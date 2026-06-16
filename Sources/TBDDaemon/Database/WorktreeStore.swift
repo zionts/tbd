@@ -23,6 +23,10 @@ struct WorktreeRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
     var tabOrder: String  // JSON array of UUID strings, e.g. "[]" or "[\"...\",\"...\"]"
     var activeTabID: String?
     var parentWorktreeID: String?
+    // Blit backend (Phase 3, additive — coexists with the tmuxServer column).
+    var blitSocket: String
+    var gatewayPort: Int?
+    var gatewayPassphrase: String?
 
     init(from wt: Worktree) {
         self.id = wt.id.uuidString
@@ -45,6 +49,9 @@ struct WorktreeRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
         self.tabOrder = "[]"  // overwritten by GRDB when fetched; only "new worktree" path uses this initializer
         self.activeTabID = nil  // new worktrees start with no stored selection
         self.parentWorktreeID = wt.parentWorktreeID?.uuidString
+        self.blitSocket = wt.blitSocket
+        self.gatewayPort = wt.gatewayPort
+        self.gatewayPassphrase = wt.gatewayPassphrase
     }
 
     func toModel() -> Worktree {
@@ -68,7 +75,10 @@ struct WorktreeRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
             archivedClaudeSessions: sessions,
             sortOrder: sortOrder,
             archivedHeadSHA: archivedHeadSHA,
-            parentWorktreeID: parentWorktreeID.flatMap { UUID(uuidString: $0) }
+            parentWorktreeID: parentWorktreeID.flatMap { UUID(uuidString: $0) },
+            blitSocket: blitSocket,
+            gatewayPort: gatewayPort,
+            gatewayPassphrase: gatewayPassphrase
         )
     }
 }

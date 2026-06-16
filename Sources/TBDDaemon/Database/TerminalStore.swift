@@ -20,6 +20,9 @@ struct TerminalRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
     var transcriptPath: String?
     var kind: String?
     var activityState: String?
+    // Blit backend (Phase 3, additive — coexists with the tmux* columns).
+    var blitTerminalID: String
+    var blitPidfilePath: String?
 
     init(from terminal: Terminal) {
         self.id = terminal.id.uuidString
@@ -36,6 +39,8 @@ struct TerminalRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
         self.transcriptPath = terminal.transcriptPath
         self.kind = terminal.kind?.rawValue
         self.activityState = terminal.activityState.rawValue
+        self.blitTerminalID = terminal.blitTerminalID
+        self.blitPidfilePath = terminal.blitPidfilePath
     }
 
     func toModel() -> Terminal {
@@ -53,7 +58,9 @@ struct TerminalRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
             profileID: profile_id.flatMap(UUID.init(uuidString:)),
             transcriptPath: transcriptPath,
             kind: kind.flatMap(TerminalKind.init(rawValue:)),
-            activityState: activityState.flatMap(TerminalActivityState.init(rawValue:)) ?? .unknown
+            activityState: activityState.flatMap(TerminalActivityState.init(rawValue:)) ?? .unknown,
+            blitTerminalID: blitTerminalID,
+            blitPidfilePath: blitPidfilePath
         )
     }
 }

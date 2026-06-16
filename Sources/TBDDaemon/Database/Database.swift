@@ -542,6 +542,34 @@ public final class TBDDatabase: Sendable {
             try db.addColumnIfMissing(table: "model_profiles", column: "env_overrides", type: .text)
         }
 
+        // Blit terminal backend (Phase 3 of the tmux→blit migration). Purely
+        // additive: these columns live ALONGSIDE the existing `tmux*` columns so
+        // the project keeps compiling and existing behavior is untouched while
+        // later phases wire blit in. Defaults keep old rows decodable.
+        //   * terminal.blitTerminalID   — blit's per-server integer terminal ID
+        //                                  (stored as text). "" until a blit
+        //                                  terminal is spawned for the row.
+        //   * terminal.blitPidfilePath  — path to the per-terminal pidfile the
+        //                                  spawn wrapper writes (maps terminal→PID
+        //                                  since blit exposes no PID). Nullable.
+        //   * worktree.blitSocket       — the per-repo blit server unix socket.
+        //                                  "" until a server is provisioned.
+        //   * worktree.gatewayPort      — loopback TCP port of the blit gateway
+        //                                  the app's WKWebView connects to. Nullable.
+        //   * worktree.gatewayPassphrase — gateway handshake passphrase. Nullable.
+        migrator.registerMigration("v32_blit_terminal_backend") { db in
+            try db.addColumnIfMissing(
+                table: "terminal", column: "blitTerminalID", type: .text, defaults: "")
+            try db.addColumnIfMissing(
+                table: "terminal", column: "blitPidfilePath", type: .text)
+            try db.addColumnIfMissing(
+                table: "worktree", column: "blitSocket", type: .text, defaults: "")
+            try db.addColumnIfMissing(
+                table: "worktree", column: "gatewayPort", type: .integer)
+            try db.addColumnIfMissing(
+                table: "worktree", column: "gatewayPassphrase", type: .text)
+        }
+
         return migrator
     }
 }

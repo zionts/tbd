@@ -127,6 +127,16 @@ public struct Worktree: Codable, Sendable, Identifiable, Equatable {
     /// project dir could not be resolved).
     public var liveClaudeSessionCount: Int?
     public var parentWorktreeID: UUID?
+    /// The per-repo blit server unix socket path. Empty until a blit server is
+    /// provisioned for this worktree's repo. Coexists with `tmuxServer` during
+    /// the tmux→blit migration (Phase 3, additive).
+    public var blitSocket: String
+    /// Loopback TCP port of the blit gateway the app's WKWebView connects to.
+    /// nil until a gateway is provisioned.
+    public var gatewayPort: Int?
+    /// Passphrase for the blit gateway handshake. nil until a gateway is
+    /// provisioned.
+    public var gatewayPassphrase: String?
 
     public init(id: UUID = UUID(), repoID: UUID, name: String, displayName: String,
                 branch: String, path: String, status: WorktreeStatus = .active,
@@ -135,7 +145,10 @@ public struct Worktree: Codable, Sendable, Identifiable, Equatable {
                 archivedClaudeSessions: [String]? = nil, sortOrder: Int = 0,
                 archivedHeadSHA: String? = nil,
                 liveClaudeSessionCount: Int? = nil,
-                parentWorktreeID: UUID? = nil) {
+                parentWorktreeID: UUID? = nil,
+                blitSocket: String = "",
+                gatewayPort: Int? = nil,
+                gatewayPassphrase: String? = nil) {
         self.id = id
         self.repoID = repoID
         self.name = name
@@ -152,6 +165,9 @@ public struct Worktree: Codable, Sendable, Identifiable, Equatable {
         self.archivedHeadSHA = archivedHeadSHA
         self.liveClaudeSessionCount = liveClaudeSessionCount
         self.parentWorktreeID = parentWorktreeID
+        self.blitSocket = blitSocket
+        self.gatewayPort = gatewayPort
+        self.gatewayPassphrase = gatewayPassphrase
     }
 
     enum CodingKeys: String, CodingKey {
@@ -159,6 +175,7 @@ public struct Worktree: Codable, Sendable, Identifiable, Equatable {
         case hasConflicts, createdAt, archivedAt, tmuxServer
         case archivedClaudeSessions, sortOrder, archivedHeadSHA
         case liveClaudeSessionCount, parentWorktreeID
+        case blitSocket, gatewayPort, gatewayPassphrase
     }
 
     public init(from decoder: Decoder) throws {
@@ -179,6 +196,10 @@ public struct Worktree: Codable, Sendable, Identifiable, Equatable {
         archivedHeadSHA = try c.decodeIfPresent(String.self, forKey: .archivedHeadSHA)
         liveClaudeSessionCount = try c.decodeIfPresent(Int.self, forKey: .liveClaudeSessionCount)
         parentWorktreeID = try c.decodeIfPresent(UUID.self, forKey: .parentWorktreeID)
+        // New blit fields — defaulted so older JSON/rows still decode.
+        blitSocket = try c.decodeIfPresent(String.self, forKey: .blitSocket) ?? ""
+        gatewayPort = try c.decodeIfPresent(Int.self, forKey: .gatewayPort)
+        gatewayPassphrase = try c.decodeIfPresent(String.self, forKey: .gatewayPassphrase)
     }
 }
 
@@ -208,6 +229,15 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
     public var transcriptPath: String?
     public var kind: TerminalKind?
     public var activityState: TerminalActivityState
+    /// blit's per-server integer terminal ID (stored as a String to fit the
+    /// existing opaque-ID patterns). Empty until a blit terminal is spawned for
+    /// this row. Coexists with `tmuxWindowID`/`tmuxPaneID` during the
+    /// tmux→blit migration (Phase 3, additive).
+    public var blitTerminalID: String
+    /// Absolute path to the per-terminal pidfile the blit spawn wrapper writes
+    /// (`echo $$ > <pidfile>` before `exec`). Maps a blit terminal to a real
+    /// PID since blit exposes none. nil until a blit terminal is spawned.
+    public var blitPidfilePath: String?
 
     public init(id: UUID = UUID(), worktreeID: UUID, tmuxWindowID: String,
                 tmuxPaneID: String, label: String? = nil, createdAt: Date = Date(),
@@ -216,7 +246,9 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
                 profileID: UUID? = nil,
                 transcriptPath: String? = nil,
                 kind: TerminalKind? = nil,
-                activityState: TerminalActivityState = .unknown) {
+                activityState: TerminalActivityState = .unknown,
+                blitTerminalID: String = "",
+                blitPidfilePath: String? = nil) {
         self.id = id
         self.worktreeID = worktreeID
         self.tmuxWindowID = tmuxWindowID
@@ -231,12 +263,15 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
         self.transcriptPath = transcriptPath
         self.kind = kind
         self.activityState = activityState
+        self.blitTerminalID = blitTerminalID
+        self.blitPidfilePath = blitPidfilePath
     }
 
     enum CodingKeys: String, CodingKey {
         case id, worktreeID, tmuxWindowID, tmuxPaneID, label, createdAt
         case pinnedAt, claudeSessionID, suspendedAt, suspendedSnapshot, profileID, transcriptPath, kind
         case activityState
+        case blitTerminalID, blitPidfilePath
     }
 
     public init(from decoder: Decoder) throws {
@@ -255,6 +290,9 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
         transcriptPath = try c.decodeIfPresent(String.self, forKey: .transcriptPath)
         kind = try c.decodeIfPresent(TerminalKind.self, forKey: .kind)
         activityState = try c.decodeIfPresent(TerminalActivityState.self, forKey: .activityState) ?? .unknown
+        // New blit fields — defaulted so older JSON/rows still decode.
+        blitTerminalID = try c.decodeIfPresent(String.self, forKey: .blitTerminalID) ?? ""
+        blitPidfilePath = try c.decodeIfPresent(String.self, forKey: .blitPidfilePath)
     }
 }
 
