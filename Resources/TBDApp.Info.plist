@@ -33,5 +33,15 @@
 	<string>15.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- Phase 6a: the terminal WKWebView connects to the per-repo blit
+		     gateway over a non-TLS loopback WebSocket (ws://127.0.0.1:<port>).
+		     ATS blocks insecure loads by default; NSAllowsLocalNetworking
+		     permits loopback/.local connections without weakening ATS for
+		     public hosts. -->
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

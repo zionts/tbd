@@ -22,6 +22,15 @@ struct TerminalPanelView: View {
     let tmuxServer: String
     let tmuxWindowID: String
     let tmuxBridge: TmuxBridge
+    // MARK: - blit gateway wiring (Phase 6a)
+    // The WKWebView renderer connects to the worktree's per-repo blit gateway
+    // at ws://127.0.0.1:<gatewayPort> (passphrase auth) and renders the blit
+    // terminal whose integer id == `blitTerminalID`. These are populated from
+    // the Worktree (gateway info) + Terminal (blit id) at the call site. They
+    // default to "unprovisioned" so the SwiftTerm-era call shape still compiles.
+    var blitTerminalID: Int? = nil
+    var gatewayPort: Int? = nil
+    var gatewayPassphrase: String? = nil
     var tabCloseContext: TabCloseContext? = nil
     var worktreePath: String = ""
     var remoteURL: String?
@@ -79,20 +88,22 @@ struct TerminalPanelView: View {
                 .padding(8)
                 .background(Color.yellow.opacity(0.2))
             }
-            TerminalPanelRepresentable(
-                terminalID: terminalID,
-                tmuxServer: tmuxServer,
-                tmuxWindowID: tmuxWindowID,
-                tmuxBridge: tmuxBridge,
-                tabCloseContext: tabCloseContext,
-                worktreePath: worktreePath,
-                remoteURL: remoteURL,
-                onFilePathClicked: onFilePathClicked,
-                onTerminalNotification: onTerminalNotification,
-                onDeadWindow: onDeadWindow,
-                initialSnapshot: initialSnapshot,
-                isSuspendedSnapshot: isSuspendedSnapshot,
-                shouldSuppressEvents: shouldSuppressEvents
+            // Phase 6a: render the terminal via the WKWebView blit web client
+            // instead of the SwiftTerm-backed `TerminalPanelRepresentable`. The
+            // SwiftTerm path (and `TerminalPanelRepresentable` below) is kept
+            // unused for 6b removal.
+            //
+            // TODO(blit 6b/7): snapshot display (`initialSnapshot` /
+            // `isSuspendedSnapshot`), Cmd-click file-path routing
+            // (`onFilePathClicked`), dead-window recreation (`onDeadWindow`),
+            // OSC-777 notifications (`onTerminalNotification`), and event
+            // suppression (`shouldSuppressEvents`) are not yet bridged into the
+            // web client — they are no-ops in this renderer for now.
+            BlitWebTerminalView(
+                blitTerminalID: blitTerminalID,
+                gatewayPort: gatewayPort,
+                gatewayPassphrase: gatewayPassphrase,
+                theme: BlitTheme.from(appearance: appearance)
             )
         }
         .task(id: pinnedProfileID) {

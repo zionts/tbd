@@ -145,6 +145,9 @@ private struct PinnedTerminalCell: View {
                     tmuxServer: worktree.tmuxServer,
                     tmuxWindowID: terminal.tmuxWindowID,
                     tmuxBridge: appState.tmuxBridge,
+                    blitTerminalID: Int(terminal.blitTerminalID),
+                    gatewayPort: worktree.gatewayPort,
+                    gatewayPassphrase: worktree.gatewayPassphrase,
                     worktreePath: worktree.path,
                     onDeadWindow: {
                         Task { await appState.recreateTerminalWindow(terminalID: terminal.id) }
