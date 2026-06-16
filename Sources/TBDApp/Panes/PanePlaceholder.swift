@@ -315,11 +315,10 @@ struct PanePlaceholder: View {
                     .padding(8)
                 }
             } else {
-                // TODO(blit 7): the blit WebView renderer does not yet bridge
-                // file-path click routing, OSC-777 notifications, dead-window
-                // recreation, snapshot display, or SwiftUI-overlay event
-                // suppression — the SwiftTerm code paths for these were removed
-                // in Phase 6b. Re-wire via WKScriptMessageHandler/postMessage.
+                // Phase 8: the blit WebView renderer bridges file-path click
+                // routing, terminal notifications, dead-window recreation,
+                // snapshot display, and SwiftUI-overlay event suppression via
+                // WKScriptMessageHandler/postMessage (see BlitWebTerminalView).
                 TerminalPanelView(
                     terminalID: terminalID,
                     blitTerminalID: Int(terminal.blitTerminalID),
@@ -327,9 +326,31 @@ struct PanePlaceholder: View {
                     gatewayPassphrase: worktree.gatewayPassphrase,
                     tabCloseContext: tabID.map { TabCloseContext(worktreeID: worktree.id, tabID: $0) },
                     worktreePath: worktree.path,
-                    remoteURL: appState.repos.first(where: { $0.id == worktree.repoID })?.remoteURL
+                    remoteURL: appState.repos.first(where: { $0.id == worktree.repoID })?.remoteURL,
+                    initialSnapshot: terminal.suspendedSnapshot,
+                    isSuspendedSnapshot: terminal.suspendedAt != nil,
+                    onFilePathClicked: { path in
+                        layout = routeFileClick(into: layout, terminalID: terminalID, path: path)
+                    },
+                    onDeadWindow: {
+                        Task { await appState.recreateTerminalWindow(terminalID: terminalID) }
+                    },
+                    onTerminalNotification: { title, body in
+                        appState.handleTerminalNotification(
+                            terminalID: terminalID,
+                            worktreeID: worktree.id,
+                            title: title,
+                            body: body
+                        )
+                    },
+                    shouldSuppressEvents: { [overlayCoordinator] in
+                        shouldSuppressEvents(in: overlayCoordinator, forTerminalID: terminalID)
+                    }
                 )
-                .id("\(terminal.id)-\(terminal.tmuxWindowID)-\(terminal.suspendedAt != nil)")
+                // Rebuild the WebView when the underlying blit terminal changes
+                // (dead-window recreate assigns a new blitTerminalID) or the
+                // suspended state flips, so the panel reconnects to the live PTY.
+                .id("\(terminal.id)-\(terminal.blitTerminalID)-\(terminal.suspendedAt != nil)")
                 .overlay(alignment: .topTrailing) {
                     if terminal.suspendedAt != nil {
                         Button {

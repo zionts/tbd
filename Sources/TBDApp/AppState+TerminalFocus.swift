@@ -3,12 +3,11 @@ import Foundation
 
 /// Weak handle to a terminal's backing NSView for first-responder routing.
 ///
-/// TODO(blit 7): with the SwiftTerm `TBDTerminalView` removed, no NSView is
-/// registered here yet — the blit `WKWebView` would need to expose a
-/// first-responder hook before keyboard focus tracking can be re-wired. The
-/// registry stays in place (callers and tab-close routing depend on it) but is
-/// currently always empty, so focus resolution falls back to the last
-/// explicitly-set `focusedTabCloseContext`.
+/// Phase 8: the blit `TBDTerminalWebView` registers itself here on creation
+/// (see `BlitWebTerminalView.makeNSView`). Because WebKit nests the actual key
+/// view inside the `WKWebView`, `resolvedFocusedTabCloseContext` matches a
+/// registered view when the window's first responder is that view OR a
+/// descendant of it.
 @MainActor
 final class TerminalFocusTarget {
     weak var view: NSView?
@@ -41,10 +40,16 @@ extension AppState {
         if terminalFocusTargets.isEmpty {
             return focusedTabCloseContext
         }
-        guard let terminalView = NSApp.keyWindow?.firstResponder as? NSView else {
+        guard let responder = NSApp.keyWindow?.firstResponder as? NSView else {
             return nil
         }
-        guard let terminalID = terminalFocusTargets.first(where: { $0.value.view === terminalView })?.key else {
+        // WebKit nests the key view inside the WKWebView, so the first responder
+        // is usually a descendant of the registered terminal view rather than
+        // the view itself. Match on identity OR descendant containment.
+        guard let terminalID = terminalFocusTargets.first(where: { entry in
+            guard let view = entry.value.view else { return false }
+            return responder === view || responder.isDescendant(of: view)
+        })?.key else {
             return nil
         }
         return terminalTabCloseContexts[terminalID]

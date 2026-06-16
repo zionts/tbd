@@ -19,6 +19,34 @@ extension AppState {
         }
     }
 
+    /// Handle a notification emitted by a terminal itself (OSC-777, a bell, or
+    /// a title change) and bridged from the blit web client. Delivers a native
+    /// banner only when the terminal's worktree is NOT currently visible —
+    /// matching the old SwiftTerm behavior, which only notified when the
+    /// terminal's window wasn't key. The banner collapses per-worktree and
+    /// routes to the originating terminal on click.
+    func handleTerminalNotification(terminalID: UUID, worktreeID: UUID,
+                                    title: String, body: String) {
+        // Suppress when the user is already looking at this worktree.
+        guard !visibleWorktreeIDs.contains(worktreeID) else { return }
+
+        let message: String
+        if !body.isEmpty {
+            message = title.isEmpty ? body : "\(title): \(body)"
+        } else {
+            message = title
+        }
+        guard !message.isEmpty else { return }
+
+        macNotificationManager.postIfEnabled(
+            worktreeID: worktreeID,
+            message: message,
+            worktrees: worktrees.values.flatMap { $0 },
+            type: .responseComplete,
+            terminalID: terminalID
+        )
+    }
+
     /// Mark all notifications for a worktree as read.
     func markNotificationsRead(worktreeID: UUID) async {
         do {

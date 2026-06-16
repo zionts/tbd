@@ -152,10 +152,16 @@ function TerminalById({
     }
   }, [session, terminalId]);
 
-  // --- Feature 7: title-change notifications ------------------------------
-  // Surface terminal title changes (incl. OSC-set titles) as native
-  // notifications. We skip the first observed title (initial paint) and only
-  // fire on subsequent changes.
+  // --- Feature 7: terminal notifications ----------------------------------
+  // blit 0.35's web protocol surfaces exactly one terminal-originated signal to
+  // JS: the title (S2C_TITLE → session.title). The WASM Terminal consumes BEL
+  // and OSC-777/OSC-9 internally and exposes neither a bell event nor a
+  // notification callback, and `blit terminal show` returns the *rendered*
+  // screen (escape sequences already parsed away), so the daemon can't recover
+  // OSC-777 from captured output either. Title changes are therefore the real,
+  // working notification signal we bridge; many TUIs (incl. Claude Code) set
+  // the title to announce attention/completion, so this covers the common case.
+  // We skip the first observed title (initial paint) and only fire on changes.
   const lastTitle = useRef<string | null>(null);
   const sawFirstTitle = useRef(false);
   useEffect(() => {

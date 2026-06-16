@@ -28,6 +28,18 @@ struct TerminalPanelView: View {
     var tabCloseContext: TabCloseContext? = nil
     var worktreePath: String = ""
     var remoteURL: String?
+    /// Captured ANSI scrollback shown while the terminal is suspended.
+    var initialSnapshot: String? = nil
+    /// True when the terminal is suspended (no live PTY behind it).
+    var isSuspendedSnapshot: Bool = false
+    /// Cmd-click file-path handler (routes a viewer pane open).
+    var onFilePathClicked: ((String) -> Void)?
+    /// Dead-window handler — recreate the terminal's blit window.
+    var onDeadWindow: (() -> Void)?
+    /// Terminal notification handler (OSC-777 / bell / title).
+    var onTerminalNotification: ((String, String) -> Void)?
+    /// Returns true while a SwiftUI overlay covers this terminal.
+    var shouldSuppressEvents: @MainActor () -> Bool = { false }
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var appearance: AppearanceSettings
 
@@ -60,18 +72,24 @@ struct TerminalPanelView: View {
                 .padding(8)
                 .background(Color.yellow.opacity(0.2))
             }
-            // Phase 6a/6b: render the terminal via the WKWebView blit web client.
-            //
-            // TODO(blit 7): snapshot display (initial ANSI for suspended
-            // terminals), Cmd-click file-path routing, dead-window recreation,
-            // OSC-777 notifications, and SwiftUI-overlay event suppression are
-            // not yet bridged into the web client — they were stubbed in 6a and
-            // the SwiftTerm code paths that implemented them were removed in 6b.
+            // Phase 8: the WKWebView blit web client renders the terminal and
+            // bridges snapshot display, Cmd-click file-path routing, dead-window
+            // recreation, terminal notifications, focus tracking, live theme
+            // updates, and SwiftUI-overlay event suppression to/from JS.
             BlitWebTerminalView(
+                terminalID: terminalID,
                 blitTerminalID: blitTerminalID,
                 gatewayPort: gatewayPort,
                 gatewayPassphrase: gatewayPassphrase,
-                theme: BlitTheme.from(appearance: appearance)
+                theme: BlitTheme.from(appearance: appearance),
+                worktreePath: worktreePath,
+                snapshot: initialSnapshot,
+                isSuspended: isSuspendedSnapshot,
+                tabCloseContext: tabCloseContext,
+                onFilePathClicked: onFilePathClicked,
+                onDeadWindow: onDeadWindow,
+                onTerminalNotification: onTerminalNotification,
+                shouldSuppressEvents: shouldSuppressEvents
             )
         }
         .task(id: pinnedProfileID) {

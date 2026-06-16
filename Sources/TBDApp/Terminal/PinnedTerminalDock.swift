@@ -147,7 +147,7 @@ private struct PinnedTerminalCell: View {
                     gatewayPassphrase: worktree.gatewayPassphrase,
                     worktreePath: worktree.path
                 )
-                .id("\(terminal.id)-\(terminal.tmuxWindowID)")
+                .id("\(terminal.id)-\(terminal.blitTerminalID)")
             } else {
                 ZStack {
                     Color(nsColor: .textBackgroundColor)
