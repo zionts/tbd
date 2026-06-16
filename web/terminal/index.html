@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>TBD Terminal</title>
+    <style>
+      :root {
+        --tbd-bg: #000000;
+        --tbd-fg: #e5e5e5;
+        --tbd-cursor: #e5e5e5;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: var(--tbd-bg);
+        color: var(--tbd-fg);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+      }
+      #root {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+      .tbd-status {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        font-size: 13px;
+        opacity: 0.6;
+      }
+      .tbd-error {
+        color: #f14c4c;
+        opacity: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- build.mjs replaces this with the inlined bundle for a single-file dist. -->
+    <script type="module" src="./dist/bundle.js"></script>
+  </body>
+</html>

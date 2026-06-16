@@ -1,0 +1,20 @@
+{
+  "name": "tbd-blit-terminal",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Static web bundle that renders one blit terminal inside TBD's WKWebView, connected to the local blit gateway.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@blit-sh/core": "0.35.0",
+    "@blit-sh/react": "0.35.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

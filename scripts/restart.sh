@@ -28,6 +28,19 @@ done
 # MARK: - Build
 
 if [ "$skip_build" = false ]; then
+    # Build the blit web client bundle for the WKWebView terminal (Phase 5).
+    # Guarded: only when the web project exists AND npm is available, and a
+    # failure here only warns — it must never block the Swift build.
+    if [ -f "$REPO_ROOT/web/terminal/package.json" ] && command -v npm >/dev/null 2>&1; then
+        echo "Building web bundle..."
+        tw=$SECONDS
+        if "$REPO_ROOT/scripts/build-web.sh" 2>&1 | tail -3; then
+            echo "  Web build: $((SECONDS - tw))s"
+        else
+            echo "  WARNING: web bundle build failed — continuing with Swift build."
+        fi
+    fi
+
     echo "Building..."
     t0=$SECONDS
     (cd "$REPO_ROOT" && swift build) 2>&1 | tail -3

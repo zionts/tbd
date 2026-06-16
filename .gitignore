@@ -12,3 +12,7 @@ docs/implementation-plans/
 
 # Brainstorming companion (local-only session artifacts)
 .superpowers/
+
+# Web terminal bundle — built on demand by scripts/build-web.sh
+web/terminal/node_modules/
+web/terminal/dist/
