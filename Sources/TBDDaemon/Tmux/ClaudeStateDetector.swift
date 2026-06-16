@@ -1,5 +1,13 @@
 import Foundation
 
+// NOTE (Phase 7, tmux->blit migration): This file is intentionally RETAINED.
+// Its pure static helpers (`checkIdle`, `parseSessionID`, `isClaudeProcess`) are
+// the canonical idle/session-marker logic and are delegated to by the blit
+// detector (`Blit/BlitClaudeStateDetector.swift`) so behavior — and the shared
+// `ClaudeStateDetectorTests` — stay identical across backends. The tmux-bound
+// instance methods (`isIdle`/`captureSessionID` taking a `TmuxManager`) are
+// vestigial but harmless; deleting the type would orphan the blit delegation and
+// its tests. Folding the static helpers into the Blit layer is out of Phase 7 scope.
 public struct ClaudeStateDetector: Sendable {
     // MARK: - Pattern Constants
     nonisolated(unsafe) static let claudeProcessRegex = try! Regex(#"^\d+\.\d+\.\d+"#)

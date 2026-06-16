@@ -98,6 +98,19 @@ if [ ! -f "$BUNDLE_ICON" ] || [ "$SOURCE_ICON" -nt "$BUNDLE_ICON" ]; then
     cp "$SOURCE_ICON" "$BUNDLE_ICON"
 fi
 
+# Copy the built blit web client into the bundle as Contents/Resources/blit-web/.
+# This satisfies BlitWebTerminalView's resolution step 2 (Bundle.main resource
+# subdirectory "blit-web") so the installed app renders terminals without needing
+# TBD_WEB_DIST. Guarded on the dist existing — a missing/unbuilt web bundle must
+# not break the Swift app launch (the dev fallback path still applies in that case).
+WEB_DIST="$REPO_ROOT/web/terminal/dist"
+BUNDLE_WEB="$BUNDLE_RESOURCES/blit-web"
+if [ -f "$WEB_DIST/index.html" ]; then
+    rm -rf "$BUNDLE_WEB"
+    mkdir -p "$BUNDLE_WEB"
+    cp -R "$WEB_DIST"/. "$BUNDLE_WEB"/
+fi
+
 # Stash the source worktree path inside the bundle so the running app can
 # show it in the status bar — it can no longer infer this from its own
 # exec path now that it runs from /Applications instead of .build/.

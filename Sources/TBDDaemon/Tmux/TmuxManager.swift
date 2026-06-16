@@ -3,6 +3,17 @@ import os
 
 private let logger = Logger(subsystem: "com.tbd.daemon", category: "TmuxManager")
 
+// NOTE (Phase 7, tmux->blit migration): This file is intentionally RETAINED.
+// Although terminals now run on blit (see `Blit/BlitManager.swift`), the daemon
+// still depends on this type for non-terminal concerns:
+//   - `TmuxManager.serverName(forRepoPath:)` is the stable per-repo identity hash
+//     reused by `WorktreeLifecycle+{Create,Adopt,Reconcile}` and `RPCRouter+RepoHandlers`.
+//   - `AgentReaper` consumes the `TmuxProcessQuerying` conformance.
+//   - `Daemon.swift` instantiates it for the above.
+// The tmux *terminal* command builders below are vestigial but harmless and kept
+// to avoid churning the dry-run test seams the suite still exercises
+// (`TmuxManagerTests`). Removing the type cleanly would require migrating
+// `serverName` + the reaper seam into the Blit layer first — out of Phase 7 scope.
 public struct TmuxManager: Sendable {
     public let dryRun: Bool
     private let counter: Counter
