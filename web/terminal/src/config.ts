@@ -36,11 +36,28 @@ export interface BlitRuntimeConfig {
   passphrase: string;
   terminalId: number;
   theme?: BlitThemeInput;
+  /**
+   * ANSI scrollback captured while the terminal was suspended. Rendered as a
+   * static screen until the live blit session connects (Phase 8, feature 1).
+   */
+  snapshot?: string;
+  /** true when this terminal is currently suspended (no live PTY behind it). */
+  isSuspended?: boolean;
 }
 
 declare global {
   interface Window {
     __BLIT__?: Partial<BlitRuntimeConfig>;
+    /**
+     * Swift→JS bridge surface, populated by `src/bridge.ts` once the React app
+     * mounts. The native host calls these via `evaluateJavaScript`.
+     */
+    __TBD_BRIDGE__?: {
+      /** Re-apply theme/font without a reload. Arg is a BlitThemeInput JSON. */
+      applyTheme(themeJson: string): void;
+      /** Mark this WebView active/inactive (background event suppression). */
+      setActive(active: boolean): void;
+    };
   }
 }
 
@@ -115,7 +132,11 @@ export function resolveConfig(): BlitRuntimeConfig {
     throw new Error(`blit config: invalid terminalId "${terminalIdRaw}"`);
   }
 
-  return { wsUrl, passphrase, terminalId, theme };
+  const snapshot = injected.snapshot ?? params.get("snapshot") ?? undefined;
+  const isSuspended =
+    injected.isSuspended ?? params.get("isSuspended") === "1" ?? false;
+
+  return { wsUrl, passphrase, terminalId, theme, snapshot, isSuspended };
 }
 
 const DEFAULT_ANSI: Array<[number, number, number]> = [
