@@ -1,5 +1,4 @@
 import AppKit
-import SwiftTerm
 import SwiftUI
 import TBDShared
 import UniformTypeIdentifiers

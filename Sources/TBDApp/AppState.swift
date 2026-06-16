@@ -499,7 +499,6 @@ final class AppState: ObservableObject {
     let themeStore = ThemeStore()
 
     let daemonClient = DaemonClient()
-    let tmuxBridge = TmuxBridge()
     lazy var cliInstallerCoordinator = CLIInstallerCoordinator(daemonClient: daemonClient, userDefaults: userDefaults)
     lazy var legacyHooksCoordinator = LegacyHooksCoordinator(daemonClient: daemonClient, userDefaults: userDefaults)
     private var pollTimer: Timer?
@@ -1474,12 +1473,12 @@ final class AppState: ObservableObject {
     /// scrollback that #73 introduced these defaults to prevent.
     func mainAreaTerminalSize() -> (cols: Int?, rows: Int?) {
         guard terminalAutoResizeEnabled else { return (nil, nil) }
-        // Use the user's current font so initial pane dimensions match what
-        // the freshly-spawned `TBDTerminalView` will render with. Falls back
-        // to the SwiftTerm default if `appearance` hasn't been wired yet
-        // (only possible during pre-`onAppear` startup ordering).
-        let font = appearance?.font ?? TBDTerminalView.defaultMonospaceFont
-        let cell = TBDTerminalView.cellDimensions(for: font)
+        // Use the user's current font so initial pane dimensions match what the
+        // freshly-spawned terminal will render with. Falls back to the default
+        // monospace font if `appearance` hasn't been wired yet (only possible
+        // during pre-`onAppear` startup ordering).
+        let font = appearance?.font ?? TerminalCellMetrics.defaultMonospaceFont
+        let cell = TerminalCellMetrics.cellDimensions(for: font)
         guard cell.width > 0, cell.height > 0 else { return (80, 24) }
         let cols = max(80, Int(mainAreaSize.width / cell.width))
         let rows = max(24, Int(mainAreaSize.height / cell.height))

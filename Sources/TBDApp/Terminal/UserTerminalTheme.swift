@@ -1,5 +1,4 @@
 import Foundation
-import SwiftTerm
 
 /// Codable representation of a user-authored terminal color scheme as stored
 /// on disk in `~/tbd/terminal-themes/<id>.json`. Converts to a runtime
@@ -60,22 +59,15 @@ struct UserTerminalTheme: Codable, Equatable, Hashable {
     }
 
     static func parseHex(_ hex: String) -> (UInt8, UInt8, UInt8)? {
-        guard hex.hasPrefix("#"), hex.count == 7 else { return nil }
-        let scanner = Scanner(string: String(hex.dropFirst()))
-        var value: UInt64 = 0
-        guard scanner.scanHexInt64(&value), scanner.isAtEnd else { return nil }
-        return (UInt8((value >> 16) & 0xff), UInt8((value >> 8) & 0xff), UInt8(value & 0xff))
+        guard let rgb = TerminalRGB(hex: hex) else { return nil }
+        return (rgb.r, rgb.g, rgb.b)
     }
 
-    static func color(fromHex hex: String) -> SwiftTerm.Color? {
-        guard let (r, g, b) = parseHex(hex) else { return nil }
-        return SwiftTerm.Color(red: UInt16(r) * 257, green: UInt16(g) * 257, blue: UInt16(b) * 257)
+    static func color(fromHex hex: String) -> TerminalRGB? {
+        TerminalRGB(hex: hex)
     }
 
-    static func hex(from color: SwiftTerm.Color) -> String {
-        let r = Int(color.red / 257)
-        let g = Int(color.green / 257)
-        let b = Int(color.blue / 257)
-        return String(format: "#%02x%02x%02x", r, g, b)
+    static func hex(from color: TerminalRGB) -> String {
+        color.hexString
     }
 }

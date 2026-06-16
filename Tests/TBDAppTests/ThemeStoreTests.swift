@@ -148,7 +148,7 @@ struct ThemeStoreTests {
         )
         try store.save(edited)
         store.reloadFromDisk()
-        #expect(store.userThemes.first?.ansi[0].red == UInt16(0xff) * 257)
+        #expect(store.userThemes.first?.ansi[0].r == 0xff)
     }
 
     @Test("delete moves the file into .trash/ with a timestamp suffix")

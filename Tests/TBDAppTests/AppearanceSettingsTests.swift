@@ -1,6 +1,5 @@
 import Foundation
 import Testing
-import SwiftTerm
 @testable import TBDApp
 
 @MainActor
@@ -186,11 +185,11 @@ struct AppearanceSettingsTests {
         let store = ThemeStore()
         let lightUser = TerminalColorScheme(
             id: "light-user", displayName: "Light U",
-            ansi: Array(repeating: SwiftTerm.Color(red: 0, green: 0, blue: 0), count: 16),
-            foreground: SwiftTerm.Color(red: 0, green: 0, blue: 0),
-            background: SwiftTerm.Color(red: 65535, green: 65535, blue: 65535),
-            cursor: SwiftTerm.Color(red: 0, green: 0, blue: 0),
-            selection: SwiftTerm.Color(red: 32000, green: 32000, blue: 32000)
+            ansi: Array(repeating: TerminalRGB(r: 0, g: 0, b: 0), count: 16),
+            foreground: TerminalRGB(r: 0, g: 0, b: 0),
+            background: TerminalRGB(r: 255, g: 255, b: 255),
+            cursor: TerminalRGB(r: 0, g: 0, b: 0),
+            selection: TerminalRGB(r: 124, g: 124, b: 124)
         )
         store.injectForTest(userThemes: [lightUser])
 

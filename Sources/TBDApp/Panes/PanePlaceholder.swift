@@ -315,31 +315,19 @@ struct PanePlaceholder: View {
                     .padding(8)
                 }
             } else {
+                // TODO(blit 7): the blit WebView renderer does not yet bridge
+                // file-path click routing, OSC-777 notifications, dead-window
+                // recreation, snapshot display, or SwiftUI-overlay event
+                // suppression — the SwiftTerm code paths for these were removed
+                // in Phase 6b. Re-wire via WKScriptMessageHandler/postMessage.
                 TerminalPanelView(
                     terminalID: terminalID,
-                    tmuxServer: worktree.tmuxServer,
-                    tmuxWindowID: terminal.tmuxWindowID,
-                    tmuxBridge: appState.tmuxBridge,
                     blitTerminalID: Int(terminal.blitTerminalID),
                     gatewayPort: worktree.gatewayPort,
                     gatewayPassphrase: worktree.gatewayPassphrase,
                     tabCloseContext: tabID.map { TabCloseContext(worktreeID: worktree.id, tabID: $0) },
                     worktreePath: worktree.path,
-                    remoteURL: appState.repos.first(where: { $0.id == worktree.repoID })?.remoteURL,
-                    onFilePathClicked: { path in
-                        layout = routeFileClick(into: layout, terminalID: terminalID, path: path)
-                    },
-                    onTerminalNotification: { title, body in
-                        debugLog("OSC 777: \(title) — \(body)")
-                    },
-                    onDeadWindow: {
-                        Task { await appState.recreateTerminalWindow(terminalID: terminalID) }
-                    },
-                    initialSnapshot: terminal.suspendedSnapshot,
-                    isSuspendedSnapshot: terminal.suspendedAt != nil,
-                    shouldSuppressEvents: { [overlayCoordinator] in
-                        shouldSuppressEvents(in: overlayCoordinator, forTerminalID: terminalID)
-                    }
+                    remoteURL: appState.repos.first(where: { $0.id == worktree.repoID })?.remoteURL
                 )
                 .id("\(terminal.id)-\(terminal.tmuxWindowID)-\(terminal.suspendedAt != nil)")
                 .overlay(alignment: .topTrailing) {

@@ -10,11 +10,6 @@ let package = Package(
         .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
         .package(url: "https://github.com/apple/swift-nio", from: "2.65.0"),
-        // Pinned to a main-branch revision because the `fontSmoothing` public
-        // property (PR #531) hasn't shipped in a tagged release yet. Switch back
-        // to `from: "1.14.0"` (or whichever) once SwiftTerm cuts a release that
-        // includes commit dae32cc.
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm", revision: "dae32cc8f9bcda15713f4091bb2ea7e11f6dd57c"),
         .package(url: "https://github.com/raspu/Highlightr", from: "2.2.1"),
         .package(url: "https://github.com/siteline/swiftui-introspect", from: "1.0.0"),
         .package(url: "https://github.com/gonzalezreal/swift-markdown-ui", from: "2.4.0"),
@@ -89,7 +84,6 @@ let package = Package(
             dependencies: [
                 "TBDShared",
                 "TBDAppIcon",
-                .product(name: "SwiftTerm", package: "SwiftTerm"),
                 .product(name: "Highlightr", package: "Highlightr"),
                 .product(name: "SwiftUIIntrospect", package: "swiftui-introspect"),
                 .product(name: "MarkdownUI", package: "swift-markdown-ui"),
@@ -100,8 +94,8 @@ let package = Package(
             path: "Sources/TBDApp",
             resources: [.copy("Resources/Icons")],
             // See TBDDaemonLib above. TBDApp is the larger of the two
-            // memory-heavy modules (SwiftUI view bodies + MarkdownUI +
-            // SwiftTerm); same WMO-OOM symptom on the macos-15 runner.
+            // memory-heavy modules (SwiftUI view bodies + MarkdownUI);
+            // same WMO-OOM symptom on the macos-15 runner.
             swiftSettings: [
                 .unsafeFlags(["-no-whole-module-optimization"], .when(configuration: .debug)),
             ]

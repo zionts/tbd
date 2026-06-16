@@ -1,17 +1,25 @@
 import AppKit
 import Foundation
 
+/// Weak handle to a terminal's backing NSView for first-responder routing.
+///
+/// TODO(blit 7): with the SwiftTerm `TBDTerminalView` removed, no NSView is
+/// registered here yet — the blit `WKWebView` would need to expose a
+/// first-responder hook before keyboard focus tracking can be re-wired. The
+/// registry stays in place (callers and tab-close routing depend on it) but is
+/// currently always empty, so focus resolution falls back to the last
+/// explicitly-set `focusedTabCloseContext`.
 @MainActor
 final class TerminalFocusTarget {
-    weak var view: TBDTerminalView?
+    weak var view: NSView?
 
-    init(_ view: TBDTerminalView) {
+    init(_ view: NSView) {
         self.view = view
     }
 }
 
 extension AppState {
-    func registerTerminalView(_ view: TBDTerminalView, for terminalID: UUID) {
+    func registerTerminalView(_ view: NSView, for terminalID: UUID) {
         terminalFocusTargets[terminalID] = TerminalFocusTarget(view)
     }
 
@@ -23,7 +31,7 @@ extension AppState {
         }
     }
 
-    func unregisterTerminalView(_ view: TBDTerminalView, for terminalID: UUID) {
+    func unregisterTerminalView(_ view: NSView, for terminalID: UUID) {
         guard terminalFocusTargets[terminalID]?.view === view else { return }
         terminalFocusTargets.removeValue(forKey: terminalID)
         terminalTabCloseContexts.removeValue(forKey: terminalID)
@@ -33,7 +41,7 @@ extension AppState {
         if terminalFocusTargets.isEmpty {
             return focusedTabCloseContext
         }
-        guard let terminalView = NSApp.keyWindow?.firstResponder as? TBDTerminalView else {
+        guard let terminalView = NSApp.keyWindow?.firstResponder as? NSView else {
             return nil
         }
         guard let terminalID = terminalFocusTargets.first(where: { $0.value.view === terminalView })?.key else {

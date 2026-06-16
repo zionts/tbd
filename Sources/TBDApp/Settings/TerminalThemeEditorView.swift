@@ -1,6 +1,5 @@
 // Sources/TBDApp/Settings/TerminalThemeEditorView.swift
 import SwiftUI
-import SwiftTerm
 
 private typealias SwiftUIColor = SwiftUI.Color
 

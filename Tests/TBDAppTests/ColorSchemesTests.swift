@@ -1,5 +1,4 @@
 import Testing
-import SwiftTerm
 @testable import TBDApp
 
 @MainActor
@@ -60,11 +59,11 @@ struct ColorSchemesTests {
         let store = ThemeStore()
         let userScheme = TerminalColorScheme(
             id: "my-user-theme", displayName: "Mine",
-            ansi: Array(repeating: SwiftTerm.Color(red: 0, green: 0, blue: 0), count: 16),
-            foreground: SwiftTerm.Color(red: 65535, green: 65535, blue: 65535),
-            background: SwiftTerm.Color(red: 0, green: 0, blue: 0),
-            cursor: SwiftTerm.Color(red: 65535, green: 65535, blue: 65535),
-            selection: SwiftTerm.Color(red: 20000, green: 20000, blue: 20000)
+            ansi: Array(repeating: TerminalRGB(r: 0, g: 0, b: 0), count: 16),
+            foreground: TerminalRGB(r: 255, g: 255, b: 255),
+            background: TerminalRGB(r: 0, g: 0, b: 0),
+            cursor: TerminalRGB(r: 255, g: 255, b: 255),
+            selection: TerminalRGB(r: 78, g: 78, b: 78)
         )
         store.injectForTest(userThemes: [userScheme])
         let resolved = ColorSchemes.scheme(forID: "my-user-theme", store: store)
@@ -76,11 +75,11 @@ struct ColorSchemesTests {
         let store = ThemeStore()
         let conflicting = TerminalColorScheme(
             id: "gruvbox-dark", displayName: "Hijack",
-            ansi: Array(repeating: SwiftTerm.Color(red: 65535, green: 0, blue: 0), count: 16),
-            foreground: SwiftTerm.Color(red: 65535, green: 0, blue: 0),
-            background: SwiftTerm.Color(red: 65535, green: 0, blue: 0),
-            cursor: SwiftTerm.Color(red: 65535, green: 0, blue: 0),
-            selection: SwiftTerm.Color(red: 65535, green: 0, blue: 0)
+            ansi: Array(repeating: TerminalRGB(r: 255, g: 0, b: 0), count: 16),
+            foreground: TerminalRGB(r: 255, g: 0, b: 0),
+            background: TerminalRGB(r: 255, g: 0, b: 0),
+            cursor: TerminalRGB(r: 255, g: 0, b: 0),
+            selection: TerminalRGB(r: 255, g: 0, b: 0)
         )
         store.injectForTest(userThemes: [conflicting])
         let resolved = ColorSchemes.scheme(forID: "gruvbox-dark", store: store)

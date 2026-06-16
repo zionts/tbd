@@ -1,15 +1,14 @@
 import AppKit
 import Combine
 import Foundation
-import SwiftTerm
 import TBDShared
 
 /// Global user-customizable terminal appearance settings.
 ///
 /// One instance lives at the app root and is injected as `@EnvironmentObject`.
-/// Live `TBDTerminalView` instances subscribe to `objectWillChange` to reapply
-/// font/colors/cursor whenever the user edits a value in the Terminal tab of
-/// Settings.
+/// The blit WebView renderer reads the resolved theme/font via
+/// `BlitTheme.from(appearance:)` (Phase 6b); changing a value recreates the
+/// panel so the new theme is picked up.
 ///
 /// Persistence: each property writes to `UserDefaults` on `didSet`. `UserDefaults`
 /// is injectable for tests (see `Tests/TBDAppTests/AppearanceSettingsTests.swift`).
@@ -54,11 +53,6 @@ final class AppearanceSettings: ObservableObject {
     @Published var cursorStyle: CursorStyle { didSet { defaults.set(cursorStyle.rawString, forKey: Keys.cursorStyle) } }
     @Published var thinStrokes: Bool { didSet { defaults.set(thinStrokes, forKey: Keys.thinStrokes) } }
 
-    /// True if the user's tmux config sets a cell-painting style option that
-    /// would override the chosen color scheme's foreground/background. Best-
-    /// effort detection at init — see `TmuxConfigStyleDetector`.
-    @Published private(set) var hasTmuxStyleOverrides: Bool
-
     init(defaults: UserDefaults = .standard, userThemesDirectory: URL? = nil) {
         self.defaults = defaults
 
@@ -100,17 +94,6 @@ final class AppearanceSettings: ObservableObject {
         } else {
             self.thinStrokes = Defaults.thinStrokes
         }
-
-        // Detection reads tmux config files from disk. Defer to a detached task
-        // so app launch isn't blocked by synchronous I/O; the property updates
-        // asynchronously on the main actor once detection finishes.
-        self.hasTmuxStyleOverrides = false
-        Task { @MainActor [weak self] in
-            let detected = await Task.detached {
-                TmuxConfigStyleDetector.detectFromUserConfig()
-            }.value
-            self?.hasTmuxStyleOverrides = detected
-        }
     }
 
     /// Resolves `fontName` + `fontSize` to an `NSFont`. Falls back to system
@@ -128,14 +111,9 @@ final class AppearanceSettings: ObservableObject {
     /// threshold on near-black / near-white terminal backgrounds; do not use this
     /// helper as a general-purpose accessibility-contrast check.
     nonisolated static func colorFgBg(for scheme: TerminalColorScheme) -> String {
-        // Convert SwiftTerm.Color channels (0–65535 scale) to 0–1 range.
-        // Bundled scheme values are sRGB hex codes; use sRGB so wide-gamut
-        // displays (Display P3) don't drift from the spec.
-        let red = CGFloat(scheme.background.red) / 65535.0
-        let green = CGFloat(scheme.background.green) / 65535.0
-        let blue = CGFloat(scheme.background.blue) / 65535.0
-
-        let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+        // `TerminalRGB` channels are 0–255 sRGB values; `approximateLuminance`
+        // normalizes them to 0–1 using the same WCAG-coefficient shortcut.
+        let luminance = scheme.background.approximateLuminance
         // Light background (luminance > 0.5) → use black foreground, white background hint
         // Dark background (luminance ≤ 0.5) → use white foreground, black background hint
         return luminance > 0.5 ? "0;15" : "15;0"
@@ -174,7 +152,6 @@ extension CursorStyle {
         case .steadyUnderline: return "steady-underline"
         case .blinkBar: return "blink-bar"
         case .steadyBar: return "steady-bar"
-        @unknown default: return "blink-block"
         }
     }
 

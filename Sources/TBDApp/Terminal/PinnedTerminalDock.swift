@@ -142,16 +142,10 @@ private struct PinnedTerminalCell: View {
             if let worktree {
                 TerminalPanelView(
                     terminalID: terminal.id,
-                    tmuxServer: worktree.tmuxServer,
-                    tmuxWindowID: terminal.tmuxWindowID,
-                    tmuxBridge: appState.tmuxBridge,
                     blitTerminalID: Int(terminal.blitTerminalID),
                     gatewayPort: worktree.gatewayPort,
                     gatewayPassphrase: worktree.gatewayPassphrase,
-                    worktreePath: worktree.path,
-                    onDeadWindow: {
-                        Task { await appState.recreateTerminalWindow(terminalID: terminal.id) }
-                    }
+                    worktreePath: worktree.path
                 )
                 .id("\(terminal.id)-\(terminal.tmuxWindowID)")
             } else {

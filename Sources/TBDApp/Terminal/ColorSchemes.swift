@@ -1,17 +1,79 @@
+import AppKit
 import Foundation
-import SwiftTerm
 
-// SwiftTerm.Color is a class but our usage is read-only post-construction.
-extension SwiftTerm.Color: @retroactive @unchecked Sendable {}
+/// Pure font-metric helpers for converting a px area to terminal cols/rows.
+///
+/// Previously lived on `TBDTerminalView` (the SwiftTerm subclass). Lifted out
+/// when SwiftTerm was removed (Phase 6b) — `AppState.mainAreaTerminalSize()`
+/// still needs these to compute initial tmux pane dimensions before any live
+/// terminal view exists. The math is plain CoreText, no renderer dependency.
+enum TerminalCellMetrics {
+    /// The default monospace font used for px → cells conversion before any
+    /// live terminal view exists. Computed (not a stored static) so the type
+    /// stays non-isolated without tripping the non-Sendable global-state check
+    /// on `NSFont`.
+    static var defaultMonospaceFont: NSFont {
+        NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+    }
+
+    /// Cell dimensions derived from CTFont metrics (advance width of "W" and
+    /// ascent + descent + leading), matching a terminal renderer's cell sizing.
+    static func cellDimensions(for font: NSFont) -> (width: CGFloat, height: CGFloat) {
+        let glyph = font.glyph(withName: "W")
+        let cellWidth = font.advancement(forGlyph: glyph).width
+        let cellHeight = ceil(CTFontGetAscent(font) + CTFontGetDescent(font) + CTFontGetLeading(font))
+        return (cellWidth, cellHeight)
+    }
+}
+
+/// 8-bit-per-channel RGB color. Replaces `SwiftTerm.Color` as the app's
+/// terminal-color value type after the blit WebView became the only renderer
+/// (Phase 6b). Channels are plain 0–255 `UInt8`; the web client consumes
+/// `#rrggbb` strings, so all conversions go through `hexString` / `init(hex:)`.
+struct TerminalRGB: Equatable, Hashable, Sendable {
+    let r: UInt8
+    let g: UInt8
+    let b: UInt8
+
+    init(r: UInt8, g: UInt8, b: UInt8) {
+        self.r = r
+        self.g = g
+        self.b = b
+    }
+
+    /// Parses a `#rrggbb` string. Returns nil for malformed input.
+    init?(hex: String) {
+        guard hex.hasPrefix("#"), hex.count == 7 else { return nil }
+        let scanner = Scanner(string: String(hex.dropFirst()))
+        var value: UInt64 = 0
+        guard scanner.scanHexInt64(&value), scanner.isAtEnd else { return nil }
+        self.init(
+            r: UInt8((value >> 16) & 0xff),
+            g: UInt8((value >> 8) & 0xff),
+            b: UInt8(value & 0xff)
+        )
+    }
+
+    /// `#rrggbb` lowercased.
+    var hexString: String {
+        String(format: "#%02x%02x%02x", Int(r), Int(g), Int(b))
+    }
+
+    /// Approximate sRGB luminance (WCAG coefficients applied to raw 0–1 values,
+    /// skipping gamma linearization). Sufficient for a binary light/dark test.
+    var approximateLuminance: Double {
+        (0.2126 * Double(r) + 0.7152 * Double(g) + 0.0722 * Double(b)) / 255.0
+    }
+}
 
 struct TerminalColorScheme {
     let id: String
     let displayName: String
-    let ansi: [SwiftTerm.Color]      // 16 colors, indices 0..15
-    let foreground: SwiftTerm.Color
-    let background: SwiftTerm.Color
-    let cursor: SwiftTerm.Color
-    let selection: SwiftTerm.Color
+    let ansi: [TerminalRGB]      // 16 colors, indices 0..15
+    let foreground: TerminalRGB
+    let background: TerminalRGB
+    let cursor: TerminalRGB
+    let selection: TerminalRGB
 }
 
 enum ColorSchemes {
@@ -477,14 +539,25 @@ enum ColorSchemes {
         selection: rgb(240, 235, 220)
     )
 
-    /// 8-bit-per-channel → SwiftTerm.Color (16-bit per channel).
-    /// `UInt8` parameters make the 0–255 constraint self-documenting and
-    /// prevent silent overflow if a future scheme uses an out-of-range literal.
-    private static func rgb(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> SwiftTerm.Color {
-        SwiftTerm.Color(
-            red: UInt16(r) * 257,
-            green: UInt16(g) * 257,
-            blue: UInt16(b) * 257
-        )
+    /// 8-bit-per-channel `TerminalRGB`. `UInt8` parameters make the 0–255
+    /// constraint self-documenting and prevent silent overflow if a future
+    /// scheme uses an out-of-range literal.
+    private static func rgb(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> TerminalRGB {
+        TerminalRGB(r: r, g: g, b: b)
     }
+}
+
+// MARK: - CursorStyle
+
+/// Terminal cursor style. Replaces SwiftTerm's `CursorStyle` enum (Phase 6b).
+/// The blit web client owns rendering; this type now only feeds the Settings
+/// picker and the `UserDefaults` round-trip in `AppearanceSettings`. Case names
+/// are preserved so the persisted `rawString` values keep decoding.
+enum CursorStyle: Equatable, Hashable, Sendable {
+    case blinkBlock
+    case steadyBlock
+    case blinkUnderline
+    case steadyUnderline
+    case blinkBar
+    case steadyBar
 }

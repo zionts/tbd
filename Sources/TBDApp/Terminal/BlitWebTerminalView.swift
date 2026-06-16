@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import SwiftTerm
 import SwiftUI
 import WebKit
 import os
@@ -45,22 +44,15 @@ extension BlitTheme {
         )
     }
 
-    /// `SwiftTerm.Color` channels are UInt16 on a 0–65535 scale (8-bit values
-    /// are stored as `value * 257`). Convert back to 8-bit and format `#rrggbb`.
-    static func hex(_ color: SwiftTerm.Color) -> String {
-        let r = Int((Double(color.red) / 65535.0 * 255.0).rounded())
-        let g = Int((Double(color.green) / 65535.0 * 255.0).rounded())
-        let b = Int((Double(color.blue) / 65535.0 * 255.0).rounded())
-        return String(format: "#%02x%02x%02x", r, g, b)
+    /// `TerminalRGB` → `#rrggbb` for the web client's theme dict.
+    static func hex(_ color: TerminalRGB) -> String {
+        color.hexString
     }
 
     /// Approximate luminance test (same coefficients/shortcut as
     /// `AppearanceSettings.colorFgBg`) used to set the `dark` flag.
-    static func isDark(_ bg: SwiftTerm.Color) -> Bool {
-        let r = Double(bg.red) / 65535.0
-        let g = Double(bg.green) / 65535.0
-        let b = Double(bg.blue) / 65535.0
-        return (0.2126 * r + 0.7152 * g + 0.0722 * b) <= 0.5
+    static func isDark(_ bg: TerminalRGB) -> Bool {
+        bg.approximateLuminance <= 0.5
     }
 }
 

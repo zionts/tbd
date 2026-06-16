@@ -119,8 +119,8 @@ struct UserTerminalThemeTests {
         #expect(scheme.id == "x")
         #expect(scheme.displayName == "X")
         #expect(scheme.ansi.count == 16)
-        #expect(scheme.foreground.red == 171 * 257)
-        #expect(scheme.foreground.green == 205 * 257)
-        #expect(scheme.foreground.blue == 239 * 257)
+        #expect(scheme.foreground.r == 171)
+        #expect(scheme.foreground.g == 205)
+        #expect(scheme.foreground.b == 239)
     }
 }
