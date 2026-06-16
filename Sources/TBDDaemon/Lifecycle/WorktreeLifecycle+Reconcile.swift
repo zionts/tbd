@@ -90,20 +90,12 @@ extension WorktreeLifecycle {
         }
 
         let gitWorktrees = try await git.worktreeList(repoPath: repo.path)
-        let correctTmuxServer = TmuxManager.serverName(forRepoPath: repo.path)
-        var dbWorktrees = try await db.worktrees.list(repoID: repoID, status: .active)
-
-        // Fix stale tmux server names (e.g. after migration from UUID-based to path-based naming)
-        let mainWorktrees = try await db.worktrees.list(repoID: repoID, status: .main)
-        for wt in (dbWorktrees + mainWorktrees) where wt.tmuxServer != correctTmuxServer {
-            do {
-                try await db.worktrees.updateTmuxServer(id: wt.id, tmuxServer: correctTmuxServer)
-            } catch {
-                logger.warning("reconcile: failed to update tmux server for worktree \(wt.id, privacy: .public): \(error, privacy: .public)")
-            }
-        }
-        // Re-fetch with corrected names
-        dbWorktrees = try await db.worktrees.list(repoID: repoID, status: .active)
+        // The per-repo blit server socket is deterministic from the repo path
+        // (BlitManager.socketPath), so there's no stale-name fix-up to do as
+        // there was for tmux server names. The DB's blitSocket value is
+        // refreshed lazily by ensureBlitProvisioned on next spawn.
+        let blitSocket = BlitManager.socketPath(forRepoPath: repo.path)
+        let dbWorktrees = try await db.worktrees.list(repoID: repoID, status: .active)
 
         let gitPaths = Set(gitWorktrees.map(\.path))
         // Include `.creating` rows so a worktree whose pre-session phase-3
@@ -116,14 +108,15 @@ extension WorktreeLifecycle {
         )
         let dbPaths = Set(dbWorktrees.map(\.path)).union(creatingPaths)
 
-        // Mark missing worktrees as archived — also kill their tmux windows
+        // Mark missing worktrees as archived — also kill their blit terminals
         for wt in dbWorktrees where !gitPaths.contains(wt.path) {
             let terminals = try await db.terminals.list(worktreeID: wt.id)
-            for terminal in terminals {
-                await killWindowAndReap(
-                    server: wt.tmuxServer,
-                    windowID: terminal.tmuxWindowID,
-                    paneID: terminal.tmuxPaneID
+            let wtSocket = wt.blitSocket.isEmpty ? blitSocket : wt.blitSocket
+            for terminal in terminals where !terminal.blitTerminalID.isEmpty {
+                await killTerminalAndReap(
+                    socket: wtSocket,
+                    terminalID: terminal.blitTerminalID,
+                    pidfile: terminal.blitPidfilePath
                 )
             }
             try await db.terminals.deleteForWorktree(worktreeID: wt.id)
@@ -162,90 +155,90 @@ extension WorktreeLifecycle {
             )
         }
 
-        // Clean up terminal records pointing to dead tmux windows (especially main worktrees).
-        // If the entire tmux server is gone (e.g. machine reboot), recreate windows from
-        // persisted records instead of deleting them.
+        // Rebuild terminals from the DB for blit's in-memory model.
+        //
+        // blit's server holds all terminals/scrollback in memory and starts
+        // EMPTY after a daemon (or machine) restart. So unlike the old tmux
+        // reconcile — which re-synced the DB against still-live windows — the
+        // correct action here is "rebuild from the DB":
+        //
+        //   - If the blit terminal is still present on the live server (the
+        //     daemon restarted but the server survived, e.g. a `--app`-only
+        //     restart), leave it alone.
+        //   - Otherwise the terminal's in-memory state is gone. Resumable
+        //     Claude terminals are respawned from their snapshot + session ID
+        //     (`recreateAfterReboot`); everything else is respawned fresh so
+        //     the user always sees a live pane.
         let allLiveWorktrees = try await db.worktrees.list(repoID: repoID, status: .active)
             + (try await db.worktrees.list(repoID: repoID, status: .main))
-        let serverAlive = await tmux.serverExists(server: correctTmuxServer)
+        let serverAlive = await blit.serverExists(socket: blitSocket)
+        let liveTerminalIDs: Set<String>
+        if serverAlive {
+            liveTerminalIDs = Set((try? await blit.listWindows(socket: blitSocket)) ?? [])
+        } else {
+            liveTerminalIDs = []
+        }
         for wt in allLiveWorktrees {
             let terminals = try await db.terminals.list(worktreeID: wt.id)
             for terminal in terminals where terminal.suspendedAt == nil {
-                if serverAlive {
-                    let alive = await tmux.windowExists(server: wt.tmuxServer, windowID: terminal.tmuxWindowID)
-                    if !alive {
-                        if terminal.isClaudeResumable, let sessionID = terminal.claudeSessionID {
-                            // Window is gone but a resumable session exists.
-                            // Suspend the terminal instead of deleting it — the
-                            // suspend/resume machinery rebuilds a window from the
-                            // session ID on demand. Deleting here would orphan the
-                            // transcript and the session would vanish from TBD.
-                            try? await db.terminals.setSuspended(id: terminal.id, sessionID: sessionID)
-                            logger.info("reconcile: suspended terminal \(terminal.id, privacy: .public) — window \(terminal.tmuxWindowID, privacy: .public) gone, session \(sessionID, privacy: .public) preserved")
-                        } else {
-                            try? await db.terminals.delete(id: terminal.id)
-                            logger.info("reconcile: deleted terminal \(terminal.id, privacy: .public) — window \(terminal.tmuxWindowID, privacy: .public) gone, no session to preserve")
-                        }
-                        await pendingQuestions.clear(terminalID: terminal.id)
-                    }
-                } else {
-                    do {
-                        try await recreateAfterReboot(terminal: terminal, worktree: wt)
-                        logger.info("Reboot recovery: recreated terminal \(terminal.id, privacy: .public) in worktree \(wt.id, privacy: .public)")
-                    } catch {
-                        logger.error("Reboot recovery: failed to recreate terminal \(terminal.id, privacy: .public): \(error, privacy: .public)")
-                    }
+                let alive = serverAlive
+                    && !terminal.blitTerminalID.isEmpty
+                    && liveTerminalIDs.contains(terminal.blitTerminalID)
+                if alive { continue }
+                do {
+                    try await recreateAfterReboot(terminal: terminal, worktree: wt)
+                    logger.info("reconcile: rebuilt terminal \(terminal.id, privacy: .public) in worktree \(wt.id, privacy: .public) — blit terminal gone")
+                } catch {
+                    logger.error("reconcile: failed to rebuild terminal \(terminal.id, privacy: .public): \(error, privacy: .public)")
                 }
             }
         }
 
-        // Clean up orphaned tmux windows — windows not tracked by any terminal
-        // (active, main, or creating). `.creating` worktrees count as live: a
-        // pre-session hook wait that's still in flight (or just resumed by the
-        // startup recovery sweep) owns a real tmux window, and phase 3 spawns
-        // primary/setup windows before the row flips `.active`. Treating those
-        // rows as dead would kill the hook mid-run (interrupting e.g. a running
-        // npm install), fire a spurious `.paneKilled` notification, and spawn
-        // the agent prematurely.
-        let tmuxServer = TmuxManager.serverName(forRepoPath: repo.path)
+        // Clean up orphaned blit terminals — terminals not tracked by any
+        // worktree row (active, main, or creating). `.creating` worktrees count
+        // as live: a pre-session hook wait still in flight (or just resumed by
+        // the startup recovery sweep) owns a real blit terminal, and phase 3
+        // spawns primary/setup terminals before the row flips `.active`.
+        // Treating those rows as dead would kill the hook mid-run (interrupting
+        // e.g. a running npm install) and spawn the agent prematurely.
         let activeWorktrees = try await db.worktrees.list(repoID: repoID, status: .active)
         let mainWorktreesForCleanup = try await db.worktrees.list(repoID: repoID, status: .main)
         let creatingWorktreesForCleanup = try await db.worktrees.list(repoID: repoID, status: .creating)
         let allLiveWorktreesForCleanup = activeWorktrees + mainWorktreesForCleanup + creatingWorktreesForCleanup
         if allLiveWorktreesForCleanup.isEmpty {
-            // No live worktrees (including `.creating` ones) — reap the
-            // server's agent processes first so a wedged one doesn't reparent
-            // to launchd, then kill the entire tmux server. A repo whose only
-            // live row is mid-pre-session must NOT land here, or the hook's
-            // window dies with the server.
-            await reaper.reapServerChildren(server: tmuxServer)
-            do {
-                try await tmux.killServer(server: tmuxServer)
-            } catch {
-                logger.warning("reconcile: failed to kill tmux server \(tmuxServer, privacy: .public): \(error, privacy: .public)")
+            // No live worktrees (including `.creating` ones) — quit the blit
+            // server (which kills all its terminals). A repo whose only live row
+            // is mid-pre-session must NOT land here, or the hook's terminal dies
+            // with the server.
+            if await blit.serverExists(socket: blitSocket) {
+                do {
+                    try await blit.killServer(socket: blitSocket)
+                } catch {
+                    logger.warning("reconcile: failed to quit blit server \(blitSocket, privacy: .public): \(error, privacy: .public)")
+                }
             }
-        } else {
-            // Collect all tracked window IDs (active + main + creating worktrees)
-            var trackedWindowIDs: Set<String> = []
+        } else if await blit.serverExists(socket: blitSocket) {
+            // Collect all tracked blit terminal IDs (active + main + creating).
+            var trackedTerminalIDs: Set<String> = []
             for wt in allLiveWorktreesForCleanup {
                 let terminals = try await db.terminals.list(worktreeID: wt.id)
-                for t in terminals {
-                    trackedWindowIDs.insert(t.tmuxWindowID)
+                for t in terminals where !t.blitTerminalID.isEmpty {
+                    trackedTerminalIDs.insert(t.blitTerminalID)
                 }
             }
 
-            // List actual tmux windows and kill any that aren't tracked
+            // List actual blit terminals and kill any that aren't tracked.
             do {
-                let tmuxWindows = try await tmux.listWindows(server: tmuxServer, session: "main")
-                for window in tmuxWindows where !trackedWindowIDs.contains(window.windowID) {
-                    await killWindowAndReap(
-                        server: tmuxServer,
-                        windowID: window.windowID,
-                        paneID: window.paneID
+                let blitTerminals = try await blit.listWindows(socket: blitSocket)
+                for terminalID in blitTerminals where !trackedTerminalIDs.contains(terminalID) {
+                    await killTerminalAndReap(
+                        socket: blitSocket,
+                        terminalID: terminalID,
+                        pidfile: nil
                     )
                 }
             } catch {
-                logger.warning("reconcile: failed to list tmux windows for server \(tmuxServer, privacy: .public): \(error, privacy: .public)")
+                logger.warning("reconcile: failed to list blit terminals for socket \(blitSocket, privacy: .public): \(error, privacy: .public)")
             }
         }
 
@@ -268,33 +261,27 @@ extension WorktreeLifecycle {
 
     // MARK: - Reboot Recovery
 
-    /// Recreates a tmux window for a terminal record after the tmux server has been lost
-    /// (e.g. machine reboot). Updates the terminal's stored window/pane IDs in the DB.
+    /// Respawns a blit terminal for a terminal record whose in-memory blit state
+    /// was lost (daemon/machine restart — blit's server is in-memory). Resumable
+    /// Claude terminals come back via `claude --resume <sessionID>`; everything
+    /// else respawns fresh. The saved ANSI snapshot is retained on the row so
+    /// the app can show it until live output arrives. Updates the terminal's
+    /// stored blit terminal ID + pidfile in the DB.
     ///
-    /// Visibility: `internal` (not `private`) so tests in the same module can drive
-    /// this path directly. The reconcile dispatcher only enters this branch when
-    /// `serverExists → false`, which `TmuxManager(dryRun: true)` cannot simulate.
+    /// Visibility: `internal` (not `private`) so tests in the same module can
+    /// drive this path directly.
     internal func recreateAfterReboot(terminal: Terminal, worktree: Worktree) async throws {
-        // tmux invariant: killing the ONLY window in a session destroys the
-        // session, and a server with no sessions exits. `ensureServer` here
-        // bootstraps a brand-new server via `new-session -d -s main`, leaving
-        // exactly one window. If we kill that bootstrap window now, the
-        // session collapses, the server exits, and the `createWindow` call
-        // below fails with `no server running on …`. Defer the kill until
-        // after the real window exists so the session always has at least
-        // one window during the transition.
-        let bootstrapWindowID = try await tmux.ensureServer(
-            server: worktree.tmuxServer, session: "main", cwd: worktree.path
-        )
-
-        let rebootConfig = try? await db.config.get()
-        let claudeEnvOverrides = rebootConfig?.envSettingOverrides ?? [:]
         // Free-form env overrides applied to recreated agent panes (global <
         // repo < profile). Codex takes the merged map as-is; Claude layers the
         // builder's auth/routing env on top; plain shells get nothing. The repo
-        // record is fetched once here, but each agent branch performs its own
-        // merge so non-agent (shell/cmd) panes skip the work entirely.
+        // record is fetched once here; the blit socket is derived from its path.
         let rebootRepo = try? await db.repos.get(id: worktree.repoID)
+        let repoPath = rebootRepo?.path ?? worktree.path
+        // Ensure the per-repo blit server + gateway are running and persisted.
+        let blitSocket = try await ensureBlitProvisioned(worktree: worktree, repoPath: repoPath)
+
+        let rebootConfig = try? await db.config.get()
+        let claudeEnvOverrides = rebootConfig?.envSettingOverrides ?? [:]
         let spawn: ClaudeSpawnCommandBuilder.Result
         // Per-branch free-form env layered into the recreated pane; defaults to
         // none (plain shells stay clean).
@@ -382,36 +369,21 @@ extension WorktreeLifecycle {
             )
         }
 
-        let window: (windowID: String, paneID: String)
-        do {
-            window = try await tmux.createWindow(
-                server: worktree.tmuxServer,
-                session: "main",
-                cwd: worktree.path,
-                shellCommand: spawn.command,
-                env: env,
-                sensitiveEnv: primarySensitiveEnv
-            )
-        } catch {
-            // If we just bootstrapped the server and createWindow failed, the
-            // server is alive with only the placeholder window. On the next
-            // reconcile, `serverAlive=true` + `windowExists("@stale")=false`
-            // would route this terminal to the dead-window-delete path and
-            // lose the record. Kill the server so the next reconcile takes
-            // the serverExists=false branch and retries recovery here.
-            if bootstrapWindowID != nil {
-                try? await tmux.killServer(server: worktree.tmuxServer)
-            }
-            throw error
-        }
-        // Now that a real window exists, it's safe to kill the bootstrap.
-        // The session retains the freshly-created window, so it stays alive
-        // and the server keeps running. Best-effort: a failure here just
-        // leaves an empty placeholder window behind, which the orphan-window
-        // cleanup pass in reconcile() will remove next time.
-        if let bootstrapWindowID {
-            try? await tmux.killWindow(server: worktree.tmuxServer, windowID: bootstrapWindowID)
-        }
-        try await db.terminals.updateTmuxIDs(id: terminal.id, windowID: window.windowID, paneID: window.paneID)
+        let window = try await blit.createWindow(
+            forRepoPath: repoPath,
+            socket: blitSocket,
+            cwd: worktree.path,
+            shellCommand: spawn.command,
+            env: env,
+            sensitiveEnv: primarySensitiveEnv
+        )
+        // Record the new blit terminal ID + pidfile. The saved ANSI snapshot on
+        // the row is intentionally retained so the app can show it until live
+        // output arrives over the gateway.
+        try await db.terminals.updateBlitTerminal(
+            id: terminal.id,
+            blitTerminalID: window.terminalID,
+            blitPidfilePath: window.pidfilePath
+        )
     }
 }

@@ -41,6 +41,7 @@ struct RPCRouterWorktreeCreateBroadcastTests {
             db: db,
             git: GitManager(),
             tmux: TmuxManager(dryRun: true),
+            blit: BlitManager(dryRun: true),
             hooks: HookResolver(),
             subscriptions: subs,
             preSessionPollInterval: 0.05
@@ -49,6 +50,7 @@ struct RPCRouterWorktreeCreateBroadcastTests {
             db: db,
             lifecycle: lifecycle,
             tmux: TmuxManager(dryRun: true),
+            blit: BlitManager(dryRun: true),
             subscriptions: subs
         )
         return (router, deltas)

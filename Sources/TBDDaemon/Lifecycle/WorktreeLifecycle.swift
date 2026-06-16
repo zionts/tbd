@@ -52,6 +52,10 @@ public struct WorktreeLifecycle: Sendable {
     public let db: TBDDatabase
     public let git: GitManager
     public let tmux: TmuxManager
+    /// Blit terminal backend. The daemon spawns terminals through this instead
+    /// of tmux (Phase 4). `tmux` is retained for the agent reaper's
+    /// process-introspection seams only, until the final tmux removal phase.
+    public let blit: BlitManager
     public let hooks: HookResolver
     public let subscriptions: StateSubscriptionManager?
     public let modelProfileResolver: ModelProfileResolver?
@@ -79,6 +83,7 @@ public struct WorktreeLifecycle: Sendable {
         db: TBDDatabase,
         git: GitManager,
         tmux: TmuxManager,
+        blit: BlitManager = BlitManager(),
         hooks: HookResolver,
         subscriptions: StateSubscriptionManager? = nil,
         modelProfileResolver: ModelProfileResolver? = nil,
@@ -92,6 +97,7 @@ public struct WorktreeLifecycle: Sendable {
         self.db = db
         self.git = git
         self.tmux = tmux
+        self.blit = blit
         self.hooks = hooks
         self.subscriptions = subscriptions
         self.modelProfileResolver = modelProfileResolver
@@ -109,16 +115,50 @@ public struct WorktreeLifecycle: Sendable {
                     graceAttempts: reaperGraceAttempts, pollInterval: reaperPollInterval)
     }
 
-    /// Kill a tmux window, then confirm the pane process actually died and
-    /// escalate (SIGTERM→SIGKILL) if it survived the SIGHUP (wedged agent).
-    func killWindowAndReap(server: String, windowID: String, paneID: String) async {
-        let panePID = Int32((try? await tmux.panePID(server: server, paneID: paneID)) ?? "")
+    /// Kill a blit terminal, then confirm the leader process actually died and
+    /// escalate (SIGTERM→SIGKILL) if it survived (wedged agent). The leader PID
+    /// comes from the per-terminal pidfile, since blit exposes no PID.
+    func killTerminalAndReap(socket: String, terminalID: String, pidfile: String?) async {
+        let leaderPID = pidfile.flatMap { blit.leaderPID(forPidfile: $0) }
         do {
-            try await tmux.killWindow(server: server, windowID: windowID)
+            try await blit.killWindow(socket: socket, terminalID: terminalID)
         } catch {
-            logger.warning("killWindow failed on \(server, privacy: .public) window \(windowID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            logger.warning("killWindow failed on \(socket, privacy: .public) terminal \(terminalID, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
-        // Escalate even if killWindow threw — the pane process may still be alive.
-        if let panePID { await reaper.escalateAfterHangup(panePID) }
+        // Escalate even if killWindow threw — the leader process may still be alive.
+        if let leaderPID { await reaper.escalateAfterHangup(leaderPID) }
+    }
+
+    /// Ensures the per-repo blit server + gateway are running for `worktree` and
+    /// persists the resulting socket/port/passphrase onto the worktree row.
+    /// Idempotent: re-running re-derives the socket (deterministic per repo
+    /// path) and only spawns a gateway when one isn't already recorded. Returns
+    /// the resolved socket path the caller threads into blit terminal calls.
+    @discardableResult
+    func ensureBlitProvisioned(worktree: Worktree, repoPath: String) async throws -> String {
+        let socket = BlitManager.socketPath(forRepoPath: repoPath)
+        try await blit.ensureServer(socket: socket)
+        // Provision a gateway once per worktree. blit's gateway is an in-memory
+        // child with a fresh loopback port each spawn; re-provisioning on every
+        // call would churn ports the app is connected to. Only (re)provision
+        // when the row has no recorded port yet.
+        var port = worktree.gatewayPort
+        var passphrase = worktree.gatewayPassphrase
+        if port == nil || passphrase == nil {
+            let gateway = try await blit.ensureGateway(socket: socket)
+            port = gateway.port
+            passphrase = gateway.passphrase
+        }
+        if worktree.blitSocket != socket
+            || worktree.gatewayPort != port
+            || worktree.gatewayPassphrase != passphrase {
+            try await db.worktrees.updateBlitGateway(
+                id: worktree.id,
+                blitSocket: socket,
+                gatewayPort: port,
+                gatewayPassphrase: passphrase
+            )
+        }
+        return socket
     }
 }

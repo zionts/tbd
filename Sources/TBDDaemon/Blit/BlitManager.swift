@@ -371,10 +371,18 @@ public struct BlitManager: Sendable {
         let tag = "t-\(UUID().uuidString.prefix(8).lowercased())"
         let pidfile = Self.pidfilePath(forRepoPath: repoPath, tag: tag, environment: environment)
 
-        // Write secrets to a 0600 env-file before spawn so they never appear in
-        // the blit invocation's argv. The wrapper sources then deletes it.
-        var envFilePath: String?
-        if !sensitiveEnv.isEmpty {
+        // Resolve the secrets env-file path. In dryRun, do NOT write it to disk
+        // (tests must not touch ~/tbd) — use a synthetic path so the wrapper
+        // shape stays realistic for assertions; the secret value still never
+        // appears in argv. Otherwise write a real 0600 file the wrapper sources
+        // and deletes, keeping secrets out of the blit invocation's argv.
+        let envFilePath: String?
+        if sensitiveEnv.isEmpty {
+            envFilePath = nil
+        } else if dryRun {
+            envFilePath = Self.runDir(environment: environment)
+                .appendingPathComponent("\(Self.serverName(forRepoPath: repoPath))-\(tag).env").path
+        } else {
             envFilePath = try Self.writeEnvFile(sensitiveEnv, repoPath: repoPath, tag: tag, environment: environment)
         }
 

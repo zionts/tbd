@@ -3,16 +3,20 @@ import Testing
 @testable import TBDDaemonLib
 @testable import TBDShared
 
-/// Regression tests for the bug where recreated tmux panes inherited a stale
-/// `TBD_WORKTREE_ID` from their tmux server's global env, mis-routing
+/// Regression tests for the bug where recreated panes inherited a stale
+/// `TBD_WORKTREE_ID` from the terminal backend's global env, mis-routing
 /// notifications from sub-worktrees to the main worktree.
+///
+/// Under the blit backend each pane's env is encoded in the spawn wrapper
+/// (`export TBD_WORKTREE_ID='…'; … exec <cmd>`), so the regression surface is
+/// the wrapper body (the last argv element of `blit terminal start`).
 ///
 /// Two surfaces are covered:
 ///  1. `Daemon.scrubInheritedTBDEnv()` clears poisoning vars from the daemon's
-///     own env before any tmux server is spawned.
+///     own env before any terminal server is spawned.
 ///  2. The recreate paths (`recreateAfterReboot` and `handleTerminalRecreateWindow`)
 ///     defensively set `TBD_WORKTREE_ID` on every new pane so they don't
-///     inherit a stale value from the tmux server's global environment.
+///     inherit a stale value.
 
 // MARK: - Recorder helper (mirrors LifecycleRecordedCommands in WorktreeLifecycleTests)
 
@@ -31,12 +35,13 @@ private final class RecordedCommands: @unchecked Sendable {
     }
 }
 
-/// Returns the shell command body (last argument of `new-window`) for any
-/// recorded `new-window` invocation. tmux argv ends with `<shell> -ic <body>`
-/// when env vars are inlined, so the body is the last element.
+/// Returns the wrapper body (last argument of `blit terminal start`) for any
+/// recorded terminal-start invocation. blit argv ends with
+/// `<shell> -lic <wrapper>`, and the wrapper carries the `export …;` env lines
+/// and `exec <cmd>`, so the body is the last element.
 private func newWindowBodies(_ recorded: [[String]]) -> [String] {
     recorded.compactMap { call in
-        guard call.contains("new-window") else { return nil }
+        guard call.contains("terminal") && call.contains("start") else { return nil }
         return call.last
     }
 }
@@ -103,13 +108,15 @@ func testScrubInheritedTBDEnv() {
 func testRecreateAfterRebootClaudeBranchSetsWorktreeID() async throws {
     let db = try TBDDatabase(inMemory: true)
     let recorded = RecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
     let lifecycle = WorktreeLifecycle(
         db: db,
         git: GitManager(),
         tmux: tmux,
+        blit: blit,
         hooks: HookResolver()
     )
 
@@ -149,13 +156,15 @@ func testRecreateAfterRebootCodexBranchSetsWorktreeID() async throws {
 
     let db = try TBDDatabase(inMemory: true)
     let recorded = RecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
     let lifecycle = WorktreeLifecycle(
         db: db,
         git: GitManager(),
         tmux: tmux,
+        blit: blit,
         hooks: HookResolver()
     )
 
@@ -198,13 +207,15 @@ func testRecreateAfterRebootCodexBranchSetsWorktreeID() async throws {
 func testRecreateAfterRebootShellBranchSetsWorktreeID() async throws {
     let db = try TBDDatabase(inMemory: true)
     let recorded = RecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
     let lifecycle = WorktreeLifecycle(
         db: db,
         git: GitManager(),
         tmux: tmux,
+        blit: blit,
         hooks: HookResolver()
     )
 
@@ -242,13 +253,15 @@ func testRecreateAfterRebootCodexKindWinsOverCapturedSessionID() async throws {
 
     let db = try TBDDatabase(inMemory: true)
     let recorded = RecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
     let lifecycle = WorktreeLifecycle(
         db: db,
         git: GitManager(),
         tmux: tmux,
+        blit: blit,
         hooks: HookResolver()
     )
 
@@ -288,7 +301,8 @@ func testRecreateAfterRebootCodexKindWinsOverCapturedSessionID() async throws {
 func testHandleTerminalRecreateWindowSetsWorktreeID() async throws {
     let db = try TBDDatabase(inMemory: true)
     let recorded = RecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
     let router = RPCRouter(
@@ -297,9 +311,11 @@ func testHandleTerminalRecreateWindowSetsWorktreeID() async throws {
             db: db,
             git: GitManager(),
             tmux: tmux,
+            blit: blit,
             hooks: HookResolver()
         ),
-        tmux: tmux
+        tmux: tmux,
+        blit: blit
     )
 
     let repo = try await db.repos.create(
@@ -339,7 +355,8 @@ func testHandleTerminalRecreateWindowCodexLaunchCommand() async throws {
 
     let db = try TBDDatabase(inMemory: true)
     let recorded = RecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
     let router = RPCRouter(
@@ -348,9 +365,11 @@ func testHandleTerminalRecreateWindowCodexLaunchCommand() async throws {
             db: db,
             git: GitManager(),
             tmux: tmux,
+            blit: blit,
             hooks: HookResolver()
         ),
-        tmux: tmux
+        tmux: tmux,
+        blit: blit
     )
 
     let repo = try await db.repos.create(
@@ -425,13 +444,15 @@ func testCreateWorktreeSetupTabExportsTBDIDs() async throws {
 
     let db = try TBDDatabase(inMemory: true)
     let recorded = RecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
     let lifecycle = WorktreeLifecycle(
         db: db,
         git: GitManager(),
         tmux: tmux,
+        blit: blit,
         hooks: HookResolver()
     )
 
@@ -469,7 +490,8 @@ func testCreateWorktreeSetupTabExportsTBDIDs() async throws {
 func testHandleTerminalCreateRegressionWorktreeID() async throws {
     let db = try TBDDatabase(inMemory: true)
     let recorded = RecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
     let router = RPCRouter(
@@ -478,9 +500,11 @@ func testHandleTerminalCreateRegressionWorktreeID() async throws {
             db: db,
             git: GitManager(),
             tmux: tmux,
+            blit: blit,
             hooks: HookResolver()
         ),
-        tmux: tmux
+        tmux: tmux,
+        blit: blit
     )
 
     let repo = try await db.repos.create(
@@ -515,7 +539,8 @@ func testHandleTerminalCreateCodexLaunchCommand() async throws {
 
     let db = try TBDDatabase(inMemory: true)
     let recorded = RecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
     let router = RPCRouter(
@@ -524,9 +549,11 @@ func testHandleTerminalCreateCodexLaunchCommand() async throws {
             db: db,
             git: GitManager(),
             tmux: tmux,
+            blit: blit,
             hooks: HookResolver()
         ),
-        tmux: tmux
+        tmux: tmux,
+        blit: blit
     )
 
     let repo = try await db.repos.create(
@@ -568,7 +595,8 @@ func testHandleTerminalCreateCodexInitialPrompt() async throws {
 
     let db = try TBDDatabase(inMemory: true)
     let recorded = RecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
     let router = RPCRouter(
@@ -577,9 +605,11 @@ func testHandleTerminalCreateCodexInitialPrompt() async throws {
             db: db,
             git: GitManager(),
             tmux: tmux,
+            blit: blit,
             hooks: HookResolver()
         ),
-        tmux: tmux
+        tmux: tmux,
+        blit: blit
     )
 
     let repo = try await db.repos.create(

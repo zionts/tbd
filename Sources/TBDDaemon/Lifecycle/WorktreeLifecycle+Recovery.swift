@@ -98,13 +98,64 @@ extension WorktreeLifecycle {
                 continue
             }
 
-            // Resume the wait. The hook command wraps its exit code into the
-            // marker file, so a hook that finished while the daemon was down
-            // is picked up on the first poll.
+            // Resume the wait. blit's server is in-memory, so after a daemon
+            // restart the pre-session terminal no longer exists. Re-provision the
+            // blit server + gateway and respawn the pre-session hook terminal so
+            // the marker wait has a live window to observe.
+            let recoverySocket: String
+            let recoveredBlitTerminalID: String
+            let recoveredPidfile: String?
+            do {
+                recoverySocket = try await ensureBlitProvisioned(worktree: worktree, repoPath: repo.path)
+                let hookPath = hooks.resolve(
+                    event: .preSession,
+                    repoPath: worktree.path,
+                    appHookPath: TBDConstants.hookPath(
+                        repoID: worktree.repoID,
+                        eventName: HookEvent.preSession.rawValue
+                    )
+                ) ?? ""
+                let markerPath = Self.preSessionMarkerPath(worktreeID: worktree.id)
+                let command = Self.preSessionCommand(
+                    hookPath: hookPath,
+                    runtimeDir: Self.preSessionRuntimeDir,
+                    markerPath: markerPath,
+                    shell: defaultShell
+                )
+                let env: [String: String] = [
+                    "TBD_WORKTREE_ID": worktree.id.uuidString,
+                    "TBD_TERMINAL_ID": preSessionTerminal.id.uuidString,
+                    "TBD_EVENT": HookEvent.preSession.rawValue,
+                    "TBD_WORKTREE_NAME": worktree.name,
+                    "TBD_WORKTREE_PATH": worktree.path,
+                    "TBD_REPO_PATH": repo.path,
+                    "TBD_BRANCH": worktree.branch,
+                ]
+                let window = try await blit.createWindow(
+                    forRepoPath: repo.path,
+                    socket: recoverySocket,
+                    cwd: worktree.path,
+                    shellCommand: command,
+                    env: env,
+                    cols: BlitManager.defaultCols,
+                    rows: BlitManager.defaultRows
+                )
+                recoveredBlitTerminalID = window.terminalID
+                recoveredPidfile = window.pidfilePath
+                try? await db.terminals.updateBlitTerminal(
+                    id: preSessionTerminal.id,
+                    blitTerminalID: window.terminalID,
+                    blitPidfilePath: window.pidfilePath
+                )
+            } catch {
+                logger.warning("recovery: failed to respawn pre-session terminal for worktree \(worktree.id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                continue
+            }
             let spawn = PreSessionSpawn(
                 terminalID: preSessionTerminal.id,
-                windowID: preSessionTerminal.tmuxWindowID,
-                paneID: preSessionTerminal.tmuxPaneID,
+                blitTerminalID: recoveredBlitTerminalID,
+                blitSocket: recoverySocket,
+                blitPidfilePath: recoveredPidfile,
                 markerPath: Self.preSessionMarkerPath(worktreeID: worktree.id),
                 // Informational only in phase 3; best-effort re-resolve.
                 hookPath: hooks.resolve(

@@ -13,7 +13,7 @@ import Testing
     let db = try TBDDatabase(inMemory: true)
     let lifecycle = WorktreeLifecycle(
         db: db, git: GitManager(),
-        tmux: TmuxManager(dryRun: true), hooks: HookResolver()
+        tmux: TmuxManager(dryRun: true), blit: BlitManager(dryRun: true), hooks: HookResolver()
     )
     let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
     let wt = try await lifecycle.createWorktree(repoID: repo.id, skipClaude: true)
@@ -39,7 +39,7 @@ import Testing
     let db = try TBDDatabase(inMemory: true)
     let lifecycle = WorktreeLifecycle(
         db: db, git: GitManager(),
-        tmux: TmuxManager(dryRun: true), hooks: HookResolver()
+        tmux: TmuxManager(dryRun: true), blit: BlitManager(dryRun: true), hooks: HookResolver()
     )
     let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
     let wt = try await lifecycle.createWorktree(repoID: repo.id, skipClaude: true)
@@ -62,7 +62,7 @@ import Testing
     let db = try TBDDatabase(inMemory: true)
     let lifecycle = WorktreeLifecycle(
         db: db, git: GitManager(),
-        tmux: TmuxManager(dryRun: true), hooks: HookResolver()
+        tmux: TmuxManager(dryRun: true), blit: BlitManager(dryRun: true), hooks: HookResolver()
     )
     let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
     let wt = try await lifecycle.createWorktree(repoID: repo.id, skipClaude: true)
@@ -80,7 +80,7 @@ import Testing
     let db = try TBDDatabase(inMemory: true)
     let lifecycle = WorktreeLifecycle(
         db: db, git: GitManager(),
-        tmux: TmuxManager(dryRun: true), hooks: HookResolver()
+        tmux: TmuxManager(dryRun: true), blit: BlitManager(dryRun: true), hooks: HookResolver()
     )
     let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
     let wt = try await lifecycle.createWorktree(repoID: repo.id, skipClaude: true)
@@ -116,7 +116,7 @@ import Testing
     let db = try TBDDatabase(inMemory: true)
     let lifecycle = WorktreeLifecycle(
         db: db, git: GitManager(),
-        tmux: TmuxManager(dryRun: true), hooks: HookResolver()
+        tmux: TmuxManager(dryRun: true), blit: BlitManager(dryRun: true), hooks: HookResolver()
     )
     let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
     let wt = try await lifecycle.createWorktree(repoID: repo.id, skipClaude: true)
@@ -164,7 +164,7 @@ import Testing
     let db = try TBDDatabase(inMemory: true)
     let git = GitManager()
     let lifecycle = WorktreeLifecycle(
-        db: db, git: git, tmux: TmuxManager(dryRun: true), hooks: HookResolver()
+        db: db, git: git, tmux: TmuxManager(dryRun: true), blit: BlitManager(dryRun: true), hooks: HookResolver()
     )
     let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
 
@@ -205,7 +205,7 @@ import Testing
     let db = try TBDDatabase(inMemory: true)
     let git = GitManager()
     let lifecycle = WorktreeLifecycle(
-        db: db, git: git, tmux: TmuxManager(dryRun: true), hooks: HookResolver()
+        db: db, git: git, tmux: TmuxManager(dryRun: true), blit: BlitManager(dryRun: true), hooks: HookResolver()
     )
     let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
     let wt = try await lifecycle.createWorktree(repoID: repo.id, skipClaude: true)
@@ -232,7 +232,7 @@ import Testing
     let db = try TBDDatabase(inMemory: true)
     let git = GitManager()
     let lifecycle = WorktreeLifecycle(
-        db: db, git: git, tmux: TmuxManager(dryRun: true), hooks: HookResolver()
+        db: db, git: git, tmux: TmuxManager(dryRun: true), blit: BlitManager(dryRun: true), hooks: HookResolver()
     )
     let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
     let wt = try await lifecycle.createWorktree(repoID: repo.id, skipClaude: true)
@@ -251,8 +251,10 @@ import Testing
 
 // MARK: - Revive must --resume archived Claude sessions
 
-/// Captures the argv tmux would have been invoked with so we can assert the
-/// shell command body. Mirrors the recorder pattern in ModelProfileSpawnTests.
+/// Captures the argv blit would have been invoked with so we can assert the
+/// spawned command body. Mirrors the recorder pattern in ModelProfileSpawnTests.
+/// blit `terminal start` argv ends with `<shell> -lic <wrapper>`, and the
+/// wrapper carries `exec <claude …>`, so the body is the last argv element.
 private final class TmuxArgvRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var _calls: [[String]] = []
@@ -264,8 +266,12 @@ private final class TmuxArgvRecorder: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         _calls.append(args)
     }
-    /// Last argv element of each call — the shell command body for new-window.
-    var shellBodies: [String] { calls.compactMap { $0.last } }
+    /// Last argv element of each blit `terminal start` call — the spawn wrapper.
+    var shellBodies: [String] {
+        calls
+            .filter { $0.contains("terminal") && $0.contains("start") }
+            .compactMap { $0.last }
+    }
 }
 
 @Test func testReviveSpawnsClaudeWithResumeFlag() async throws {
@@ -274,9 +280,10 @@ private final class TmuxArgvRecorder: @unchecked Sendable {
 
     let db = try TBDDatabase(inMemory: true)
     let recorder = TmuxArgvRecorder()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in recorder.record(args) })
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in recorder.record(args) })
     let lifecycle = WorktreeLifecycle(
-        db: db, git: GitManager(), tmux: tmux, hooks: HookResolver()
+        db: db, git: GitManager(), tmux: tmux, blit: blit, hooks: HookResolver()
     )
     let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
 
@@ -309,9 +316,10 @@ private final class TmuxArgvRecorder: @unchecked Sendable {
 
     let db = try TBDDatabase(inMemory: true)
     let recorder = TmuxArgvRecorder()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in recorder.record(args) })
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in recorder.record(args) })
     let lifecycle = WorktreeLifecycle(
-        db: db, git: GitManager(), tmux: tmux, hooks: HookResolver()
+        db: db, git: GitManager(), tmux: tmux, blit: blit, hooks: HookResolver()
     )
     let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
 

@@ -113,13 +113,16 @@ extension WorktreeLifecycle {
             archivedHeadSHA: capturedSHA
         )
 
-        // Kill all tmux windows for this worktree, reaping any wedged agent
-        // that survives kill-window's SIGHUP.
-        for terminal in terminals {
-            await killWindowAndReap(
-                server: worktree.tmuxServer,
-                windowID: terminal.tmuxWindowID,
-                paneID: terminal.tmuxPaneID
+        // Kill all blit terminals for this worktree, reaping any wedged agent
+        // that survives kill's signal.
+        let archiveSocket = worktree.blitSocket.isEmpty
+            ? BlitManager.socketPath(forRepoPath: repo.path)
+            : worktree.blitSocket
+        for terminal in terminals where !terminal.blitTerminalID.isEmpty {
+            await killTerminalAndReap(
+                socket: archiveSocket,
+                terminalID: terminal.blitTerminalID,
+                pidfile: terminal.blitPidfilePath
             )
         }
 

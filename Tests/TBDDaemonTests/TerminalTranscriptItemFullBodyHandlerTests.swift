@@ -17,9 +17,11 @@ struct TerminalTranscriptItemFullBodyHandlerTests {
                 db: db,
                 git: GitManager(),
                 tmux: TmuxManager(dryRun: true),
+                blit: BlitManager(dryRun: true),
                 hooks: HookResolver()
             ),
             tmux: TmuxManager(dryRun: true),
+            blit: BlitManager(dryRun: true),
             startTime: Date()
         )
     }

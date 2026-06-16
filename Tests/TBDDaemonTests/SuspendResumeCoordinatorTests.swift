@@ -16,8 +16,9 @@ struct SuspendResumeCoordinatorTests {
             tmuxServer: "tbd-test"
         )
         let terminal = try await db.terminals.create(
-            worktreeID: wt.id, tmuxWindowID: "@0", tmuxPaneID: "%0",
-            label: "claude-1", claudeSessionID: "session-abc"
+            worktreeID: wt.id, tmuxWindowID: "", tmuxPaneID: "",
+            label: "claude-1", claudeSessionID: "session-abc",
+            blitTerminalID: "1"
         )
         try await db.terminals.setSuspended(
             id: terminal.id, sessionID: "session-abc", snapshot: "fake snapshot"
@@ -27,8 +28,8 @@ struct SuspendResumeCoordinatorTests {
 
     @Test func resumeSkippedWhenSuspendDisabled() async throws {
         let (db, worktreeID, terminalID) = try await setupSuspendedTerminal()
-        let tmux = TmuxManager(dryRun: true)
-        let coordinator = SuspendResumeCoordinator(db: db, tmux: tmux)
+        let blit = BlitManager(dryRun: true)
+        let coordinator = SuspendResumeCoordinator(db: db, blit: blit)
 
         // Verify terminal is suspended
         let before = try await db.terminals.get(id: terminalID)
@@ -48,8 +49,8 @@ struct SuspendResumeCoordinatorTests {
 
     @Test func resumeRunsWhenSuspendEnabled() async throws {
         let (db, worktreeID, terminalID) = try await setupSuspendedTerminal()
-        let tmux = TmuxManager(dryRun: true)
-        let coordinator = SuspendResumeCoordinator(db: db, tmux: tmux)
+        let blit = BlitManager(dryRun: true)
+        let coordinator = SuspendResumeCoordinator(db: db, blit: blit)
 
         await coordinator.selectionChanged(to: [worktreeID], suspendEnabled: true)
 
@@ -61,8 +62,8 @@ struct SuspendResumeCoordinatorTests {
 
     @Test func manualSuspendSkipsAlreadySuspended() async throws {
         let (db, _, terminalID) = try await setupSuspendedTerminal()
-        let tmux = TmuxManager(dryRun: true)
-        let coordinator = SuspendResumeCoordinator(db: db, tmux: tmux)
+        let blit = BlitManager(dryRun: true)
+        let coordinator = SuspendResumeCoordinator(db: db, blit: blit)
 
         let result = await coordinator.manualSuspend(terminalID: terminalID)
         #expect(result == .alreadySuspended)
@@ -77,11 +78,11 @@ struct SuspendResumeCoordinatorTests {
             tmuxServer: "tbd-test"
         )
         let terminal = try await db.terminals.create(
-            worktreeID: wt.id, tmuxWindowID: "@0", tmuxPaneID: "%0",
-            label: "zsh"
+            worktreeID: wt.id, tmuxWindowID: "", tmuxPaneID: "",
+            label: "zsh", blitTerminalID: "1"
         )
-        let tmux = TmuxManager(dryRun: true)
-        let coordinator = SuspendResumeCoordinator(db: db, tmux: tmux)
+        let blit = BlitManager(dryRun: true)
+        let coordinator = SuspendResumeCoordinator(db: db, blit: blit)
 
         let result = await coordinator.manualSuspend(terminalID: terminal.id)
         #expect(result == .notClaudeTerminal)
@@ -96,11 +97,12 @@ struct SuspendResumeCoordinatorTests {
             tmuxServer: "tbd-test"
         )
         let terminal = try await db.terminals.create(
-            worktreeID: wt.id, tmuxWindowID: "@0", tmuxPaneID: "%0",
-            label: "claude-1", claudeSessionID: "session-abc"
+            worktreeID: wt.id, tmuxWindowID: "", tmuxPaneID: "",
+            label: "claude-1", claudeSessionID: "session-abc",
+            blitTerminalID: "1"
         )
-        let tmux = TmuxManager(dryRun: true)
-        let coordinator = SuspendResumeCoordinator(db: db, tmux: tmux)
+        let blit = BlitManager(dryRun: true)
+        let coordinator = SuspendResumeCoordinator(db: db, blit: blit)
 
         let result = await coordinator.manualResume(terminalID: terminal.id)
         #expect(result == .notSuspended)
@@ -116,17 +118,18 @@ struct SuspendResumeCoordinatorTests {
         )
         let terminal = try await db.terminals.create(
             worktreeID: wt.id,
-            tmuxWindowID: "@0",
-            tmuxPaneID: "%0",
+            tmuxWindowID: "",
+            tmuxPaneID: "",
             label: "Codex",
             claudeSessionID: "session-abc",
-            kind: .codex
+            kind: .codex,
+            blitTerminalID: "1"
         )
         try await db.terminals.setSuspended(
             id: terminal.id, sessionID: "session-abc", snapshot: "fake snapshot"
         )
-        let tmux = TmuxManager(dryRun: true)
-        let coordinator = SuspendResumeCoordinator(db: db, tmux: tmux)
+        let blit = BlitManager(dryRun: true)
+        let coordinator = SuspendResumeCoordinator(db: db, blit: blit)
 
         await coordinator.selectionChanged(to: [wt.id], suspendEnabled: true)
         try await Task.sleep(for: .milliseconds(250))
@@ -147,9 +150,9 @@ struct SuspendResumeCoordinatorTests {
         // api-key profile — oauth profiles no longer inject a token.
         let token = try await db.modelProfiles.create(name: "test-token", kind: .apiKey)
         let terminal = try await db.terminals.create(
-            worktreeID: wt.id, tmuxWindowID: "@0", tmuxPaneID: "%0",
+            worktreeID: wt.id, tmuxWindowID: "", tmuxPaneID: "",
             label: "claude-1", claudeSessionID: "session-abc",
-            profileID: token.id
+            profileID: token.id, blitTerminalID: "1"
         )
         try await db.terminals.setSuspended(
             id: terminal.id, sessionID: "session-abc", snapshot: nil
@@ -164,12 +167,12 @@ struct SuspendResumeCoordinatorTests {
             keychain: { id in id == token.id.uuidString ? secret : nil }
         )
 
-        // Recorder to capture the createWindow shellCommand argument.
+        // Recorder to capture the `blit terminal start` argv.
         let recorded = RecordedCommands()
-        let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+        let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
             recorded.append(args)
         })
-        let coordinator = SuspendResumeCoordinator(db: db, tmux: tmux, modelProfileResolver: resolver)
+        let coordinator = SuspendResumeCoordinator(db: db, blit: blit, modelProfileResolver: resolver)
 
         await coordinator.selectionChanged(to: [wt.id], suspendEnabled: true)
 
@@ -178,31 +181,29 @@ struct SuspendResumeCoordinatorTests {
         }
         #expect(cleared, "Resume should clear suspendedAt when suspendEnabled is true")
 
-        // Find the createWindow invocation (it's the only dryRun call recorded here).
+        // Find the `terminal start` invocation that wraps `claude --resume`.
         let snap = recorded.snapshot()
         let resumeCall = snap.first { $0.joined(separator: " ").contains("claude --resume") }
-        #expect(resumeCall != nil, "expected a createWindow call containing claude --resume")
-        // Token must be passed via tmux -e flag, NOT inlined in the shell command argv.
-        #expect(resumeCall?.contains("ANTHROPIC_API_KEY=\(secret)") == true,
-                "expected token in tmux -e flag; got: \(resumeCall ?? [])")
-        // The shell command body (last arg, after -ic) must NOT contain the secret.
-        let shellBody = resumeCall?.last ?? ""
-        #expect(!shellBody.contains(secret),
-                "secret leaked into shell command body: \(shellBody)")
-        #expect(!shellBody.contains("ANTHROPIC_API_KEY"),
-                "env var name leaked into shell command body: \(shellBody)")
-        #expect(shellBody.contains("claude --resume session-abc"))
+        #expect(resumeCall != nil, "expected a blit terminal start call containing claude --resume")
+        // Blit routes the secret through a 0600 env-file the wrapper sources, so
+        // the token must NOT appear anywhere in the recorded argv.
+        let joinedCall = resumeCall?.joined(separator: " ") ?? ""
+        #expect(!joinedCall.contains(secret),
+                "secret leaked into blit terminal start argv: \(joinedCall)")
+        #expect(!joinedCall.contains("ANTHROPIC_API_KEY=\(secret)"),
+                "secret env assignment leaked into argv: \(joinedCall)")
+        #expect(joinedCall.contains("claude --resume session-abc"))
     }
 
     @Test func resumeOmitsTokenWhenResolverNil() async throws {
         let (db, worktreeID, terminalID) = try await setupSuspendedTerminal()
 
         let recorded = RecordedCommands()
-        let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+        let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
             recorded.append(args)
         })
         // No resolver supplied — fallback branch.
-        let coordinator = SuspendResumeCoordinator(db: db, tmux: tmux, modelProfileResolver: nil)
+        let coordinator = SuspendResumeCoordinator(db: db, blit: blit, modelProfileResolver: nil)
 
         await coordinator.selectionChanged(to: [worktreeID], suspendEnabled: true)
 
@@ -213,7 +214,7 @@ struct SuspendResumeCoordinatorTests {
 
         let joined = recorded.snapshot().map { $0.joined(separator: " ") }
         let resumeArg = joined.first { $0.contains("claude --resume") }
-        #expect(resumeArg != nil, "expected a createWindow call containing claude --resume")
+        #expect(resumeArg != nil, "expected a blit terminal start call containing claude --resume")
         #expect(resumeArg?.contains("CLAUDE_CODE_OAUTH_TOKEN") == false,
                 "fallback branch must not inject CLAUDE_CODE_OAUTH_TOKEN; got: \(resumeArg ?? "nil")")
         #expect(resumeArg?.contains("ANTHROPIC_API_KEY") == false)
@@ -229,11 +230,12 @@ struct SuspendResumeCoordinatorTests {
             tmuxServer: "tbd-test"
         )
         let terminal = try await db.terminals.create(
-            worktreeID: wt.id, tmuxWindowID: "@0", tmuxPaneID: "%0",
-            label: "claude-1", claudeSessionID: "session-abc"
+            worktreeID: wt.id, tmuxWindowID: "", tmuxPaneID: "",
+            label: "claude-1", claudeSessionID: "session-abc",
+            blitTerminalID: "1"
         )
-        let tmux = TmuxManager(dryRun: true)
-        let coordinator = SuspendResumeCoordinator(db: db, tmux: tmux)
+        let blit = BlitManager(dryRun: true)
+        let coordinator = SuspendResumeCoordinator(db: db, blit: blit)
 
         // First: arrive at the worktree so it's in lastKnownSelection
         await coordinator.selectionChanged(to: [wt.id], suspendEnabled: false)
@@ -269,7 +271,7 @@ struct SuspendResumeCoordinatorTests {
     }
 }
 
-/// Thread-safe collector for TmuxManager dryRun recorded args.
+/// Thread-safe collector for BlitManager dryRun recorded args.
 private final class RecordedCommands: @unchecked Sendable {
     private let lock = NSLock()
     private var commands: [[String]] = []

@@ -393,7 +393,7 @@ extension WorktreeLifecycle {
         preSessionTerminalID: UUID?
     ) async throws -> [(id: UUID, label: String)] {
         let worktreeID = worktree.id
-        let tmuxServer = worktree.tmuxServer
+        let repoPath = repo.path
         let worktreePath = worktreePath ?? worktree.path
         let config = try await db.config.get()
         let claudeEnvOverrides = config.envSettingOverrides
@@ -404,19 +404,12 @@ extension WorktreeLifecycle {
         )
         let archivedSessions = archivedClaudeSessions ?? []
         // Resolve a usable size: prefer caller's value, otherwise fall back to
-        // TmuxManager's defaults. tmux's own 80x24 default would let Claude
-        // render into hard-wrapped scrollback that can never be reflowed when
-        // the user later attaches a wider SwiftTerm view.
-        let resolvedCols = cols ?? TmuxManager.defaultCols
-        let resolvedRows = rows ?? TmuxManager.defaultRows
-        // Ensure tmux server exists — capture initial window ID to kill later
-        let initialWindowID = try await tmux.ensureServer(
-            server: tmuxServer,
-            session: "main",
-            cwd: worktreePath,
-            cols: resolvedCols,
-            rows: resolvedRows
-        )
+        // BlitManager's defaults so the web client doesn't attach into
+        // hard-wrapped 80x24 scrollback.
+        let resolvedCols = cols ?? BlitManager.defaultCols
+        let resolvedRows = rows ?? BlitManager.defaultRows
+        // Ensure the per-repo blit server + gateway are running and persisted.
+        let blitSocket = try await ensureBlitProvisioned(worktree: worktree, repoPath: repoPath)
 
         // Resolve model profile (repo override → global default → none).
         // Failures here must NOT break worktree creation — fall back to keychain login.
@@ -518,9 +511,9 @@ extension WorktreeLifecycle {
             primaryProfileID = resolvedProfile?.profileID
             primaryLabel = TerminalLabel.claudeCode
         }
-        let window1 = try await tmux.createWindow(
-            server: tmuxServer,
-            session: "main",
+        let window1 = try await blit.createWindow(
+            forRepoPath: repoPath,
+            socket: blitSocket,
             cwd: worktreePath,
             shellCommand: primaryCommand,
             env: primaryEnv,
@@ -531,12 +524,14 @@ extension WorktreeLifecycle {
         _ = try await db.terminals.create(
             id: plannedTerminalID1,
             worktreeID: worktreeID,
-            tmuxWindowID: window1.windowID,
-            tmuxPaneID: window1.paneID,
+            tmuxWindowID: "",
+            tmuxPaneID: "",
             label: primaryLabel,
             claudeSessionID: primarySessionID,
             profileID: primaryProfileID,
-            kind: primaryTerminalKind
+            kind: primaryTerminalKind,
+            blitTerminalID: window1.terminalID,
+            blitPidfilePath: window1.pidfilePath
         )
         var createdTerminals: [(id: UUID, label: String)] = [
             (id: plannedTerminalID1, label: primaryLabel)
@@ -563,9 +558,9 @@ extension WorktreeLifecycle {
             "TBD_REPO_PATH": repo.path,
             "TBD_BRANCH": worktree.branch,
         ]
-        let window2 = try await tmux.createWindow(
-            server: tmuxServer,
-            session: "main",
+        let window2 = try await blit.createWindow(
+            forRepoPath: repoPath,
+            socket: blitSocket,
             cwd: worktreePath,
             shellCommand: setupCommand,
             env: setupEnv,
@@ -575,10 +570,12 @@ extension WorktreeLifecycle {
         _ = try await db.terminals.create(
             id: plannedTerminalID2,
             worktreeID: worktreeID,
-            tmuxWindowID: window2.windowID,
-            tmuxPaneID: window2.paneID,
+            tmuxWindowID: "",
+            tmuxPaneID: "",
             label: TerminalLabel.setup,
-            kind: .shell
+            kind: .shell,
+            blitTerminalID: window2.terminalID,
+            blitPidfilePath: window2.pidfilePath
         )
         createdTerminals.append((id: plannedTerminalID2, label: TerminalLabel.setup))
 
@@ -622,9 +619,9 @@ extension WorktreeLifecycle {
                     "TBD_WORKTREE_ID": worktreeID.uuidString,
                     "TBD_TERMINAL_ID": plannedID.uuidString,
                 ]
-                let window = try await tmux.createWindow(
-                    server: tmuxServer,
-                    session: "main",
+                let window = try await blit.createWindow(
+                    forRepoPath: repoPath,
+                    socket: blitSocket,
                     cwd: worktreePath,
                     shellCommand: spawn.command,
                     env: perTermEnv,
@@ -636,12 +633,14 @@ extension WorktreeLifecycle {
                 _ = try await db.terminals.create(
                     id: plannedID,
                     worktreeID: worktreeID,
-                    tmuxWindowID: window.windowID,
-                    tmuxPaneID: window.paneID,
+                    tmuxWindowID: "",
+                    tmuxPaneID: "",
                     label: TerminalLabel.claudeCode,
                     claudeSessionID: sessionID,
                     profileID: resolvedProfile?.profileID,
-                    kind: .claude
+                    kind: .claude,
+                    blitTerminalID: window.terminalID,
+                    blitPidfilePath: window.pidfilePath
                 )
                 createdTerminals.append((id: plannedID, label: TerminalLabel.claudeCode))
             }
@@ -657,10 +656,8 @@ extension WorktreeLifecycle {
         try await db.worktrees.setTabOrder(worktreeID: worktreeID, tabIDs: tabOrder)
         try await db.worktrees.setActiveTabID(worktreeID: worktreeID, tabID: plannedTerminalID1)
 
-        // Kill the untracked initial window that new-session created
-        if let windowID = initialWindowID {
-            try? await tmux.killWindow(server: tmuxServer, windowID: windowID)
-        }
+        // No initial-window cleanup needed: unlike tmux's `new-session`, blit's
+        // `server` starts with no terminals, so there's no placeholder to kill.
 
         return createdTerminals
     }

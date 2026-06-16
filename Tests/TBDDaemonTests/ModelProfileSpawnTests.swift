@@ -11,7 +11,10 @@ extension TBDHomeSerialized {
 @Suite("Claude Token Spawn + Swap")
 struct ModelProfileSpawnTests {
 
-    /// Recorder for tmux argv lists invoked during dryRun.
+    /// Recorder for blit argv lists invoked during dryRun. (Named `TmuxRecorder`
+    /// historically; it now feeds `BlitManager.dryRunRecorder`. The blit backend
+    /// records `terminal start …` argv where the LAST element is the zsh wrapper
+    /// string carrying cwd, exported non-sensitive env, and `exec <shellCommand>`.)
     final class TmuxRecorder: @unchecked Sendable {
         private let lock = NSLock()
         private var _calls: [[String]] = []
@@ -24,23 +27,34 @@ struct ModelProfileSpawnTests {
             _calls.append(args)
         }
         var joinedAll: String { calls.map { $0.joined(separator: " ") }.joined(separator: "\n") }
-        /// Concatenation of just the shell-command bodies (last argv element of
-        /// each new-window call). Used to assert that secrets do NOT leak into
-        /// the long-running shell process arg.
+        /// Concatenation of just the wrapper bodies (last argv element of each
+        /// blit `terminal start` call). The wrapper holds the non-sensitive env
+        /// exports and `exec <shellCommand>`; secrets are routed via a 0600
+        /// env-file and so never appear here. Used to assert on the spawned
+        /// claude/codex command + flags, and that secrets do NOT leak.
         var shellBodies: String {
-            calls.compactMap { $0.last }.joined(separator: "\n")
+            calls
+                .filter { $0.contains("terminal") && $0.contains("start") }
+                .compactMap { $0.last }
+                .joined(separator: "\n")
         }
     }
 
     private func makeFixture() -> (RPCRouter, TBDDatabase, TmuxRecorder) {
         let recorder = TmuxRecorder()
-        let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in recorder.record(args) })
+        // Production still holds a TmuxManager (for the reaper), but spawns/
+        // captures go through blit. Attach the recorder to the BLIT manager and
+        // wire the SAME dry-run instance into both lifecycle and router so no
+        // real blit server is ever contacted (avoids serverNotReady).
+        let tmux = TmuxManager(dryRun: true)
+        let blit = BlitManager(dryRun: true, dryRunRecorder: { args in recorder.record(args) })
         let db = try! TBDDatabase(inMemory: true)
-        let lifecycle = WorktreeLifecycle(db: db, git: GitManager(), tmux: tmux, hooks: HookResolver())
+        let lifecycle = WorktreeLifecycle(db: db, git: GitManager(), tmux: tmux, blit: blit, hooks: HookResolver())
         let router = RPCRouter(
             db: db,
             lifecycle: lifecycle,
             tmux: tmux,
+            blit: blit,
             startTime: Date(),
             usageFetcher: StubClaudeUsageFetcher()
         )
@@ -111,10 +125,12 @@ struct ModelProfileSpawnTests {
         #expect(resp.success)
         let term = try resp.decodeResult(Terminal.self)
         #expect(term.profileID == tok.id)
-        // OAuth profiles inject CLAUDE_CONFIG_DIR, not a token.
+        // OAuth profiles inject CLAUDE_CONFIG_DIR, not a token. Under blit,
+        // CLAUDE_CONFIG_DIR is now SENSITIVE env routed through a 0600 env-file
+        // the wrapper sources — so it (and any token) is NOT present in the
+        // recorded argv by design. We can still prove the profile was resolved
+        // (profileID above) and that no secret/token leaks into the argv.
         #expect(!recorder.joinedAll.contains("CLAUDE_CODE_OAUTH_TOKEN"))
-        // The config dir is a path derived from the profile UUID, injected via tmux -e.
-        #expect(recorder.joinedAll.contains("CLAUDE_CONFIG_DIR="))
         #expect(!recorder.shellBodies.contains("CLAUDE_CODE_OAUTH_TOKEN"))
     }
 
@@ -138,9 +154,10 @@ struct ModelProfileSpawnTests {
         #expect(resp.success)
         let term = try resp.decodeResult(Terminal.self)
         #expect(term.profileID == b.id)
-        // OAuth profiles inject CLAUDE_CONFIG_DIR, not a token.
+        // OAuth profiles inject CLAUDE_CONFIG_DIR, not a token. Under blit it
+        // flows via the 0600 env-file (sensitive), so it is NOT in argv; we
+        // assert the override was resolved (profileID==b.id) and no token leaks.
         #expect(!recorder.joinedAll.contains("CLAUDE_CODE_OAUTH_TOKEN"))
-        #expect(recorder.joinedAll.contains("CLAUDE_CONFIG_DIR="))
     }
 
     // MARK: - Spawn: non-claude type ignores token
@@ -174,22 +191,27 @@ struct ModelProfileSpawnTests {
     /// profile).
     private func makeLifecycleFixture() -> (WorktreeLifecycle, TBDDatabase, TmuxRecorder) {
         let recorder = TmuxRecorder()
-        let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in recorder.record(args) })
+        let tmux = TmuxManager(dryRun: true)
+        let blit = BlitManager(dryRun: true, dryRunRecorder: { args in recorder.record(args) })
         let db = try! TBDDatabase(inMemory: true)
         let resolver = ModelProfileResolver(
             profiles: db.modelProfiles, repos: db.repos, config: db.config
         )
         let lifecycle = WorktreeLifecycle(
-            db: db, git: GitManager(), tmux: tmux, hooks: HookResolver(),
+            db: db, git: GitManager(), tmux: tmux, blit: blit, hooks: HookResolver(),
             modelProfileResolver: resolver
         )
         return (lifecycle, db, recorder)
     }
 
     /// Codex's primary spawn carries the merged free-form env overrides
-    /// (global ∪ repo) via tmux `-e KEY=VALUE`. Covers the
+    /// (global ∪ repo) as `sensitiveEnv`. Covers the
     /// `primarySensitiveEnv = mergedEnvOverrides` branch in spawnPrimaryTerminals.
-    @Test("spawn: Codex primary receives merged global+repo env overrides via -e")
+    /// Under blit, sensitive env is written to a 0600 env-file the wrapper
+    /// sources — it is NEVER in the recorded argv — so we assert the spawn
+    /// succeeded and the values do NOT leak into argv. (Merge precedence itself
+    /// is unit-tested via EnvOverrideResolver's own tests.)
+    @Test("spawn: Codex primary receives merged global+repo env overrides (env-file, not argv)")
     func codexReceivesMergedEnvOverrides() async throws {
         let codexHome = FileManager.default.temporaryDirectory
             .appendingPathComponent("tbd-codex-home-\(UUID().uuidString)")
@@ -214,14 +236,19 @@ struct ModelProfileSpawnTests {
             worktree: wt, repo: freshRepo, skipClaude: false, preSessionTerminalID: nil
         )
 
-        // Both scopes reach the Codex pane as sensitive -e env.
-        #expect(recorder.joinedAll.contains("FOO=bar"))
-        #expect(recorder.joinedAll.contains("REPO_VAR=rv"))
+        // A codex spawn happened (proves the branch ran)...
+        #expect(recorder.shellBodies.contains("codex"))
+        // ...and the sensitive overrides are routed via the 0600 env-file, so
+        // they must NOT appear anywhere in the recorded argv.
+        #expect(!recorder.joinedAll.contains("FOO=bar"))
+        #expect(!recorder.joinedAll.contains("REPO_VAR=rv"))
     }
 
     /// With no env overrides configured, the Codex primary spawn injects no
-    /// sensitive `-e` env at all (the empty-config off branch).
-    @Test("spawn: empty config → Codex primary gets no -e env overrides")
+    /// sensitive env at all (the empty-config off branch). Under blit, an empty
+    /// `sensitiveEnv` means the wrapper has NO `set -a; . <envfile>` sourcing
+    /// line at all — so we assert the wrapper body contains no env-file sourcing.
+    @Test("spawn: empty config → Codex primary gets no sensitive env-file sourcing")
     func codexEmptyConfigInjectsNothing() async throws {
         let codexHome = FileManager.default.temporaryDirectory
             .appendingPathComponent("tbd-codex-home-\(UUID().uuidString)")
@@ -241,22 +268,29 @@ struct ModelProfileSpawnTests {
             worktree: wt, repo: repo, skipClaude: false, preSessionTerminalID: nil
         )
 
-        // The Codex `new-window` call exists and carries no `-e` env flag.
+        // The Codex `terminal start` call exists; its wrapper (last argv element)
+        // launches codex and, with empty sensitiveEnv, has NO env-file sourcing
+        // (`set -a; . <envfile>`). blit never emits a `-e` flag.
         let codexCall = try #require(recorder.calls.first {
-            $0.contains("new-window") && ($0.last?.contains("codex") ?? false)
+            $0.contains("terminal") && $0.contains("start") && ($0.last?.contains("codex") ?? false)
         })
-        #expect(!codexCall.contains("-e"))
+        let codexWrapper = codexCall.last ?? ""
+        #expect(!codexWrapper.contains("set -a"),
+                "empty sensitiveEnv must produce no env-file sourcing; got wrapper: \(codexWrapper)")
         #expect(!recorder.joinedAll.contains("FOO=bar"))
     }
 
     // MARK: - Spawn: Claude free-form env overrides (branch-test rule)
 
     /// Claude's primary spawn carries the merged free-form env overrides from
-    /// all three scopes (global ∪ repo ∪ resolved-profile) via tmux
-    /// `-e KEY=VALUE`. Covers the
+    /// all three scopes (global ∪ repo ∪ resolved-profile) as `sensitiveEnv`.
+    /// Covers the
     /// `primarySensitiveEnv = mergedEnvOverrides.merging(spawn.sensitiveEnv)`
-    /// branch in spawnPrimaryTerminals.
-    @Test("spawn: Claude primary receives merged global+repo+profile env overrides via -e")
+    /// branch in spawnPrimaryTerminals. Under blit, sensitive env is written to
+    /// a 0600 env-file the wrapper sources — never in argv — so we assert the
+    /// claude spawn happened and the values do NOT leak into argv. (Merge
+    /// precedence itself is covered by EnvOverrideResolver's own tests.)
+    @Test("spawn: Claude primary receives merged global+repo+profile env overrides (env-file, not argv)")
     func claudeReceivesMergedEnvOverrides() async throws {
         let (lifecycle, db, recorder) = makeLifecycleFixture()
         defer { Task { await cleanup(db) } }
@@ -280,10 +314,13 @@ struct ModelProfileSpawnTests {
             worktree: wt, repo: freshRepo, skipClaude: false, preSessionTerminalID: nil
         )
 
-        // All three scopes reach the Claude pane as sensitive -e env.
-        #expect(recorder.joinedAll.contains("GLOBAL_VAR=gv"))
-        #expect(recorder.joinedAll.contains("REPO_VAR=rv"))
-        #expect(recorder.joinedAll.contains("PROFILE_VAR=pv"))
+        // A claude spawn happened (proves the branch ran)...
+        #expect(recorder.shellBodies.contains("claude "))
+        // ...and all three scopes are routed via the 0600 env-file (sensitive),
+        // so none of their values appear in the recorded argv.
+        #expect(!recorder.joinedAll.contains("GLOBAL_VAR=gv"))
+        #expect(!recorder.joinedAll.contains("REPO_VAR=rv"))
+        #expect(!recorder.joinedAll.contains("PROFILE_VAR=pv"))
     }
 
     /// The Claude builder's structured auth/routing env is layered ON TOP of the
@@ -311,10 +348,16 @@ struct ModelProfileSpawnTests {
             worktree: wt, repo: repo, skipClaude: false, preSessionTerminalID: nil
         )
 
-        // Builder's structured AWS_REGION is final; the free-form value loses.
-        #expect(recorder.joinedAll.contains("AWS_REGION=us-west-2"))
-        #expect(!recorder.joinedAll.contains("AWS_REGION=us-east-1"))
-        #expect(recorder.joinedAll.contains("CLAUDE_CODE_USE_BEDROCK=1"))
+        // Both the builder's structured AWS_REGION and the colliding free-form
+        // value are SENSITIVE env, routed through the 0600 env-file under blit,
+        // so NEITHER value appears in the recorded argv. We assert the claude
+        // spawn happened and that neither region literal leaks into argv. The
+        // auth-wins-over-collision precedence is unit-tested directly via
+        // ClaudeSpawnCommandBuilder / EnvOverrideResolver, not via argv here.
+        #expect(recorder.shellBodies.contains("claude "))
+        #expect(!recorder.joinedAll.contains("us-west-2"))
+        #expect(!recorder.joinedAll.contains("us-east-1"))
+        #expect(!recorder.joinedAll.contains("CLAUDE_CODE_USE_BEDROCK=1"))
     }
 
     // MARK: - Spawn: fallbackModels overlay routing
@@ -466,19 +509,21 @@ struct ModelProfileSpawnTests {
         let oldAfter = try await db.terminals.get(id: oldTerm.id)
         #expect(oldAfter?.profileID == a.id)
 
-        // Daemon did NOT send C-c or send-keys to the old pane
+        // Daemon did NOT interrupt or send input to the old pane. Under blit,
+        // input goes via `terminal send` and Ctrl-C maps to `kill <ID> INT`;
+        // a fork-into-new-tab swap must touch neither.
         let postSwap = Array(recorder.calls.dropFirst(beforeSwap))
         let joined = postSwap.map { $0.joined(separator: " ") }.joined(separator: "\n")
-        #expect(!joined.contains("C-c"))
-        #expect(!joined.contains("send-keys"))
-        // The new tab was spawned with B's CLAUDE_CONFIG_DIR via tmux -e (NOT inlined),
-        // and the shell body contains --session-id <newSessionID> (fresh path),
-        // never --resume.
-        #expect(joined.contains("CLAUDE_CONFIG_DIR="))
+        #expect(!joined.contains("terminal send"))
+        #expect(!joined.contains("kill \(oldTerm.blitTerminalID) INT"))
+        // B's CLAUDE_CONFIG_DIR is SENSITIVE env routed via the 0600 env-file
+        // under blit, so it does NOT appear in argv. The wrapper body (last argv
+        // element of `terminal start`) DOES contain the fresh claude command
+        // (`--session-id <newSessionID>`, never `--resume`).
         #expect(joined.contains("claude --session-id \(newTerm.claudeSessionID!)"))
         #expect(!joined.contains("claude --resume"))
         #expect(joined.contains("--dangerously-skip-permissions"))
-        // Negative: secrets and tokens must NOT appear in any shell body or tmux call.
+        // Negative: secrets and tokens must NOT appear in any wrapper body or argv.
         let postBodies = postSwap.compactMap { $0.last }.joined(separator: "\n")
         #expect(!postBodies.contains("CLAUDE_CODE_OAUTH_TOKEN"))
     }
@@ -516,12 +561,17 @@ struct ModelProfileSpawnTests {
 
         let postSwap = Array(recorder.calls.dropFirst(beforeSwap))
         let joined = postSwap.map { $0.joined(separator: " ") }.joined(separator: "\n")
-        // Blank session → fresh --session-id, never --resume.
+        // Blank session → fresh --session-id, never --resume. The command lives
+        // in the blit wrapper body (last argv element of `terminal start`).
         #expect(joined.contains("claude --session-id"))
         #expect(!joined.contains("claude --resume"))
         #expect(!joined.contains("CLAUDE_CODE_OAUTH_TOKEN"))
+        // No profile (nil) → no CLAUDE_CONFIG_DIR was injected at all. (Even when
+        // present it's sensitive env-file, never argv — so this stays absent.)
         #expect(!joined.contains("CLAUDE_CONFIG_DIR"))
-        #expect(!joined.contains("C-c"))
+        // No interrupt to the old pane (blit Ctrl-C == `kill <ID> INT`).
+        #expect(!joined.contains("terminal send"))
+        #expect(!joined.contains("kill \(oldTerm.blitTerminalID) INT"))
     }
 
     // MARK: - Swap: non-claude terminal errors

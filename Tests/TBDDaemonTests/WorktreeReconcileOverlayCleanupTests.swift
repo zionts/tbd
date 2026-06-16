@@ -36,6 +36,7 @@ struct WorktreeReconcileOverlayCleanupTests {
             db: db,
             git: GitManager(),
             tmux: TmuxManager(dryRun: true),
+            blit: BlitManager(dryRun: true),
             hooks: HookResolver()
         )
         let repo = try await db.repos.create(

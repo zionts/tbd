@@ -62,32 +62,44 @@ actor TranscriptParseCache {
 
 extension RPCRouter {
 
+    // MARK: - Blit socket resolution
+
+    /// The per-repo blit server socket for a worktree, derived deterministically
+    /// from the repo path (BlitManager.socketPath), falling back to the value
+    /// persisted on the worktree row when the repo can't be loaded.
+    func blitSocket(for worktree: Worktree) async throws -> String {
+        if let repo = try await db.repos.get(id: worktree.repoID) {
+            return BlitManager.socketPath(forRepoPath: repo.path)
+        }
+        return worktree.blitSocket.isEmpty
+            ? BlitManager.socketPath(forRepoPath: worktree.path)
+            : worktree.blitSocket
+    }
+
     // MARK: - Terminal Handlers
 
     func handleTerminalCreate(_ paramsData: Data) async throws -> RPCResponse {
         let params = try decoder.decode(TerminalCreateParams.self, from: paramsData)
 
-        // Look up the worktree to get tmux server and path
+        // Look up the worktree to get path
         guard let worktree = try await db.worktrees.get(id: params.worktreeID) else {
             return RPCResponse(error: "Worktree not found: \(params.worktreeID)")
         }
 
-        // Resolve initial size: caller-supplied → TmuxManager defaults to avoid
-        // tmux's 80x24 default producing un-reflowable hard-wrapped scrollback.
-        let resolvedCols = params.cols ?? TmuxManager.defaultCols
-        let resolvedRows = params.rows ?? TmuxManager.defaultRows
-
-        // Ensure tmux server exists before creating window
-        _ = try await tmux.ensureServer(
-            server: worktree.tmuxServer,
-            session: "main",
-            cwd: worktree.path,
-            cols: resolvedCols,
-            rows: resolvedRows
-        )
+        // Resolve initial size: caller-supplied → BlitManager defaults to avoid
+        // an 80x24 default producing un-reflowable hard-wrapped scrollback.
+        let resolvedCols = params.cols ?? BlitManager.defaultCols
+        let resolvedRows = params.rows ?? BlitManager.defaultRows
 
         // Look up repo once for system prompt env vars and Claude session setup
         let repo = try await db.repos.get(id: worktree.repoID)
+
+        // Ensure the per-repo blit server + gateway are running and persisted.
+        let blitSocket = try await lifecycle.ensureBlitProvisioned(
+            worktree: worktree,
+            repoPath: repo?.path ?? worktree.path
+        )
+        let blitRepoPath = repo?.path ?? worktree.path
 
         // Fetch config once for both the typed Claude env overrides and the
         // free-form env overrides (global < repo < profile). The profile scope
@@ -144,9 +156,9 @@ extension RPCRouter {
                 repo: repo?.envOverrides,
                 profile: nil
             )
-            let window = try await tmux.createWindow(
-                server: worktree.tmuxServer,
-                session: "main",
+            let window = try await blit.createWindow(
+                forRepoPath: blitRepoPath,
+                socket: blitSocket,
                 cwd: worktree.path,
                 shellCommand: CodexSpawnCommandBuilder.build(initialPrompt: params.prompt),
                 env: codexEnv,
@@ -158,12 +170,14 @@ extension RPCRouter {
             let terminal = try await db.terminals.create(
                 id: plannedTerminalID,
                 worktreeID: params.worktreeID,
-                tmuxWindowID: window.windowID,
-                tmuxPaneID: window.paneID,
+                tmuxWindowID: "",
+                tmuxPaneID: "",
                 label: TerminalLabel.codex,
                 claudeSessionID: nil,
                 profileID: nil,
-                kind: .codex
+                kind: .codex,
+                blitTerminalID: window.terminalID,
+                blitPidfilePath: window.pidfilePath
             )
 
             subscriptions.broadcast(delta: .terminalCreated(TerminalDelta(
@@ -263,9 +277,9 @@ extension RPCRouter {
         } else {
             primarySensitiveEnv = spawn.sensitiveEnv
         }
-        let window = try await tmux.createWindow(
-            server: worktree.tmuxServer,
-            session: "main",
+        let window = try await blit.createWindow(
+            forRepoPath: blitRepoPath,
+            socket: blitSocket,
             cwd: worktree.path,
             shellCommand: spawn.command,
             env: env,
@@ -278,12 +292,14 @@ extension RPCRouter {
         let terminal = try await db.terminals.create(
             id: plannedTerminalID,
             worktreeID: params.worktreeID,
-            tmuxWindowID: window.windowID,
-            tmuxPaneID: window.paneID,
+            tmuxWindowID: "",
+            tmuxPaneID: "",
             label: label,
             claudeSessionID: claudeSessionID,
             profileID: resolvedProfile?.profileID,
-            kind: terminalKind
+            kind: terminalKind,
+            blitTerminalID: window.terminalID,
+            blitPidfilePath: window.pidfilePath
         )
 
         subscriptions.broadcast(delta: .terminalCreated(TerminalDelta(
@@ -307,9 +323,11 @@ extension RPCRouter {
             return RPCResponse(error: "Terminal not found: \(params.terminalID)")
         }
 
-        // Kill the tmux window
-        if let worktree = try await db.worktrees.get(id: terminal.worktreeID) {
-            try? await tmux.killWindow(server: worktree.tmuxServer, windowID: terminal.tmuxWindowID)
+        // Kill the blit terminal
+        if let worktree = try await db.worktrees.get(id: terminal.worktreeID),
+           !terminal.blitTerminalID.isEmpty {
+            let socket = try await blitSocket(for: worktree)
+            try? await blit.killWindow(socket: socket, terminalID: terminal.blitTerminalID)
         }
 
         // Delete from DB
@@ -349,20 +367,19 @@ extension RPCRouter {
             return RPCResponse(error: "Worktree not found for terminal: \(params.terminalID)")
         }
 
-        // Kill the old window if it still exists (avoids orphans)
-        try? await tmux.killWindow(server: worktree.tmuxServer, windowID: terminal.tmuxWindowID)
+        let resolvedCols = params.cols ?? BlitManager.defaultCols
+        let resolvedRows = params.rows ?? BlitManager.defaultRows
 
-        let resolvedCols = params.cols ?? TmuxManager.defaultCols
-        let resolvedRows = params.rows ?? TmuxManager.defaultRows
-
-        // Ensure tmux server exists
-        _ = try await tmux.ensureServer(
-            server: worktree.tmuxServer,
-            session: "main",
-            cwd: worktree.path,
-            cols: resolvedCols,
-            rows: resolvedRows
+        // Ensure the per-repo blit server + gateway are running and persisted.
+        let recreateRepoPath = (try? await db.repos.get(id: worktree.repoID))?.path ?? worktree.path
+        let blitSocket = try await lifecycle.ensureBlitProvisioned(
+            worktree: worktree, repoPath: recreateRepoPath
         )
+
+        // Kill the old blit terminal if it still exists (avoids orphans)
+        if !terminal.blitTerminalID.isEmpty {
+            try? await blit.killWindow(socket: blitSocket, terminalID: terminal.blitTerminalID)
+        }
 
         // Branch on terminal kind: codex stays codex; shell/claude become shell
         if terminal.kind == .codex || terminal.label == TerminalLabel.codex {
@@ -387,9 +404,9 @@ extension RPCRouter {
                 repo: recreateRepo?.envOverrides,
                 profile: nil
             )
-            let window = try await tmux.createWindow(
-                server: worktree.tmuxServer,
-                session: "main",
+            let window = try await blit.createWindow(
+                forRepoPath: recreateRepoPath,
+                socket: blitSocket,
                 cwd: worktree.path,
                 shellCommand: CodexSpawnCommandBuilder.command,
                 env: codexEnv,
@@ -398,11 +415,11 @@ extension RPCRouter {
                 rows: resolvedRows
             )
 
-            // Update tmux IDs but DO NOT call clearRecreated — that nukes the label and kind
-            try await db.terminals.updateTmuxIDs(
+            // Update blit IDs but DO NOT call clearRecreated — that nukes the label and kind
+            try await db.terminals.updateBlitTerminal(
                 id: params.terminalID,
-                windowID: window.windowID,
-                paneID: window.paneID
+                blitTerminalID: window.terminalID,
+                blitPidfilePath: window.pidfilePath
             )
             try await db.terminals.setActivityState(id: params.terminalID, activityState: .unknown)
 
@@ -422,9 +439,9 @@ extension RPCRouter {
             // identity into this one.
             let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
             let env: [String: String] = ["TBD_WORKTREE_ID": worktree.id.uuidString]
-            let window = try await tmux.createWindow(
-                server: worktree.tmuxServer,
-                session: "main",
+            let window = try await blit.createWindow(
+                forRepoPath: recreateRepoPath,
+                socket: blitSocket,
                 cwd: worktree.path,
                 shellCommand: shell,
                 env: env,
@@ -432,12 +449,13 @@ extension RPCRouter {
                 rows: resolvedRows
             )
 
-            // Update the terminal record with new window/pane IDs and clear stale
+            // Update the terminal record with new blit IDs first, then clear stale
             // Claude metadata — the recreated window runs a plain shell, not Claude.
-            try await db.terminals.updateTmuxIDs(
+            // (clearRecreated leaves the blit IDs intact.)
+            try await db.terminals.updateBlitTerminal(
                 id: params.terminalID,
-                windowID: window.windowID,
-                paneID: window.paneID
+                blitTerminalID: window.terminalID,
+                blitPidfilePath: window.pidfilePath
             )
             try await db.terminals.clearRecreated(id: params.terminalID)
 
@@ -461,9 +479,10 @@ extension RPCRouter {
             return RPCResponse(error: "Worktree not found for terminal: \(params.terminalID)")
         }
 
-        let rawOutput = try await tmux.capturePaneOutput(
-            server: worktree.tmuxServer,
-            paneID: terminal.tmuxPaneID
+        let socket = try await blitSocket(for: worktree)
+        let rawOutput = try await blit.capturePaneOutput(
+            socket: socket,
+            terminalID: terminal.blitTerminalID
         )
 
         let lines = params.lines ?? 50
@@ -704,14 +723,20 @@ extension RPCRouter {
             scheduleRecapture = false
         }
 
-        // Resolve initial size: caller-supplied → TmuxManager defaults to avoid
-        // tmux's 80x24 default producing un-reflowable hard-wrapped scrollback.
-        let resolvedCols = params.cols ?? TmuxManager.defaultCols
-        let resolvedRows = params.rows ?? TmuxManager.defaultRows
+        // Resolve initial size: caller-supplied → BlitManager defaults to avoid
+        // an 80x24 default producing un-reflowable hard-wrapped scrollback.
+        let resolvedCols = params.cols ?? BlitManager.defaultCols
+        let resolvedRows = params.rows ?? BlitManager.defaultRows
 
-        let window = try await tmux.createWindow(
-            server: worktree.tmuxServer,
-            session: "main",
+        // Ensure the per-repo blit server + gateway are running and persisted.
+        let swapRepoPath = repo?.path ?? worktree.path
+        let blitSocket = try await lifecycle.ensureBlitProvisioned(
+            worktree: worktree, repoPath: swapRepoPath
+        )
+
+        let window = try await blit.createWindow(
+            forRepoPath: swapRepoPath,
+            socket: blitSocket,
             cwd: worktree.path,
             shellCommand: spawn.command,
             env: env,
@@ -723,12 +748,14 @@ extension RPCRouter {
         let newTerminal = try await db.terminals.create(
             id: plannedTerminalID,
             worktreeID: worktree.id,
-            tmuxWindowID: window.windowID,
-            tmuxPaneID: window.paneID,
+            tmuxWindowID: "",
+            tmuxPaneID: "",
             label: "claude",
             claudeSessionID: storedSessionID,
             profileID: resolved?.profileID,
-            kind: .claude
+            kind: .claude,
+            blitTerminalID: window.terminalID,
+            blitPidfilePath: window.pidfilePath
         )
 
         subscriptions.broadcast(delta: .terminalCreated(TerminalDelta(
@@ -742,14 +769,13 @@ extension RPCRouter {
         // stored the correct ID, so no recapture is needed.
         if scheduleRecapture {
             let newTerminalID = newTerminal.id
-            let newPaneID = window.paneID
-            let server = worktree.tmuxServer
-            let tmuxRef = self.tmux
+            let newPidfile = window.pidfilePath
+            let blitRef = self.blit
             let dbRef = self.db
             Task {
                 try? await Task.sleep(for: .seconds(5))
-                let detector = ClaudeStateDetector(tmux: tmuxRef)
-                if let recaptured = await detector.captureSessionID(server: server, paneID: newPaneID) {
+                let detector = BlitClaudeStateDetector(blit: blitRef)
+                if let recaptured = await detector.captureSessionID(pidfile: newPidfile) {
                     try? await dbRef.terminals.updateSessionID(id: newTerminalID, sessionID: recaptured)
                 }
             }
@@ -768,21 +794,22 @@ extension RPCRouter {
             return RPCResponse(error: "Terminal not found: \(params.terminalID)")
         }
 
-        // Look up the worktree to get the tmux server name
+        // Look up the worktree to resolve the blit socket
         guard let worktree = try await db.worktrees.get(id: terminal.worktreeID) else {
             return RPCResponse(error: "Worktree not found for terminal: \(params.terminalID)")
         }
 
-        try await tmux.sendKeys(
-            server: worktree.tmuxServer,
-            paneID: terminal.tmuxPaneID,
+        let socket = try await blitSocket(for: worktree)
+        try await blit.sendKeys(
+            socket: socket,
+            terminalID: terminal.blitTerminalID,
             text: params.text
         )
 
         if params.submit == true {
-            try await tmux.sendKey(
-                server: worktree.tmuxServer,
-                paneID: terminal.tmuxPaneID,
+            try await blit.sendKey(
+                socket: socket,
+                terminalID: terminal.blitTerminalID,
                 key: "Enter"
             )
         }
@@ -792,38 +819,16 @@ extension RPCRouter {
 
     // MARK: - Main Area Size Broadcast
 
-    /// Resize every known tmux window to the new cell dimensions. Called by
-    /// the app when its main terminal area resizes (debounced) so detached
-    /// panes don't keep stale dimensions; attached panes get overwritten by
-    /// SwiftTerm's TIOCSWINSZ within milliseconds.
+    /// Previously broadcast a resize to every tmux window. With blit, the web
+    /// client (WKWebView) drives terminal size directly over the gateway, so
+    /// there is no daemon-side resize to perform. The RPC method is retained
+    /// (the app still calls it) but is now a validated no-op.
     func handleSetMainAreaSize(_ paramsData: Data) async throws -> RPCResponse {
         let params = try decoder.decode(SetMainAreaSizeParams.self, from: paramsData)
-        guard params.cols >= TmuxManager.minCols, params.rows >= TmuxManager.minRows else {
-            // Silently ignore degenerate sizes — clients can race below the
-            // minimum during window setup; tmux handles it correctly when the
-            // next valid size comes in.
+        guard params.cols >= BlitManager.minCols, params.rows >= BlitManager.minRows else {
             return .ok()
         }
-
-        let allTerminals = try await db.terminals.list()
-        // Filter to active worktrees only — archived worktrees have had their
-        // tmux servers killed, so resizing windows there spawns dead `tmux
-        // resize-window` processes (errors swallowed by `try?`) on every
-        // resize-debounce tick during a window drag.
-        let worktrees = try await db.worktrees.list(status: .active)
-        let serverByWorktree = Dictionary(uniqueKeysWithValues: worktrees.map { ($0.id, $0.tmuxServer) })
-
-        logger.debug("setMainAreaSize \(params.cols, privacy: .public)x\(params.rows, privacy: .public) across \(allTerminals.count, privacy: .public) terminals")
-
-        for terminal in allTerminals {
-            guard let server = serverByWorktree[terminal.worktreeID] else { continue }
-            try? await tmux.resizeWindow(
-                server: server,
-                windowID: terminal.tmuxWindowID,
-                cols: params.cols,
-                rows: params.rows
-            )
-        }
+        logger.debug("setMainAreaSize \(params.cols, privacy: .public)x\(params.rows, privacy: .public) — no-op under blit (web client drives size)")
         return .ok()
     }
 

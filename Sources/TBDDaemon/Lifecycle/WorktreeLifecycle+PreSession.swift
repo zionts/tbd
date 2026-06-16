@@ -8,8 +8,12 @@ private let logger = Logger(subsystem: "com.tbd.daemon", category: "worktreeLife
 /// wait + primary terminal spawn) consumes it.
 struct PreSessionSpawn: Sendable {
     let terminalID: UUID
-    let windowID: String
-    let paneID: String
+    /// blit terminal ID for the pre-session hook terminal.
+    let blitTerminalID: String
+    /// blit server socket the pre-session terminal lives on.
+    let blitSocket: String
+    /// Per-terminal pidfile path the blit spawn wrapper wrote.
+    let blitPidfilePath: String?
     let markerPath: String
     let hookPath: String
 }
@@ -94,19 +98,11 @@ extension WorktreeLifecycle {
         }
 
         let worktreeID = worktree.id
-        let tmuxServer = worktree.tmuxServer
-        let resolvedCols = cols ?? TmuxManager.defaultCols
-        let resolvedRows = rows ?? TmuxManager.defaultRows
+        let resolvedCols = cols ?? BlitManager.defaultCols
+        let resolvedRows = rows ?? BlitManager.defaultRows
 
-        // Ensure tmux server exists — capture initial window ID to kill once
-        // the first real window (the pre-session one) exists.
-        let initialWindowID = try await tmux.ensureServer(
-            server: tmuxServer,
-            session: "main",
-            cwd: worktreePath,
-            cols: resolvedCols,
-            rows: resolvedRows
-        )
+        // Ensure the per-repo blit server + gateway are running and persisted.
+        let blitSocket = try await ensureBlitProvisioned(worktree: worktree, repoPath: repo.path)
 
         let terminalID = UUID()
         let markerPath = Self.preSessionMarkerPath(worktreeID: worktreeID)
@@ -131,9 +127,9 @@ extension WorktreeLifecycle {
             "TBD_REPO_PATH": repo.path,
             "TBD_BRANCH": worktree.branch,
         ]
-        let window = try await tmux.createWindow(
-            server: tmuxServer,
-            session: "main",
+        let window = try await blit.createWindow(
+            forRepoPath: repo.path,
+            socket: blitSocket,
             cwd: worktreePath,
             shellCommand: command,
             env: env,
@@ -143,25 +139,25 @@ extension WorktreeLifecycle {
         _ = try await db.terminals.create(
             id: terminalID,
             worktreeID: worktreeID,
-            tmuxWindowID: window.windowID,
-            tmuxPaneID: window.paneID,
+            tmuxWindowID: "",
+            tmuxPaneID: "",
             label: TerminalLabel.preSession,
-            kind: .shell
+            kind: .shell,
+            blitTerminalID: window.terminalID,
+            blitPidfilePath: window.pidfilePath
         )
         // The pre-session terminal is the only tab until phase 3 runs.
         try await db.worktrees.setTabOrder(worktreeID: worktreeID, tabIDs: [terminalID])
         try await db.worktrees.setActiveTabID(worktreeID: worktreeID, tabID: terminalID)
 
-        // Kill the untracked initial window now that a real window exists.
-        if let initialWindowID {
-            try? await tmux.killWindow(server: tmuxServer, windowID: initialWindowID)
-        }
+        // No initial-window cleanup needed: blit's server starts empty.
 
         logger.info("preSession hook \(hookPath, privacy: .public) spawned for worktree \(worktreeID, privacy: .public); gating primary terminals on marker")
         return PreSessionSpawn(
             terminalID: terminalID,
-            windowID: window.windowID,
-            paneID: window.paneID,
+            blitTerminalID: window.terminalID,
+            blitSocket: blitSocket,
+            blitPidfilePath: window.pidfilePath,
             markerPath: markerPath,
             hookPath: hookPath
         )
@@ -182,7 +178,7 @@ extension WorktreeLifecycle {
     /// Polls for the completion marker. Short-circuits when the hook's tmux
     /// window disappears (user killed the pane). Reads + deletes the marker.
     func waitForPreSessionCompletion(
-        preSession: PreSessionSpawn, tmuxServer: String
+        preSession: PreSessionSpawn
     ) async -> PreSessionOutcome {
         let deadline = Date().addingTimeInterval(preSessionTimeout)
         let pollNanos = UInt64(max(preSessionPollInterval, 0.01) * 1_000_000_000)
@@ -192,8 +188,8 @@ extension WorktreeLifecycle {
             if let outcome = Self.consumeMarker(atPath: preSession.markerPath) {
                 return outcome
             }
-            let windowAlive = await tmux.windowExists(
-                server: tmuxServer, windowID: preSession.windowID
+            let windowAlive = await blit.windowExists(
+                socket: preSession.blitSocket, terminalID: preSession.blitTerminalID
             )
             if !windowAlive {
                 // Same-iteration race: the hook can write the marker after the
@@ -235,7 +231,7 @@ extension WorktreeLifecycle {
         completionAction: PreSessionCompletionAction
     ) async {
         let outcome = await waitForPreSessionCompletion(
-            preSession: preSession, tmuxServer: worktree.tmuxServer
+            preSession: preSession
         )
         // The marker must never outlive the wait, whatever the outcome —
         // `.completed` consumes it inside the wait; this catches any straggler
@@ -260,8 +256,8 @@ extension WorktreeLifecycle {
         }
         guard rowExists else {
             logger.warning("phase-3: worktree \(worktree.id, privacy: .public) row disappeared mid-wait — skipping primary spawn and cleaning up")
-            try? await tmux.killWindow(
-                server: worktree.tmuxServer, windowID: preSession.windowID
+            try? await blit.killWindow(
+                socket: preSession.blitSocket, terminalID: preSession.blitTerminalID
             )
             return
         }

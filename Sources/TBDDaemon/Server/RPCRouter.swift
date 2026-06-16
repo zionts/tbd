@@ -10,6 +10,9 @@ public final class RPCRouter: Sendable {
     public let db: TBDDatabase
     public let lifecycle: WorktreeLifecycle
     public let tmux: TmuxManager
+    /// Blit terminal backend. Terminal RPC handlers spawn/send/capture/kill
+    /// through this instead of tmux (Phase 4).
+    public let blit: BlitManager
     public let git: GitManager
     public let startTime: Date
     public let subscriptions: StateSubscriptionManager
@@ -29,6 +32,7 @@ public final class RPCRouter: Sendable {
         db: TBDDatabase,
         lifecycle: WorktreeLifecycle,
         tmux: TmuxManager,
+        blit: BlitManager = BlitManager(),
         git: GitManager = GitManager(),
         startTime: Date = Date(),
         subscriptions: StateSubscriptionManager = StateSubscriptionManager(),
@@ -42,6 +46,7 @@ public final class RPCRouter: Sendable {
         self.db = db
         self.lifecycle = lifecycle
         self.tmux = tmux
+        self.blit = blit
         self.git = git
         self.startTime = startTime
         self.subscriptions = subscriptions
@@ -53,7 +58,7 @@ public final class RPCRouter: Sendable {
         )
         self.modelProfileResolver = resolvedModelProfileResolver
         self.suspendResumeCoordinator = SuspendResumeCoordinator(
-            db: db, tmux: tmux, modelProfileResolver: resolvedModelProfileResolver
+            db: db, blit: blit, modelProfileResolver: resolvedModelProfileResolver
         )
         self.usageFetcher = usageFetcher
         self.pendingQuestions = pendingQuestions

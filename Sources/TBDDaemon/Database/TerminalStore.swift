@@ -87,7 +87,9 @@ public struct TerminalStore: Sendable {
         label: String? = nil,
         claudeSessionID: String? = nil,
         profileID: UUID? = nil,
-        kind: TerminalKind? = nil
+        kind: TerminalKind? = nil,
+        blitTerminalID: String = "",
+        blitPidfilePath: String? = nil
     ) async throws -> Terminal {
         let terminal = Terminal(
             id: id,
@@ -97,7 +99,9 @@ public struct TerminalStore: Sendable {
             label: label,
             claudeSessionID: claudeSessionID,
             profileID: profileID,
-            kind: kind
+            kind: kind,
+            blitTerminalID: blitTerminalID,
+            blitPidfilePath: blitPidfilePath
         )
         let record = TerminalRecord(from: terminal)
         try await writer.write { db in
@@ -248,6 +252,21 @@ public struct TerminalStore: Sendable {
             }
             record.tmuxWindowID = windowID
             record.tmuxPaneID = paneID
+            try record.update(db)
+        }
+    }
+
+    /// Update the blit terminal ID and per-terminal pidfile path for a terminal.
+    /// Used when a blit terminal is (re)spawned for an existing terminal row —
+    /// blit IDs are per-server integers that are not stable across daemon
+    /// restarts, so they're rewritten on every respawn.
+    public func updateBlitTerminal(id: UUID, blitTerminalID: String, blitPidfilePath: String?) async throws {
+        try await writer.write { db in
+            guard var record = try TerminalRecord.fetchOne(db, key: id.uuidString) else {
+                throw DatabaseError(message: "Terminal not found")
+            }
+            record.blitTerminalID = blitTerminalID
+            record.blitPidfilePath = blitPidfilePath
             try record.update(db)
         }
     }

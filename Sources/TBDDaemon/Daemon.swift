@@ -61,6 +61,9 @@ public final class Daemon: Sendable {
     public nonisolated(unsafe) var gitStatusTask: Task<Void, Never>?
     public nonisolated(unsafe) var reaperTask: Task<Void, Never>?
     public nonisolated(unsafe) var claudeUsagePoller: ClaudeUsagePoller?
+    /// Blit backend, retained so `stop()` can quit the per-repo blit servers
+    /// (in-memory child processes) the daemon spawned.
+    public nonisolated(unsafe) var blit: BlitManager?
     public let pidFile: PIDFile
     public let startTime: Date
 
@@ -193,6 +196,11 @@ public final class Daemon: Sendable {
         // 7. Initialize managers
         let git = GitManager()
         let tmux = TmuxManager()
+        // Blit is now the active terminal backend (Phase 4). tmux is retained
+        // only for the agent reaper's process-introspection seams until the
+        // final tmux removal phase.
+        let blit = BlitManager()
+        self.blit = blit
         let hooks = HookResolver()
         let modelProfileResolver = ModelProfileResolver(
             profiles: database.modelProfiles,
@@ -201,7 +209,7 @@ public final class Daemon: Sendable {
         )
         let pendingQuestions = PendingQuestionStore()
         let lifecycle = WorktreeLifecycle(
-            db: database, git: git, tmux: tmux, hooks: hooks,
+            db: database, git: git, tmux: tmux, blit: blit, hooks: hooks,
             subscriptions: subs,
             modelProfileResolver: modelProfileResolver,
             pendingQuestions: pendingQuestions
@@ -213,6 +221,7 @@ public final class Daemon: Sendable {
             db: database,
             lifecycle: lifecycle,
             tmux: tmux,
+            blit: blit,
             git: git,
             startTime: startTime,
             subscriptions: subs,
@@ -363,6 +372,21 @@ public final class Daemon: Sendable {
         gitFetchTask?.cancel()
         gitStatusTask?.cancel()
         reaperTask?.cancel()
+
+        // Quit the per-repo blit servers (in-memory child processes) so they
+        // don't linger after the daemon exits. Each terminal's ANSI scrollback
+        // is already snapshotted into the DB on suspend; on next startup the
+        // reconcile sweep respawns terminals from the DB (claude via --resume).
+        if let blit, let database = db, let repos = try? await database.repos.list() {
+            var quitSockets: Set<String> = []
+            for repo in repos {
+                let socket = BlitManager.socketPath(forRepoPath: repo.path)
+                guard quitSockets.insert(socket).inserted else { continue }
+                if await blit.serverExists(socket: socket) {
+                    try? await blit.killServer(socket: socket)
+                }
+            }
+        }
 
         // Stop servers
         if let sock = socketServer {

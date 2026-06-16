@@ -50,7 +50,7 @@ struct PreSessionHookTests {
         subscriptions: StateSubscriptionManager? = nil,
         timeout: TimeInterval = WorktreeLifecycle.defaultPreSessionTimeout,
         windowIsDead: (@Sendable (String) -> Bool)? = nil,
-        listWindows: (@Sendable (String, String) -> [(windowID: String, paneID: String)])? = nil
+        listWindows: (@Sendable (String) -> [String])? = nil
     ) -> WorktreeLifecycle {
         var dryRunRecorder: (@Sendable ([String]) -> Void)?
         if let recorder {
@@ -59,7 +59,8 @@ struct PreSessionHookTests {
         return WorktreeLifecycle(
             db: db,
             git: GitManager(),
-            tmux: TmuxManager(
+            tmux: TmuxManager(dryRun: true),
+            blit: BlitManager(
                 dryRun: true,
                 dryRunRecorder: dryRunRecorder,
                 dryRunWindowIsDead: windowIsDead,
@@ -209,7 +210,7 @@ struct PreSessionHookTests {
         let setup = try #require(terminals.first { $0.label == "setup" })
 
         // Window creation order: claude window first, setup window second.
-        let windowCalls = recorder.snapshot().filter { $0.contains("new-window") }
+        let windowCalls = recorder.snapshot().filter { $0.count >= 2 && $0[0] == "terminal" && $0[1] == "start" }
         #expect(windowCalls.count == 2)
         #expect(windowCalls[0].last?.contains("claude --session-id") == true,
                 "first window must be the primary agent")
@@ -290,7 +291,7 @@ struct PreSessionHookTests {
         #expect(try await db.worktrees.getActiveTabID(worktreeID: pending.id) == pre.id)
 
         // The single window so far runs the wrapped hook command.
-        let windowCalls = recorder.snapshot().filter { $0.contains("new-window") }
+        let windowCalls = recorder.snapshot().filter { $0.count >= 2 && $0[0] == "terminal" && $0[1] == "start" }
         #expect(windowCalls.count == 1)
         let body = windowCalls[0].last ?? ""
         #expect(body.contains(".worktree-hooks/preSession"))
@@ -332,7 +333,7 @@ struct PreSessionHookTests {
 
         // The parallel `setup` hook window gets the same documented env
         // (TBD_EVENT=setup) — windows are [pre-session, claude, setup].
-        let allWindowCalls = recorder.snapshot().filter { $0.contains("new-window") }
+        let allWindowCalls = recorder.snapshot().filter { $0.count >= 2 && $0[0] == "terminal" && $0[1] == "start" }
         #expect(allWindowCalls.count == 3)
         let setupBody = allWindowCalls[2].last ?? ""
         #expect(setupBody.contains("export TBD_EVENT='setup'"))
@@ -435,11 +436,11 @@ struct PreSessionHookTests {
             return true
         })
         let spawn = PreSessionSpawn(
-            terminalID: UUID(), windowID: "@mock-0", paneID: "%mock-0",
-            markerPath: markerPath, hookPath: "/dev/null"
+            terminalID: UUID(), blitTerminalID: "0", blitSocket: "/tmp/blit.sock",
+            blitPidfilePath: nil, markerPath: markerPath, hookPath: "/dev/null"
         )
         let outcome = await lifecycle.waitForPreSessionCompletion(
-            preSession: spawn, tmuxServer: "tbd-test"
+            preSession: spawn
         )
         #expect(outcome == .completed(exitCode: 0),
                 "a marker written in the same iteration must beat .paneKilled")
@@ -459,11 +460,11 @@ struct PreSessionHookTests {
         let markerPath = WorktreeLifecycle.preSessionMarkerPath(worktreeID: worktreeID)
         let lifecycle = makeLifecycle(db: db, timeout: 0)
         let spawn = PreSessionSpawn(
-            terminalID: UUID(), windowID: "@mock-0", paneID: "%mock-0",
-            markerPath: markerPath, hookPath: "/dev/null"
+            terminalID: UUID(), blitTerminalID: "0", blitSocket: "/tmp/blit.sock",
+            blitPidfilePath: nil, markerPath: markerPath, hookPath: "/dev/null"
         )
         let outcome = await lifecycle.waitForPreSessionCompletion(
-            preSession: spawn, tmuxServer: "tbd-test"
+            preSession: spawn
         )
         #expect(outcome == .completed(exitCode: 0),
                 "a marker present at the deadline must beat .timedOut")
@@ -479,11 +480,11 @@ struct PreSessionHookTests {
         let markerPath = WorktreeLifecycle.preSessionMarkerPath(worktreeID: worktreeID)
         let lifecycle = makeLifecycle(db: db, windowIsDead: { _ in true })
         let spawn = PreSessionSpawn(
-            terminalID: UUID(), windowID: "@mock-0", paneID: "%mock-0",
-            markerPath: markerPath, hookPath: "/dev/null"
+            terminalID: UUID(), blitTerminalID: "0", blitSocket: "/tmp/blit.sock",
+            blitPidfilePath: nil, markerPath: markerPath, hookPath: "/dev/null"
         )
         let outcome = await lifecycle.waitForPreSessionCompletion(
-            preSession: spawn, tmuxServer: "tbd-test"
+            preSession: spawn
         )
         #expect(outcome == .paneKilled)
     }
@@ -556,7 +557,7 @@ struct PreSessionHookTests {
         #expect(try await db.worktrees.get(id: pending.id) == nil)
         #expect(try await db.terminals.list(worktreeID: pending.id).isEmpty,
                 "no terminal rows may be created for a deleted worktree")
-        let windowCalls = recorder.snapshot().filter { $0.contains("new-window") }
+        let windowCalls = recorder.snapshot().filter { $0.count >= 2 && $0[0] == "terminal" && $0[1] == "start" }
         #expect(windowCalls.count == 1,
                 "only the pre-session window may exist — no primary windows after the row vanished")
         let markerPath = WorktreeLifecycle.preSessionMarkerPath(worktreeID: pending.id)
@@ -596,9 +597,9 @@ struct PreSessionHookTests {
         try writeMarker(worktreeID: pending.id, exitCode: 0)
         await phase3.value
 
-        let kills = recorder.snapshot().filter { $0.contains("kill-window") }
-        #expect(!kills.contains { $0.contains(preTerminal.tmuxWindowID) },
-                "a transient DB error on the existence check must not kill the pre-session window")
+        let kills = recorder.snapshot().filter { $0.count >= 2 && $0[0] == "terminal" && $0[1] == "kill" }
+        #expect(!kills.contains { $0.contains(preTerminal.blitTerminalID) },
+                "a transient DB error on the existence check must not kill the pre-session terminal")
         let markerPath = WorktreeLifecycle.preSessionMarkerPath(worktreeID: pending.id)
         #expect(!FileManager.default.fileExists(atPath: markerPath))
     }
@@ -904,14 +905,10 @@ struct PreSessionHookTests {
 
         let db = try TBDDatabase(inMemory: true)
         let recorder = RecordedCommands()
-        // The tmux server reports the active agent window, the .creating
-        // worktree's pre-session window, and one genuinely orphaned window.
-        let lifecycle = makeLifecycle(db: db, recorder: recorder, listWindows: { _, _ in
-            [
-                (windowID: "@mock-agent", paneID: "%mock-agent"),
-                (windowID: "@mock-pre", paneID: "%mock-pre"),
-                (windowID: "@mock-orphan", paneID: "%mock-orphan"),
-            ]
+        // The blit server reports the active agent terminal, the .creating
+        // worktree's pre-session terminal, and one genuinely orphaned terminal.
+        let lifecycle = makeLifecycle(db: db, recorder: recorder, listWindows: { _ in
+            ["agent", "pre", "orphan"]
         })
         let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
         let server = TmuxManager.serverName(forRepoPath: repo.path)
@@ -924,11 +921,12 @@ struct PreSessionHookTests {
         )
         _ = try await db.terminals.create(
             id: UUID(), worktreeID: active.id,
-            tmuxWindowID: "@mock-agent", tmuxPaneID: "%mock-agent",
-            label: "Claude Code", kind: .claude
+            tmuxWindowID: "", tmuxPaneID: "",
+            label: "Claude Code", kind: .claude,
+            blitTerminalID: "agent"
         )
         // A .creating worktree mid-pre-session-hook (e.g. a running npm
-        // install) — its window must survive the orphan cleanup pass.
+        // install) — its terminal must survive the orphan cleanup pass.
         let creating = try await db.worktrees.create(
             repoID: repo.id, name: "hooked", branch: "tbd/hooked",
             path: tempDir.appendingPathComponent("hooked").path,
@@ -936,20 +934,21 @@ struct PreSessionHookTests {
         )
         let preTerminal = try await db.terminals.create(
             id: UUID(), worktreeID: creating.id,
-            tmuxWindowID: "@mock-pre", tmuxPaneID: "%mock-pre",
-            label: "pre-session", kind: .shell
+            tmuxWindowID: "", tmuxPaneID: "",
+            label: "pre-session", kind: .shell,
+            blitTerminalID: "pre"
         )
 
         try await lifecycle.reconcile(repoID: repo.id)
 
-        let kills = recorder.snapshot().filter { $0.contains("kill-window") }
-        #expect(!kills.contains { $0.contains("@mock-pre") },
-                "reconcile must not kill a .creating worktree's live pre-session window")
-        #expect(!kills.contains { $0.contains("@mock-agent") },
-                "tracked active windows must survive")
-        #expect(kills.contains { $0.contains("@mock-orphan") },
-                "genuinely untracked windows must still be cleaned up")
-        #expect(!recorder.snapshot().contains { $0.contains("kill-server") })
+        let kills = recorder.snapshot().filter { $0.count >= 2 && $0[0] == "terminal" && $0[1] == "kill" }
+        #expect(!kills.contains { $0.contains("pre") },
+                "reconcile must not kill a .creating worktree's live pre-session terminal")
+        #expect(!kills.contains { $0.contains("agent") },
+                "tracked active terminals must survive")
+        #expect(kills.contains { $0.contains("orphan") },
+                "genuinely untracked terminals must still be cleaned up")
+        #expect(!recorder.snapshot().contains { $0.count >= 1 && $0[0] == "quit" })
         // The .creating row and its terminal are untouched.
         #expect(try await db.worktrees.get(id: creating.id)?.status == .creating)
         #expect(try await db.terminals.get(id: preTerminal.id) != nil)
@@ -963,14 +962,14 @@ struct PreSessionHookTests {
 
         let db = try TBDDatabase(inMemory: true)
         let recorder = RecordedCommands()
-        let lifecycle = makeLifecycle(db: db, recorder: recorder, listWindows: { _, _ in
-            [(windowID: "@mock-pre", paneID: "%mock-pre")]
+        let lifecycle = makeLifecycle(db: db, recorder: recorder, listWindows: { _ in
+            ["pre"]
         })
         let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
         let server = TmuxManager.serverName(forRepoPath: repo.path)
 
-        // The repo's ONLY live row is .creating — the kill-server branch must
-        // not fire (it would take the running hook's window down with it).
+        // The repo's ONLY live row is .creating — the quit-server branch must
+        // not fire (it would take the running hook's terminal down with it).
         let creating = try await db.worktrees.create(
             repoID: repo.id, name: "solo-hooked", branch: "tbd/solo-hooked",
             path: tempDir.appendingPathComponent("solo-hooked").path,
@@ -978,16 +977,17 @@ struct PreSessionHookTests {
         )
         _ = try await db.terminals.create(
             id: UUID(), worktreeID: creating.id,
-            tmuxWindowID: "@mock-pre", tmuxPaneID: "%mock-pre",
-            label: "pre-session", kind: .shell
+            tmuxWindowID: "", tmuxPaneID: "",
+            label: "pre-session", kind: .shell,
+            blitTerminalID: "pre"
         )
 
         try await lifecycle.reconcile(repoID: repo.id)
 
-        #expect(!recorder.snapshot().contains { $0.contains("kill-server") },
-                "a repo whose only live worktree is .creating must keep its tmux server")
-        #expect(!recorder.snapshot().contains { $0.contains("kill-window") && $0.contains("@mock-pre") },
-                "the pre-session window must not be treated as an orphan")
+        #expect(!recorder.snapshot().contains { $0.count >= 1 && $0[0] == "quit" },
+                "a repo whose only live worktree is .creating must keep its blit server")
+        #expect(!recorder.snapshot().contains { $0.count >= 3 && $0[0] == "terminal" && $0[1] == "kill" && $0[2] == "pre" },
+                "the pre-session terminal must not be treated as an orphan")
     }
 
     @Test func recoveryThenReconcileLeavesResumedWaitIntact() async throws {
@@ -998,8 +998,12 @@ struct PreSessionHookTests {
 
         let db = try TBDDatabase(inMemory: true)
         let recorder = RecordedCommands()
-        let lifecycle = makeLifecycle(db: db, recorder: recorder, listWindows: { _, _ in
-            [(windowID: "@mock-pre", paneID: "%mock-pre")]
+        // The recovery sweep respawns the pre-session terminal via blit, which
+        // (in dryRun) gets the first counter ID "0". The blit server then
+        // "reports" exactly that terminal as live, so the reconcile orphan
+        // cleanup leaves it alone.
+        let lifecycle = makeLifecycle(db: db, recorder: recorder, listWindows: { _ in
+            ["0"]
         })
         let repo = try await makeTestRepo(db: db, tempDir: tempDir, repoDir: repoDir)
         let server = TmuxManager.serverName(forRepoPath: repo.path)
@@ -1014,8 +1018,9 @@ struct PreSessionHookTests {
         )
         _ = try await db.terminals.create(
             id: UUID(), worktreeID: wt.id,
-            tmuxWindowID: "@mock-pre", tmuxPaneID: "%mock-pre",
-            label: "pre-session", kind: .shell
+            tmuxWindowID: "", tmuxPaneID: "",
+            label: "pre-session", kind: .shell,
+            blitTerminalID: "old-pre"
         )
 
         // Startup sequence: recovery sweep first, then per-repo reconcile —
@@ -1024,9 +1029,14 @@ struct PreSessionHookTests {
         #expect(resumed.count == 1)
         try await lifecycle.reconcile(repoID: repo.id)
 
-        #expect(!recorder.snapshot().contains { $0.contains("kill-window") && $0.contains("@mock-pre") },
-                "the just-resumed pre-session window must survive the startup reconcile")
-        #expect(!recorder.snapshot().contains { $0.contains("kill-server") })
+        // The recovery respawn rewrote the pre-session terminal's blit ID to "0",
+        // which the seam reports as live, so it's not treated as an orphan.
+        let killTerminalIDs = recorder.snapshot()
+            .filter { $0.count >= 3 && $0[0] == "terminal" && $0[1] == "kill" }
+            .map { $0[2] }
+        #expect(!killTerminalIDs.contains("0"),
+                "the just-resumed pre-session terminal must survive the startup reconcile")
+        #expect(!recorder.snapshot().contains { $0.count >= 1 && $0[0] == "quit" })
         #expect(try await db.worktrees.get(id: wt.id)?.status == .creating,
                 "the resumed wait must still be in flight after reconcile")
 

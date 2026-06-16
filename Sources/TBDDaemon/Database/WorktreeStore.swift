@@ -475,6 +475,27 @@ public struct WorktreeStore: Sendable {
         }
     }
 
+    /// Update the blit server socket path and gateway connection info for a
+    /// worktree. The gateway port/passphrase are rewritten whenever the daemon
+    /// re-provisions a gateway (e.g. after a restart, since blit's gateway is an
+    /// in-memory child process and gets a fresh loopback port each time).
+    public func updateBlitGateway(
+        id: UUID,
+        blitSocket: String,
+        gatewayPort: Int?,
+        gatewayPassphrase: String?
+    ) async throws {
+        try await writer.write { db in
+            guard var record = try WorktreeRecord.fetchOne(db, key: id.uuidString) else {
+                throw DatabaseError(message: "Worktree not found")
+            }
+            record.blitSocket = blitSocket
+            record.gatewayPort = gatewayPort
+            record.gatewayPassphrase = gatewayPassphrase
+            try record.update(db)
+        }
+    }
+
     /// Find a worktree by its filesystem path.
     public func findByPath(path: String) async throws -> Worktree? {
         try await writer.read { db in

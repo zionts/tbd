@@ -48,8 +48,8 @@ public enum ManualResumeResult: Equatable, Sendable {
 
 public actor SuspendResumeCoordinator {
     private let db: TBDDatabase
-    private let tmux: TmuxManager
-    private let detector: ClaudeStateDetector
+    private let blit: BlitManager
+    private let detector: BlitClaudeStateDetector
     private let modelProfileResolver: ModelProfileResolver?
     private var inFlight: [UUID: Task<Void, Never>] = [:]
     private var lastKnownSelection: Set<UUID> = []
@@ -63,10 +63,10 @@ public actor SuspendResumeCoordinator {
         ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
     }
 
-    public init(db: TBDDatabase, tmux: TmuxManager, modelProfileResolver: ModelProfileResolver? = nil) {
+    public init(db: TBDDatabase, blit: BlitManager, modelProfileResolver: ModelProfileResolver? = nil) {
         self.db = db
-        self.tmux = tmux
-        self.detector = ClaudeStateDetector(tmux: tmux)
+        self.blit = blit
+        self.detector = BlitClaudeStateDetector(blit: blit)
         self.modelProfileResolver = modelProfileResolver
     }
 
@@ -90,7 +90,7 @@ public actor SuspendResumeCoordinator {
         guard terminal.suspendedAt == nil else {
             return .alreadySuspended
         }
-        guard let server = await worktreeServer(for: terminal.worktreeID) else {
+        guard let socket = await worktreeSocket(for: terminal.worktreeID) else {
             return .notFound
         }
 
@@ -101,7 +101,7 @@ public actor SuspendResumeCoordinator {
         // Wrap in a Task stored in inFlight so cancellation propagates when
         // scheduleSuspend or another caller cancels inFlight[terminalID].
         // Task.isCancelled checks apply to THIS task, not a wrapper.
-        let suspendTask = Task<ManualSuspendResult, Never> { [detector, tmux, db] in
+        let suspendTask = Task<ManualSuspendResult, Never> { [detector, blit, db] in
             // Wait for idle up to 10s (capture-pane only, skip hook requirement)
             var idle = false
             for _ in 0..<50 {
@@ -109,7 +109,7 @@ public actor SuspendResumeCoordinator {
                     suspendLog("MANUAL SUSPEND CANCELLED \(terminalID.uuidString.prefix(8))")
                     return .busy
                 }
-                if await detector.isIdle(server: server, paneID: terminal.tmuxPaneID) {
+                if await detector.isIdle(socket: socket, terminalID: terminal.blitTerminalID, pidfile: terminal.blitPidfilePath) {
                     idle = true
                     break
                 }
@@ -133,7 +133,7 @@ public actor SuspendResumeCoordinator {
             // Capture snapshot
             let snapshot: String?
             do {
-                let captured = try await tmux.capturePaneWithAnsi(server: server, paneID: freshTerminal.tmuxPaneID)
+                let captured = try await blit.capturePaneWithAnsi(socket: socket, terminalID: freshTerminal.blitTerminalID)
                 snapshot = captured.isEmpty ? nil : captured
             } catch {
                 snapshot = nil
@@ -142,7 +142,7 @@ public actor SuspendResumeCoordinator {
             // Send /exit
             suspendLog("MANUAL SUSPENDING \(terminalID.uuidString.prefix(8)): sending /exit")
             do {
-                try await tmux.sendCommand(server: server, paneID: freshTerminal.tmuxPaneID, command: "/exit")
+                try await blit.sendCommand(socket: socket, terminalID: freshTerminal.blitTerminalID, command: "/exit")
             } catch {
                 return .notFound
             }
@@ -159,8 +159,7 @@ public actor SuspendResumeCoordinator {
             // Verify exit: poll for up to 3s
             for _ in 0..<15 {
                 try? await Task.sleep(for: .milliseconds(200))
-                if let cmd = try? await tmux.paneCurrentCommand(server: server, paneID: freshTerminal.tmuxPaneID),
-                   !ClaudeStateDetector.isClaudeProcess(cmd) {
+                if !detector.isClaudeRunning(pidfile: freshTerminal.blitPidfilePath) {
                     break
                 }
             }
@@ -192,7 +191,7 @@ public actor SuspendResumeCoordinator {
         guard terminal.isClaudeResumable else {
             return .noSessionID
         }
-        guard await worktreeServer(for: terminal.worktreeID) != nil else {
+        guard await worktreeSocket(for: terminal.worktreeID) != nil else {
             return .notFound
         }
 
@@ -240,14 +239,14 @@ public actor SuspendResumeCoordinator {
     }
 
     private func suspendTerminal(_ terminal: Terminal) async {
-        guard let server = await worktreeServer(for: terminal.worktreeID) else { return }
+        guard let socket = await worktreeSocket(for: terminal.worktreeID) else { return }
 
         // Belt: require that this worktree received a response_complete from Claude's
         // Stop hook. This confirms Claude finished a response and is waiting for input.
         // If the hook hasn't fired (e.g. daemon restarted, hook missed), do a
         // just-in-time capture-pane check to seed the idle flag.
         if !worktreeIdleFromHook.contains(terminal.worktreeID) {
-            if await detector.isIdle(server: server, paneID: terminal.tmuxPaneID) {
+            if await detector.isIdle(socket: socket, terminalID: terminal.blitTerminalID, pidfile: terminal.blitPidfilePath) {
                 worktreeIdleFromHook.insert(terminal.worktreeID)
                 suspendLog("Just-in-time seeded idle hook for worktree \(terminal.worktreeID.uuidString.prefix(8))")
             } else {
@@ -261,7 +260,7 @@ public actor SuspendResumeCoordinator {
         // (idle was just confirmed), but the 1s debounce still adds value —
         // it catches transitions from idle to busy between the JIT check
         // and the actual suspend.
-        let idleConfirmed = await detector.isIdleConfirmed(server: server, paneID: terminal.tmuxPaneID)
+        let idleConfirmed = await detector.isIdleConfirmed(socket: socket, terminalID: terminal.blitTerminalID, pidfile: terminal.blitPidfilePath)
         guard idleConfirmed else {
             suspendLog("SKIP \(terminal.id.uuidString.prefix(8)): capture-pane says not idle")
             return
@@ -274,7 +273,7 @@ public actor SuspendResumeCoordinator {
         // Capture terminal snapshot with ANSI colors before exit
         let snapshot: String?
         do {
-            let captured = try await tmux.capturePaneWithAnsi(server: server, paneID: terminal.tmuxPaneID)
+            let captured = try await blit.capturePaneWithAnsi(socket: socket, terminalID: terminal.blitTerminalID)
             snapshot = captured.isEmpty ? nil : captured
             suspendLog("Captured snapshot for \(terminal.id.uuidString.prefix(8)): \(captured.count) chars")
         } catch {
@@ -285,7 +284,7 @@ public actor SuspendResumeCoordinator {
         // POINT OF NO RETURN — send /exit
         suspendLog("SUSPENDING \(terminal.id.uuidString.prefix(8)): sending /exit")
         do {
-            try await tmux.sendCommand(server: server, paneID: terminal.tmuxPaneID, command: "/exit")
+            try await blit.sendCommand(socket: socket, terminalID: terminal.blitTerminalID, command: "/exit")
         } catch {
             logger.warning("Failed to send /exit to terminal \(terminal.id): \(error)")
             return
@@ -304,8 +303,7 @@ public actor SuspendResumeCoordinator {
         // Verify exit: poll for up to 3s
         for _ in 0..<15 {
             try? await Task.sleep(for: .milliseconds(200))
-            if let cmd = try? await tmux.paneCurrentCommand(server: server, paneID: terminal.tmuxPaneID),
-               !ClaudeStateDetector.isClaudeProcess(cmd) {
+            if !detector.isClaudeRunning(pidfile: terminal.blitPidfilePath) {
                 break
             }
         }
@@ -328,18 +326,16 @@ public actor SuspendResumeCoordinator {
     }
 
     private func resumeTerminal(_ terminal: Terminal) async {
-        guard let server = await worktreeServer(for: terminal.worktreeID),
+        guard let socket = await worktreeSocket(for: terminal.worktreeID),
               let sessionID = terminal.claudeSessionID else { return }
 
         // Step 1: Check if Claude is still running (pending /exit or user restarted)
-        if let cmd = try? await tmux.paneCurrentCommand(server: server, paneID: terminal.tmuxPaneID),
-           ClaudeStateDetector.isClaudeProcess(cmd) {
+        if detector.isClaudeRunning(pidfile: terminal.blitPidfilePath) {
             // Wait up to 5s for queued /exit to process
             var stillRunning = true
             for _ in 0..<25 {
                 try? await Task.sleep(for: .milliseconds(200))
-                if let cmd = try? await tmux.paneCurrentCommand(server: server, paneID: terminal.tmuxPaneID),
-                   !ClaudeStateDetector.isClaudeProcess(cmd) {
+                if !detector.isClaudeRunning(pidfile: terminal.blitPidfilePath) {
                     stillRunning = false
                     break
                 }
@@ -347,7 +343,7 @@ public actor SuspendResumeCoordinator {
             if stillRunning {
                 // User restarted it — clear and re-capture
                 try? await db.terminals.clearSuspended(id: terminal.id)
-                if let newID = await detector.captureSessionID(server: server, paneID: terminal.tmuxPaneID) {
+                if let newID = await detector.captureSessionID(pidfile: terminal.blitPidfilePath) {
                     try? await db.terminals.updateSessionID(id: terminal.id, sessionID: newID)
                 }
                 inFlight[terminal.id] = nil
@@ -355,7 +351,7 @@ public actor SuspendResumeCoordinator {
             }
         }
 
-        // Step 2-4: Create new tmux window with resume command
+        // Step 2-4: Create new blit terminal with resume command
         guard let worktree = try? await db.worktrees.get(id: terminal.worktreeID) else {
             inFlight[terminal.id] = nil
             return
@@ -419,22 +415,26 @@ public actor SuspendResumeCoordinator {
             "TBD_WORKTREE_ID": worktree.id.uuidString,
             "TBD_TERMINAL_ID": terminal.id.uuidString,
         ]
+        // The blit socket is per-repo; derive forRepoPath/socket from the repo
+        // path (fall back to the worktree path if the repo row is unavailable).
+        let repoPath = resumeRepo?.path ?? worktree.path
         do {
-            let window = try await tmux.createWindow(
-                server: server, session: "main",
+            let window = try await blit.createWindow(
+                forRepoPath: repoPath,
+                socket: socket,
                 cwd: worktree.path, shellCommand: spawn.command,
                 env: resumeEnv,
                 sensitiveEnv: mergedEnvOverrides.merging(spawn.sensitiveEnv) { _, builder in builder }
             )
-            try await db.terminals.updateTmuxIDs(
-                id: terminal.id, windowID: window.windowID, paneID: window.paneID
+            try await db.terminals.updateBlitTerminal(
+                id: terminal.id, blitTerminalID: window.terminalID, blitPidfilePath: window.pidfilePath
             )
             // Clear suspendedAt immediately. The snapshot stays in the DB so the
-            // app can feed it into TerminalPanelView as initial content — the live
-            // tmux output then overwrites it seamlessly.
+            // app can feed it into the web terminal as initial content — the live
+            // blit output then overwrites it seamlessly.
             // Note: snapshot persists until overwritten by the next suspend. After a
             // resume, every subsequent view recreation (tab switches, worktree
-            // navigation, app restarts) briefly shows this snapshot until live tmux
+            // navigation, app restarts) briefly shows this snapshot until live
             // output arrives. Brief stale content is better than a blank screen.
             do {
                 try await db.terminals.clearSuspended(id: terminal.id)
@@ -444,11 +444,12 @@ public actor SuspendResumeCoordinator {
                 // won't cycle this terminal again until a restart.
                 suspendLog("Failed to clear suspended for \(terminal.id.uuidString.prefix(8)): \(error)")
             }
-            suspendLog("Resumed terminal \(terminal.id.uuidString.prefix(8)) in window \(window.windowID)")
+            suspendLog("Resumed terminal \(terminal.id.uuidString.prefix(8)) in blit terminal \(window.terminalID)")
 
             let termID = terminal.id
             let worktreeID = terminal.worktreeID
-            let paneID = window.paneID
+            let newBlitTerminalID = window.terminalID
+            let newPidfile = window.pidfilePath
             // Track the post-resume task in inFlight so a rapid re-suspend
             // can cancel it — otherwise stale updateSessionID calls could
             // race with the new suspend cycle.
@@ -456,7 +457,7 @@ public actor SuspendResumeCoordinator {
                 // Wait for Claude to settle, then re-capture session ID
                 try? await Task.sleep(for: .seconds(5))
                 guard !Task.isCancelled else { return }
-                if let newID = await self.detector.captureSessionID(server: server, paneID: paneID) {
+                if let newID = await self.detector.captureSessionID(pidfile: newPidfile) {
                     try? await self.db.terminals.updateSessionID(id: termID, sessionID: newID)
                     suspendLog("Re-captured session ID for \(termID.uuidString.prefix(8)): \(newID)")
                 } else {
@@ -467,7 +468,7 @@ public actor SuspendResumeCoordinator {
                 // time to settle before the terminal becomes eligible again.
                 try? await Task.sleep(for: .seconds(30))
                 guard !Task.isCancelled else { return }
-                if await self.detector.isIdle(server: server, paneID: paneID) {
+                if await self.detector.isIdle(socket: socket, terminalID: newBlitTerminalID, pidfile: newPidfile) {
                     self.worktreeIdleFromHook.insert(worktreeID)
                     suspendLog("Re-seeded idle hook for worktree \(worktreeID.uuidString.prefix(8)) after resume (delayed)")
                 }
@@ -484,35 +485,33 @@ public actor SuspendResumeCoordinator {
     public func reconcileOnStartup() async {
         guard let allTerminals = try? await db.terminals.list() else { return }
 
-        for terminal in allTerminals where terminal.suspendedAt != nil {
-            guard let server = await worktreeServer(for: terminal.worktreeID) else { continue }
-            let alive = await tmux.windowExists(server: server, windowID: terminal.tmuxWindowID)
-            if alive, let cmd = try? await tmux.paneCurrentCommand(server: server, paneID: terminal.tmuxPaneID),
-               ClaudeStateDetector.isClaudeProcess(cmd) {
-                try? await db.terminals.clearSuspended(id: terminal.id)
-                logger.info("Startup: cleared suspendedAt for running terminal \(terminal.id)")
-            }
-        }
-
-        // Seed worktreeIdleFromHook for any worktree with a live, idle Claude terminal.
-        // This handles the case where the daemon restarts while Claude is sitting idle —
-        // without this, the in-memory flag would be empty and suspend would never trigger.
+        // blit's server is in-memory and starts EMPTY after a daemon restart, so
+        // any still-suspended terminal is genuinely suspended — there's no live
+        // blit terminal to discover "actually still running" as there was with a
+        // tmux server that survived the daemon. The per-repo reconcile sweep
+        // rebuilds non-suspended terminals from the DB; suspended ones are left
+        // as-is so the user can resume them on demand.
         for terminal in allTerminals {
             guard terminal.isClaudeResumable,
                   terminal.suspendedAt == nil else { continue }
-            guard let server = await worktreeServer(for: terminal.worktreeID) else { continue }
-            if await detector.isIdle(server: server, paneID: terminal.tmuxPaneID) {
+            guard let socket = await worktreeSocket(for: terminal.worktreeID) else { continue }
+            if await detector.isIdle(socket: socket, terminalID: terminal.blitTerminalID, pidfile: terminal.blitPidfilePath) {
                 worktreeIdleFromHook.insert(terminal.worktreeID)
                 suspendLog("Startup: seeded idle hook for worktree \(terminal.worktreeID.uuidString.prefix(8))")
             }
         }
-
     }
 
     // MARK: - Helpers
 
-    private func worktreeServer(for worktreeID: UUID) async -> String? {
+    /// The per-repo blit server socket for a worktree. Derived deterministically
+    /// from the repo path (BlitManager.socketPath), falling back to the value
+    /// persisted on the worktree row if the repo can't be loaded.
+    private func worktreeSocket(for worktreeID: UUID) async -> String? {
         guard let wt = try? await db.worktrees.get(id: worktreeID) else { return nil }
-        return wt.tmuxServer
+        if let repo = try? await db.repos.get(id: wt.repoID) {
+            return BlitManager.socketPath(forRepoPath: repo.path)
+        }
+        return wt.blitSocket.isEmpty ? nil : wt.blitSocket
     }
 }

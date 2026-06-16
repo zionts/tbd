@@ -13,6 +13,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -39,6 +40,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -61,6 +63,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -103,6 +106,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver(),
         modelProfileResolver: resolver
     )
@@ -121,6 +125,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -138,6 +143,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -164,6 +170,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -188,6 +195,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -223,6 +231,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -259,6 +268,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -283,6 +293,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -300,6 +311,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -326,6 +338,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -346,6 +359,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -381,6 +395,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -422,6 +437,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -445,6 +461,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -467,6 +484,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -492,6 +510,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -530,6 +549,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -558,6 +578,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -618,9 +639,10 @@ import Testing
         keychain: { id in id == token.id.uuidString ? secret : nil }
     )
 
-    // Recorder captures the dryRun shellCommand args from createWindow.
+    // Recorder captures the dryRun blit `terminal start` args from createWindow.
     let recorded = LifecycleRecordedCommands()
-    let tmux = TmuxManager(dryRun: true, dryRunRecorder: { args in
+    let tmux = TmuxManager(dryRun: true)
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in
         recorded.append(args)
     })
 
@@ -628,6 +650,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: tmux,
+        blit: blit,
         hooks: HookResolver(),
         modelProfileResolver: resolver
     )
@@ -637,20 +660,28 @@ import Testing
     )
     let wt = try await lifecycle.createWorktree(repoID: repo.id, skipClaude: false)
 
-    // (a) Token must be passed via tmux -e flag, NOT inlined into the shell command body.
+    // (a) The api-key profile's secret (ANTHROPIC_API_KEY) is SENSITIVE env.
+    // Under blit it's written to a 0600 env-file the spawn wrapper sources and
+    // deletes, so it must NOT appear anywhere in the recorded argv (including
+    // the wrapper body). We still prove a claude spawn happened (the command is
+    // in the wrapper body) and that neither the secret VALUE nor its env-var
+    // assignment leaks into argv.
     let snap = recorded.snapshot()
     let claudeCall = snap.first { call in
         let body = call.last ?? ""
         return body.contains("claude --session-id")
     }
     #expect(claudeCall != nil, "expected a createWindow call spawning claude")
-    #expect(claudeCall?.contains("ANTHROPIC_API_KEY=\(secret)") == true,
-            "expected token in tmux -e flag; got: \(claudeCall ?? [])")
+    let joinedCall = claudeCall?.joined(separator: " ") ?? ""
+    #expect(!joinedCall.contains(secret),
+            "secret leaked into blit terminal start argv: \(joinedCall)")
+    #expect(!joinedCall.contains("ANTHROPIC_API_KEY=\(secret)"),
+            "secret env assignment leaked into argv: \(joinedCall)")
     let shellBody = claudeCall?.last ?? ""
     #expect(!shellBody.contains(secret),
-            "secret leaked into shell command body: \(shellBody)")
+            "secret leaked into wrapper body: \(shellBody)")
     #expect(!shellBody.contains("ANTHROPIC_API_KEY"),
-            "env var name leaked into shell command body: \(shellBody)")
+            "env var name leaked into wrapper body: \(shellBody)")
 
     // (b) Persisted terminal row has profileID set to the known token UUID.
     let terminals = try await db.terminals.list(worktreeID: wt.id)
@@ -668,6 +699,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -701,6 +733,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -741,6 +774,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -785,6 +819,7 @@ import Testing
         db: db,
         git: GitManager(),
         tmux: TmuxManager(dryRun: true),
+        blit: BlitManager(dryRun: true),
         hooks: HookResolver()
     )
 
@@ -818,44 +853,30 @@ import Testing
     // mock IDs when the server is gone.
 }
 
-/// Regression test for the bug where `recreateAfterReboot` killed the bootstrap
-/// window before any real window existed in the session. tmux's rule: killing
-/// the only window destroys the session, and a server with no sessions exits.
-/// The buggy code would therefore lose the server between `ensureServer` and
-/// `createWindow`, causing the latter to fail with "no server running on …".
-///
-/// Drives the path with a REAL `TmuxManager` (not dry-run) against a unique
-/// socket name so we can observe actual tmux behavior. The test:
-///   1. Verifies the socket does not exist before the call.
-///   2. Calls `recreateAfterReboot` and asserts it does not throw.
-///   3. Asserts the terminal's window/pane IDs were updated in the DB.
-///   4. Tears down by killing the test tmux server.
+/// Blit-model replacement for the old tmux "bootstrap kill ordering" regression.
+/// The tmux-specific bug (killing the only window destroyed the session) is gone
+/// under blit, which has no session concept. The surviving invariant is:
+/// `recreateAfterReboot` provisions the (dry-run) blit server and respawns the
+/// terminal, updating the row's `blitTerminalID` to the freshly-allocated ID
+/// (dry-run createWindow returns incrementing integer IDs as strings). No real
+/// server is contacted.
 @Test func testRecreateAfterRebootBootstrapKillOrdering() async throws {
-    let socketName = "tbd-test-\(UUID().uuidString.prefix(8))"
-    let realTmux = TmuxManager()
-    // Make sure no stray server is alive on this socket (it shouldn't be, but
-    // be defensive — and verify it isn't before we call into the recovery path).
-    try? await realTmux.killServer(server: socketName)
-    let aliveBefore = await realTmux.serverExists(server: socketName)
-    #expect(!aliveBefore, "Test precondition: socket \(socketName) must not have a live server")
-
-    // Use the same temp-repo machinery as other lifecycle tests so the worktree
-    // path actually exists on disk (tmux refuses to set cwd to a missing dir).
     let (tempDir, repoDir) = try await createTestRepoResolvingSymlinks()
     defer { try? FileManager.default.removeItem(at: tempDir) }
 
     let db = try TBDDatabase(inMemory: true)
+    let recorded = LifecycleRecordedCommands()
+    let blit = BlitManager(dryRun: true, dryRunRecorder: { args in recorded.append(args) })
     let lifecycle = WorktreeLifecycle(
         db: db,
         git: GitManager(),
-        tmux: realTmux,
+        tmux: TmuxManager(dryRun: true),
+        blit: blit,
         hooks: HookResolver()
     )
 
-    // Insert a worktree + terminal record pointing at the test socket. We do
-    // NOT go through `createWorktree` — that would spawn windows. Instead we
-    // simulate a freshly-rebooted state where DB rows exist but the tmux
-    // server is gone.
+    // Simulate a freshly-rebooted state: DB rows exist but the terminal's
+    // in-memory blit state is gone (stale blitTerminalID).
     let repo = try await db.repos.create(
         path: repoDir.path, displayName: "test", defaultBranch: "main"
     )
@@ -864,176 +885,191 @@ import Testing
         name: "wt",
         branch: "main",
         path: repoDir.path,
-        tmuxServer: socketName
+        tmuxServer: "tbd-unused"
     )
     let terminal = try await db.terminals.create(
         worktreeID: wt.id,
-        tmuxWindowID: "@stale-1",
-        tmuxPaneID: "%stale-1"
+        tmuxWindowID: "",
+        tmuxPaneID: "",
+        blitTerminalID: "stale-999"
     )
 
-    // Drive the recovery path. Must not throw — with the buggy ordering this
-    // throws `TmuxError.commandFailed` with output "no server running on …".
-    do {
-        try await lifecycle.recreateAfterReboot(terminal: terminal, worktree: wt)
-    } catch {
-        // Make sure we tear down even when the assertion below fails.
-        try? await realTmux.killServer(server: socketName)
-        throw error
-    }
+    // Drive the recovery path. Must not throw.
+    try await lifecycle.recreateAfterReboot(terminal: terminal, worktree: wt)
 
-    // The terminal's IDs must have been updated to point at the freshly
-    // created tmux window/pane.
+    // The terminal's blit ID must have been replaced with the freshly-allocated
+    // dry-run mock ID (an integer-as-string), not the stale value.
     let updated = try await db.terminals.get(id: terminal.id)
     #expect(updated != nil)
-    #expect(updated?.tmuxWindowID != "@stale-1",
-            "tmuxWindowID must be replaced with a freshly-allocated tmux window ID")
-    #expect(updated?.tmuxPaneID != "%stale-1",
-            "tmuxPaneID must be replaced with a freshly-allocated tmux pane ID")
-    // Real tmux window IDs look like "@<digits>" and pane IDs like "%<digits>".
-    #expect(updated?.tmuxWindowID.hasPrefix("@") == true)
-    #expect(updated?.tmuxPaneID.hasPrefix("%") == true)
+    #expect(updated?.blitTerminalID != "stale-999",
+            "blitTerminalID must be replaced with a freshly-allocated blit terminal ID")
+    #expect(Int(updated?.blitTerminalID ?? "") != nil,
+            "dry-run blit createWindow returns an integer ID as a string; got: \(updated?.blitTerminalID ?? "nil")")
 
-    // Server should still be alive — and after the bootstrap kill, the session
-    // should contain exactly one window (the one we just created).
-    let aliveAfter = await realTmux.serverExists(server: socketName)
-    #expect(aliveAfter, "tmux server must still be running after recreateAfterReboot")
-    let windows = try await realTmux.listWindows(server: socketName, session: "main")
-    #expect(windows.count == 1,
-            "session should contain exactly the freshly-created window after bootstrap kill; got \(windows)")
-
-    // Explicit cleanup: ensure the test server is gone before we leave.
-    // (defer can't `await`, so we tear down inline.)
-    try? await realTmux.killServer(server: socketName)
+    // A blit `terminal start` was recorded (the respawn actually happened).
+    let started = recorded.snapshot().contains { $0.contains("terminal") && $0.contains("start") }
+    #expect(started, "recreateAfterReboot must issue a blit terminal start")
 }
 
-/// Dead-window cleanup, real tmux server alive: a terminal that holds a
-/// `claudeSessionID` must be SUSPENDED (not deleted) so the session can be
-/// resumed. Regression test for the 2026-05-21 mass session-loss incident.
+/// Blit-model reconcile: after a restart the server's terminals are rebuilt from
+/// the DB. A Claude terminal WITH a `claudeSessionID` whose blit terminal is no
+/// longer live (not in `dryRunListWindows`) must be RESPAWNED via
+/// `claude --resume <sessionID>` (not deleted), and its row updated with the new
+/// blit terminal ID. Covers the "WITH sessionID" branch of the test-both rule.
 @Test func testReconcileDeadWindowClaudeTerminalSuspended() async throws {
     let (tempDir, repoDir) = try await createTestRepoResolvingSymlinks()
     defer { try? FileManager.default.removeItem(at: tempDir) }
 
     let db = try TBDDatabase(inMemory: true)
-    let realTmux = TmuxManager()
+    let recorded = LifecycleRecordedCommands()
+    // Report NO live terminals so every tracked terminal is treated as gone and
+    // rebuilt from the DB (the post-restart path). serverExists is true in
+    // dry-run, so we exercise the serverAlive=true, terminal-not-live branch.
+    let blit = BlitManager(
+        dryRun: true,
+        dryRunRecorder: { args in recorded.append(args) },
+        dryRunListWindows: { _ in [] }
+    )
     let lifecycle = WorktreeLifecycle(
-        db: db, git: GitManager(), tmux: realTmux, hooks: HookResolver()
+        db: db, git: GitManager(), tmux: TmuxManager(dryRun: true), blit: blit, hooks: HookResolver()
     )
 
     let repo = try await db.repos.create(
         path: repoDir.path, displayName: "test", defaultBranch: "main"
     )
-    let serverName = TmuxManager.serverName(forRepoPath: repo.path)
-    // Start a REAL tmux server so reconcile sees serverAlive == true.
-    _ = try await realTmux.ensureServer(server: serverName, session: "main", cwd: repoDir.path)
-
     // A worktree whose path == the repo path is reported by `git worktree
     // list`, so reconcile will not archive it as missing.
     let wt = try await db.worktrees.create(
         repoID: repo.id, name: "wt", branch: "main",
-        path: repoDir.path, tmuxServer: serverName
+        path: repoDir.path, tmuxServer: "tbd-unused"
     )
-    // A claude terminal pointing at a window that does not exist on the server.
     let sessionID = UUID().uuidString
     let terminal = try await db.terminals.create(
         worktreeID: wt.id,
-        tmuxWindowID: "@stale-claude", tmuxPaneID: "%stale-claude",
-        label: "claude", claudeSessionID: sessionID, kind: .claude
+        tmuxWindowID: "", tmuxPaneID: "",
+        label: "claude", claudeSessionID: sessionID, kind: .claude,
+        blitTerminalID: "stale-claude"
     )
 
-    do {
-        try await lifecycle.reconcile(repoID: repo.id)
-    } catch {
-        try? await realTmux.killServer(server: serverName)
-        throw error
-    }
+    try await lifecycle.reconcile(repoID: repo.id)
 
     let after = try await db.terminals.get(id: terminal.id)
-    try? await realTmux.killServer(server: serverName)
-
-    #expect(after != nil, "claude terminal must NOT be deleted on dead window")
-    #expect(after?.suspendedAt != nil, "claude terminal must be marked suspended")
-    #expect(after?.claudeSessionID == sessionID, "session ID must be preserved")
+    #expect(after != nil, "claude terminal must NOT be deleted — it is rebuilt from the DB")
+    #expect(after?.claudeSessionID == sessionID, "session ID must be preserved across rebuild")
+    #expect(after?.blitTerminalID != "stale-claude",
+            "rebuilt claude terminal must get a fresh blit terminal ID")
+    // The rebuild resumes the existing session.
+    let bodies = recorded.snapshot()
+        .filter { $0.contains("terminal") && $0.contains("start") }
+        .compactMap { $0.last }
+    #expect(bodies.contains { $0.contains("--resume \(sessionID)") },
+            "claude terminal with a session ID must be rebuilt via --resume <sessionID>; got: \(bodies)")
 }
 
-/// Dead-window cleanup, real tmux server alive: a terminal with NO
-/// `claudeSessionID` (plain shell) has nothing to recover and is still
-/// deleted — unchanged behavior.
+/// Blit-model reconcile: a terminal with NO `claudeSessionID` (plain shell)
+/// whose blit terminal is gone is also REBUILT from the DB (respawned fresh),
+/// NOT deleted — every non-suspended terminal is rebuilt after a restart so the
+/// user always sees a live pane. Covers the "WITHOUT sessionID" branch
+/// (rebuilt fresh, no `--resume`).
 @Test func testReconcileDeadWindowShellTerminalDeleted() async throws {
     let (tempDir, repoDir) = try await createTestRepoResolvingSymlinks()
     defer { try? FileManager.default.removeItem(at: tempDir) }
 
     let db = try TBDDatabase(inMemory: true)
-    let realTmux = TmuxManager()
+    let recorded = LifecycleRecordedCommands()
+    let blit = BlitManager(
+        dryRun: true,
+        dryRunRecorder: { args in recorded.append(args) },
+        dryRunListWindows: { _ in [] }
+    )
     let lifecycle = WorktreeLifecycle(
-        db: db, git: GitManager(), tmux: realTmux, hooks: HookResolver()
+        db: db, git: GitManager(), tmux: TmuxManager(dryRun: true), blit: blit, hooks: HookResolver()
     )
 
     let repo = try await db.repos.create(
         path: repoDir.path, displayName: "test", defaultBranch: "main"
     )
-    let serverName = TmuxManager.serverName(forRepoPath: repo.path)
-    _ = try await realTmux.ensureServer(server: serverName, session: "main", cwd: repoDir.path)
-
     let wt = try await db.worktrees.create(
         repoID: repo.id, name: "wt", branch: "main",
-        path: repoDir.path, tmuxServer: serverName
+        path: repoDir.path, tmuxServer: "tbd-unused"
     )
     let terminal = try await db.terminals.create(
         worktreeID: wt.id,
-        tmuxWindowID: "@stale-shell", tmuxPaneID: "%stale-shell"
+        tmuxWindowID: "", tmuxPaneID: "",
+        blitTerminalID: "stale-shell"
     )
 
-    do {
-        try await lifecycle.reconcile(repoID: repo.id)
-    } catch {
-        try? await realTmux.killServer(server: serverName)
-        throw error
-    }
+    try await lifecycle.reconcile(repoID: repo.id)
 
     let after = try await db.terminals.get(id: terminal.id)
-    try? await realTmux.killServer(server: serverName)
-
-    #expect(after == nil, "shell terminal with no session must still be deleted")
+    #expect(after != nil, "shell terminal is rebuilt from the DB after restart, not deleted")
+    #expect(after?.blitTerminalID != "stale-shell",
+            "rebuilt shell terminal must get a fresh blit terminal ID")
+    // A fresh shell rebuild carries no claude session, so it must NOT --resume.
+    let bodies = recorded.snapshot()
+        .filter { $0.contains("terminal") && $0.contains("start") }
+        .compactMap { $0.last }
+    #expect(!bodies.contains { $0.contains("--resume") },
+            "shell terminal (no session) must be rebuilt fresh, never via --resume; got: \(bodies)")
 }
 
+/// Blit-model reconcile: a Codex terminal whose blit terminal is gone is rebuilt
+/// from the DB (respawned as codex), NOT deleted, and NOT misclassified as a
+/// Claude `--resume` even though Codex records its session into the shared
+/// claudeSessionID field.
 @Test func testReconcileDeadWindowCodexTerminalWithSessionMetadataDeleted() async throws {
     let (tempDir, repoDir) = try await createTestRepoResolvingSymlinks()
     defer { try? FileManager.default.removeItem(at: tempDir) }
 
+    // recreateAfterReboot's codex branch resolves the global Codex home; isolate
+    // it so the test never touches the developer's real ~/.codex.
+    let codexHome = FileManager.default.temporaryDirectory
+        .appendingPathComponent("tbd-codex-home-\(UUID().uuidString)")
+    setenv("TBD_TEST_CODEX_HOME", codexHome.path, 1)
+    defer {
+        unsetenv("TBD_TEST_CODEX_HOME")
+        try? FileManager.default.removeItem(at: codexHome)
+    }
+
     let db = try TBDDatabase(inMemory: true)
-    let realTmux = TmuxManager()
+    let recorded = LifecycleRecordedCommands()
+    let blit = BlitManager(
+        dryRun: true,
+        dryRunRecorder: { args in recorded.append(args) },
+        dryRunListWindows: { _ in [] }
+    )
     let lifecycle = WorktreeLifecycle(
-        db: db, git: GitManager(), tmux: realTmux, hooks: HookResolver()
+        db: db, git: GitManager(), tmux: TmuxManager(dryRun: true), blit: blit, hooks: HookResolver()
     )
 
     let repo = try await db.repos.create(
         path: repoDir.path, displayName: "test", defaultBranch: "main"
     )
-    let serverName = TmuxManager.serverName(forRepoPath: repo.path)
-    _ = try await realTmux.ensureServer(server: serverName, session: "main", cwd: repoDir.path)
-
     let wt = try await db.worktrees.create(
         repoID: repo.id, name: "wt", branch: "main",
-        path: repoDir.path, tmuxServer: serverName
+        path: repoDir.path, tmuxServer: "tbd-unused"
     )
+    let codexSession = UUID().uuidString
     let terminal = try await db.terminals.create(
         worktreeID: wt.id,
-        tmuxWindowID: "@stale-codex", tmuxPaneID: "%stale-codex",
-        label: "Codex", claudeSessionID: UUID().uuidString, kind: .codex
+        tmuxWindowID: "", tmuxPaneID: "",
+        label: "Codex", claudeSessionID: codexSession, kind: .codex,
+        blitTerminalID: "stale-codex"
     )
 
-    do {
-        try await lifecycle.reconcile(repoID: repo.id)
-    } catch {
-        try? await realTmux.killServer(server: serverName)
-        throw error
-    }
+    try await lifecycle.reconcile(repoID: repo.id)
 
     let after = try await db.terminals.get(id: terminal.id)
-    try? await realTmux.killServer(server: serverName)
-
-    #expect(after == nil, "stale codex terminal must be deleted, not suspended via Claude semantics")
+    #expect(after != nil, "codex terminal is rebuilt from the DB after restart, not deleted")
+    #expect(after?.blitTerminalID != "stale-codex",
+            "rebuilt codex terminal must get a fresh blit terminal ID")
+    let bodies = recorded.snapshot()
+        .filter { $0.contains("terminal") && $0.contains("start") }
+        .compactMap { $0.last }
+    #expect(bodies.contains { $0.contains("codex ") },
+            "codex terminal must be rebuilt as codex; got: \(bodies)")
+    #expect(!bodies.contains { $0.contains("--resume \(codexSession)") },
+            "codex terminal must NOT be misclassified as a Claude --resume; got: \(bodies)")
 }
 
 // MARK: - Helpers
