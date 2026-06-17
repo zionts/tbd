@@ -29,7 +29,7 @@ TBD is a macOS app that manages git worktrees and terminal tabs (Claude Code, Co
 
 ## Discovering current commands
 
-Always run `tbd <subcommand> --help` for current flags — flag detail is not duplicated here. Top-level commands: `tbd worktree`, `tbd terminal`, `tbd link`, `tbd notify`.
+Always run `tbd <subcommand> --help` for current flags — flag detail is not duplicated here. Top-level commands: `tbd worktree`, `tbd terminal`, `tbd channel`, `tbd link`, `tbd notify`.
 
 ## Common workflows
 
@@ -135,6 +135,28 @@ Get `<id>` from `tbd terminal list <worktree>` or the output of `tbd terminal cr
 ```bash
 tbd notify --type {response_complete|error|task_complete|attention_needed} --message "..."
 ```
+
+### Coordinate over the team channel
+
+A parent worktree and all its descendants share one append-only, ordered
+message channel (the "team" = the root worktree of the subtree). Use it to
+coordinate across agents — post status, surface blockers, announce PRs.
+
+```bash
+# Post a typed message (sender = TBD_WORKTREE_ID). --type defaults to note.
+tbd channel post --type start    "Starting work on the migration"
+tbd channel post --type blocker  "Blocked on schema review"
+tbd channel post --type pr       "Opened PR #123"
+tbd channel post --type done     "Finished and merged"
+tbd channel post --type learning "GRDB re-runs renamed migrations; use addColumnIfMissing"
+tbd channel post                 "free-form note"
+
+# Read the shared thread (any team member sees the same messages).
+tbd channel tail [--limit N] [--since <messageID>] [--json]
+```
+
+Types: `start`, `blocker`, `pr`, `done`, `learning`, `note`. Messages are
+append-only — they can't be edited or deleted.
 
 ### Get a deep link to a worktree
 

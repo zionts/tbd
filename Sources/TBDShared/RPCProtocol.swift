@@ -115,6 +115,8 @@ public enum RPCMethod {
     public static let noteUpdate = "note.update"
     public static let noteDelete = "note.delete"
     public static let noteList = "note.list"
+    public static let channelPost = "channel.post"
+    public static let channelTail = "channel.tail"
     public static let terminalOutput = "terminal.output"
     public static let terminalConversation = "terminal.conversation"
     public static let terminalTranscript = "terminal.transcript"
@@ -918,6 +920,45 @@ public struct NoteDeleteParams: Codable, Sendable {
 public struct NoteListParams: Codable, Sendable {
     public let worktreeID: UUID?
     public init(worktreeID: UUID? = nil) { self.worktreeID = worktreeID }
+}
+
+// MARK: - Channel Params (orchestration spine)
+
+/// Post a message to the sender's team channel. The daemon derives `teamID` by
+/// resolving the root of `senderWorktreeID`'s subtree — callers never specify it.
+public struct ChannelPostParams: Codable, Sendable {
+    public let senderWorktreeID: UUID
+    public let type: ChannelMessageType
+    public let body: String
+    public init(senderWorktreeID: UUID, type: ChannelMessageType = .note, body: String) {
+        self.senderWorktreeID = senderWorktreeID
+        self.type = type
+        self.body = body
+    }
+}
+
+/// Tail a team channel. `worktreeID` is any member of the team; the daemon
+/// resolves it to the team root. `sinceID` is an optional cursor (return only
+/// messages after it); `limit` caps the result count.
+public struct ChannelTailParams: Codable, Sendable {
+    public let worktreeID: UUID
+    public let sinceID: String?
+    public let limit: Int?
+    public init(worktreeID: UUID, sinceID: String? = nil, limit: Int? = nil) {
+        self.worktreeID = worktreeID
+        self.sinceID = sinceID
+        self.limit = limit
+    }
+}
+
+/// Result of `channel.tail`: the resolved team root and the matching messages.
+public struct ChannelTailResult: Codable, Sendable {
+    public let teamID: UUID
+    public let messages: [ChannelMessage]
+    public init(teamID: UUID, messages: [ChannelMessage]) {
+        self.teamID = teamID
+        self.messages = messages
+    }
 }
 
 // MARK: - Session Params

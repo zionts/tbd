@@ -15,6 +15,7 @@ public final class TBDDatabase: Sendable {
     public let terminals: TerminalStore
     public let notifications: NotificationStore
     public let notes: NoteStore
+    public let channel: ChannelStore
     public let modelProfiles: ModelProfileStore
     public let modelProfileUsage: ModelProfileUsageStore
     public let config: ConfigStore
@@ -43,6 +44,7 @@ public final class TBDDatabase: Sendable {
         self.terminals = TerminalStore(writer: pool)
         self.notifications = NotificationStore(writer: pool)
         self.notes = NoteStore(writer: pool)
+        self.channel = ChannelStore(writer: pool)
         self.modelProfiles = ModelProfileStore(writer: pool)
         self.modelProfileUsage = ModelProfileUsageStore(writer: pool)
         self.config = ConfigStore(writer: pool)
@@ -71,6 +73,7 @@ public final class TBDDatabase: Sendable {
         self.terminals = TerminalStore(writer: queue)
         self.notifications = NotificationStore(writer: queue)
         self.notes = NoteStore(writer: queue)
+        self.channel = ChannelStore(writer: queue)
         self.modelProfiles = ModelProfileStore(writer: queue)
         self.modelProfileUsage = ModelProfileUsageStore(writer: queue)
         self.config = ConfigStore(writer: queue)
@@ -540,6 +543,27 @@ public final class TBDDatabase: Sendable {
             try db.addColumnIfMissing(table: "config",         column: "env_overrides", type: .text)
             try db.addColumnIfMissing(table: "repo",           column: "env_overrides", type: .text)
             try db.addColumnIfMissing(table: "model_profiles", column: "env_overrides", type: .text)
+        }
+
+        // Append-only, team-scoped coordination channel (orchestration spine
+        // Phase A). `teamID` is the root worktree of a parent+children subtree,
+        // so a parent and all its descendants share one ordered message thread.
+        // No FK on senderWorktreeID/teamID: messages are an immutable audit log
+        // that must survive worktree archival/deletion.
+        migrator.registerMigration("v32_channel_message") { db in
+            try db.createTableIfNotExists("channel_message") { t in
+                t.primaryKey("id", .text).notNull()
+                t.column("teamID", .text).notNull()
+                t.column("senderWorktreeID", .text).notNull()
+                t.column("type", .text).notNull()
+                t.column("body", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+            }
+            try db.addIndexIfMissing(
+                "idx_channel_message_team_created",
+                on: "channel_message",
+                columns: ["teamID", "createdAt"]
+            )
         }
 
         return migrator

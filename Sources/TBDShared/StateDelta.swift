@@ -24,6 +24,43 @@ public enum StateDelta: Codable, Sendable {
     case terminalSessionUpdated(TerminalSessionDelta)
     case terminalActivityUpdated(TerminalActivityDelta)
     case worktreeMoved(WorktreeMovedDelta)
+    case channelMessage(ChannelMessageDelta)
+}
+
+/// Delta payload for a new coordination-channel message (orchestration spine
+/// Phase A). v1 broadcasts to ALL subscribers — clients filter by `teamID` —
+/// matching the simplicity of the notification broadcast.
+public struct ChannelMessageDelta: Codable, Sendable {
+    public let messageID: UUID
+    public let teamID: UUID
+    public let senderWorktreeID: UUID
+    public let type: ChannelMessageType
+    public let body: String
+    public let createdAt: Date
+    public init(
+        messageID: UUID,
+        teamID: UUID,
+        senderWorktreeID: UUID,
+        type: ChannelMessageType,
+        body: String,
+        createdAt: Date
+    ) {
+        self.messageID = messageID
+        self.teamID = teamID
+        self.senderWorktreeID = senderWorktreeID
+        self.type = type
+        self.body = body
+        self.createdAt = createdAt
+    }
+
+    public init(from message: ChannelMessage) {
+        self.messageID = message.id
+        self.teamID = message.teamID
+        self.senderWorktreeID = message.senderWorktreeID
+        self.type = message.type
+        self.body = message.body
+        self.createdAt = message.createdAt
+    }
 }
 
 /// Delta payload for Claude session ID/transcript path rollover, fired when

@@ -11,6 +11,7 @@ struct TBDCommand: AsyncParsableCommand {
             RepoCommand.self,
             WorktreeCommand.self,
             TerminalCommand.self,
+            ChannelCommand.self,
             NotifyCommand.self,
             SessionEventCommand.self,
             TerminalActivityEventCommand.self,

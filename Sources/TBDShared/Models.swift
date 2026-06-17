@@ -518,6 +518,57 @@ public struct TBDNotification: Codable, Sendable, Identifiable {
     }
 }
 
+// MARK: - Channel (orchestration spine)
+
+/// Typed kinds of coordination-channel posts. Free-form `.note` is the catch-all;
+/// the others give agents (and the future thread UI) a lightweight semantic tag.
+/// Backed by a string so unknown future kinds posted by a newer client still
+/// round-trip through older readers via the `init(from:)` fallback to `.note`.
+public enum ChannelMessageType: String, Codable, Sendable {
+    case start
+    case blocker
+    case pr
+    case done
+    case learning
+    case note
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = ChannelMessageType(rawValue: raw) ?? .note
+    }
+}
+
+/// One immutable message in a team's append-only coordination channel.
+///
+/// `teamID` is the root worktree of the sender's parent+children subtree
+/// (computed daemon-side via `WorktreeStore.rootWorktreeID(of:)`), so every
+/// member of a team reads and writes the same ordered thread. Messages are
+/// never updated or deleted — the channel is an append-only log.
+public struct ChannelMessage: Codable, Sendable, Identifiable, Equatable {
+    public let id: UUID
+    public let teamID: UUID
+    public let senderWorktreeID: UUID
+    public let type: ChannelMessageType
+    public let body: String
+    public let createdAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        teamID: UUID,
+        senderWorktreeID: UUID,
+        type: ChannelMessageType = .note,
+        body: String,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.teamID = teamID
+        self.senderWorktreeID = senderWorktreeID
+        self.type = type
+        self.body = body
+        self.createdAt = createdAt
+    }
+}
+
 /// Per-worktree summary of unread notifications. Returned by
 /// `NotificationStore.unreadSummaryByWorktree()` and surfaced through the
 /// `listNotifications` RPC so the app can render severity badges AND sort

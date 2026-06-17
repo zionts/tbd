@@ -306,6 +306,40 @@ public struct WorktreeStore: Sendable {
         }
     }
 
+    /// Walk `parentWorktreeID` upward from `worktreeID` and return the topmost
+    /// ancestor — the "root of subtree". A parent and all of its descendants
+    /// resolve to the same root, which the coordination channel uses as the
+    /// shared `teamID`.
+    ///
+    /// Cycle-safe: a `visited` set (seeded with the starting id, same guard as
+    /// `breakCyclicParents`/`move`) stops the walk if the DB contains a cycle
+    /// from manual edits or a regression, returning the last node reached
+    /// rather than spinning forever. A worktree with no parent (or a dangling
+    /// parent pointer) is its own root. Returns `worktreeID` unchanged if the
+    /// row doesn't exist, so callers always get a usable teamID.
+    public func rootWorktreeID(of worktreeID: UUID) async throws -> UUID {
+        try await writer.read { db in
+            var currentID = worktreeID.uuidString
+            var visited: Set<String> = [currentID]
+            while true {
+                guard let parent = try Row.fetchOne(
+                    db,
+                    sql: "SELECT parentWorktreeID FROM worktree WHERE id = ?",
+                    arguments: [currentID]
+                )?["parentWorktreeID"] as String? else {
+                    // No parent (top of tree), or current row doesn't exist.
+                    break
+                }
+                if !visited.insert(parent).inserted {
+                    // Cycle detected — stop at the current node.
+                    break
+                }
+                currentID = parent
+            }
+            return UUID(uuidString: currentID) ?? worktreeID
+        }
+    }
+
     /// Archive a worktree (set status to archived and record the timestamp).
     /// Optionally saves Claude session IDs and the captured HEAD SHA in the
     /// same transaction so they survive terminal deletion and crashes.
