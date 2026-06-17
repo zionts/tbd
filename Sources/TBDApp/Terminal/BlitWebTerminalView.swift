@@ -16,6 +16,50 @@ private let logger = Logger(subsystem: "com.tbd.app", category: "BlitWebTerminal
 /// (live: `log stream --predicate '…'`).
 private let focusLog = Logger(subsystem: "com.tbd.app", category: "terminal.focus")
 
+/// File-based mirror of the focus log. The app frequently runs UNBUNDLED (the
+/// bare-binary blit harness) or as an ad-hoc isolated bundle, and in those
+/// states `os.Logger` output is not reliably readable via `log show` — making
+/// keyboard/focus diagnosis impossible. This appends the same focus lines to a
+/// plain file under the isolated home (`$TBD_HOME/focus.log`, honoring
+/// TBD_HOME) so the next focus diagnosis is reliable regardless of bundle
+/// state. `os.Logger` is kept too (it's the right tool in a signed prod bundle).
+enum FocusFileLog {
+    /// `$TBD_HOME/focus.log` (TBD_HOME-aware via TBDConstants.configDir), with a
+    /// `/tmp/tbd-focus.log` fallback if the home dir isn't writable.
+    private static let fileURL: URL = {
+        let primary = TBDConstants.configDir.appendingPathComponent("focus.log")
+        let dir = primary.deletingLastPathComponent()
+        if (try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)) != nil {
+            return primary
+        }
+        return URL(fileURLWithPath: "/tmp/tbd-focus.log")
+    }()
+
+    private static let queue = DispatchQueue(label: "com.tbd.app.focus-file-log")
+
+    /// Append one timestamped line. Best-effort: failures are swallowed so a
+    /// logging problem never affects terminal behavior. The timestamp is
+    /// captured now (on the calling thread) and formatting happens on the serial
+    /// queue, where a fresh non-Sendable `ISO8601DateFormatter` is created — this
+    /// keeps the formatter off a shared static (Swift 6 concurrency safety).
+    static func write(_ message: String) {
+        let now = Date()
+        queue.async {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let line = "\(formatter.string(from: now)) \(message)\n"
+            guard let data = line.data(using: .utf8) else { return }
+            if let handle = try? FileHandle(forWritingTo: fileURL) {
+                defer { try? handle.close() }
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            } else {
+                try? data.write(to: fileURL, options: .atomic)
+            }
+        }
+    }
+}
+
 // MARK: - Theme bridge
 
 /// The JSON-serializable theme dict the blit web client reads from
@@ -204,6 +248,7 @@ final class TBDTerminalWebView: WKWebView {
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
         focusLog.info("becomeFirstResponder ok=\(ok, privacy: .public) allowsFocus=\(self.allowsFocus, privacy: .public) [\(self.focusLabel, privacy: .public)]")
+        FocusFileLog.write("becomeFirstResponder ok=\(ok) allowsFocus=\(allowsFocus) [\(focusLabel)]")
         if ok {
             onBecomeFirstResponder?()
             // Push DOM focus onto blit's hidden input textarea. AppKit
@@ -219,6 +264,7 @@ final class TBDTerminalWebView: WKWebView {
     override func resignFirstResponder() -> Bool {
         let ok = super.resignFirstResponder()
         focusLog.info("resignFirstResponder ok=\(ok, privacy: .public) [\(self.focusLabel, privacy: .public)]")
+        FocusFileLog.write("resignFirstResponder ok=\(ok) [\(focusLabel)]")
         return ok
     }
 
@@ -233,9 +279,11 @@ final class TBDTerminalWebView: WKWebView {
     override func mouseDown(with event: NSEvent) {
         if allowsFocus, window?.firstResponder !== self, !isDescendantFirstResponder() {
             focusLog.info("mouseDown -> promoting to first responder [\(self.focusLabel, privacy: .public)]")
+            FocusFileLog.write("mouseDown -> promoting to first responder [\(focusLabel)]")
             window?.makeFirstResponder(self)
         } else {
             focusLog.info("mouseDown (already focused or suppressed, allowsFocus=\(self.allowsFocus, privacy: .public)) [\(self.focusLabel, privacy: .public)]")
+            FocusFileLog.write("mouseDown (already focused or suppressed, allowsFocus=\(allowsFocus)) [\(focusLabel)]")
         }
         super.mouseDown(with: event)
         if allowsFocus { focusWebContent() }
@@ -245,6 +293,7 @@ final class TBDTerminalWebView: WKWebView {
     /// bridge is installed (the React app calls `installBridge` on mount).
     func focusWebContent() {
         focusLog.info("JS __TBD_BRIDGE__.focus() [\(self.focusLabel, privacy: .public)]")
+        FocusFileLog.write("JS __TBD_BRIDGE__.focus() [\(focusLabel)]")
         evaluateJavaScript(
             "window.__TBD_BRIDGE__ && window.__TBD_BRIDGE__.focus && window.__TBD_BRIDGE__.focus();",
             completionHandler: nil
@@ -261,20 +310,24 @@ final class TBDTerminalWebView: WKWebView {
     func claimFocus(reason: String) {
         guard allowsFocus else {
             focusLog.info("claimFocus SKIPPED (allowsFocus=false) reason=\(reason, privacy: .public) [\(self.focusLabel, privacy: .public)]")
+            FocusFileLog.write("claimFocus SKIPPED (allowsFocus=false) reason=\(reason) [\(focusLabel)]")
             return
         }
         guard let window else {
             focusLog.info("claimFocus SKIPPED (no window) reason=\(reason, privacy: .public) [\(self.focusLabel, privacy: .public)]")
+            FocusFileLog.write("claimFocus SKIPPED (no window) reason=\(reason) [\(focusLabel)]")
             return
         }
         let current = window.firstResponder as? NSView
         let alreadyFocused = current === self || (current?.isDescendant(of: self) ?? false)
         if alreadyFocused {
             focusLog.info("claimFocus (already first responder) reason=\(reason, privacy: .public) [\(self.focusLabel, privacy: .public)] -> refocusing web content")
+            FocusFileLog.write("claimFocus (already first responder) reason=\(reason) [\(focusLabel)] -> refocusing web content")
             focusWebContent()
             return
         }
         focusLog.info("claimFocus -> makeFirstResponder reason=\(reason, privacy: .public) [\(self.focusLabel, privacy: .public)]")
+        FocusFileLog.write("claimFocus -> makeFirstResponder reason=\(reason) [\(focusLabel)]")
         window.makeFirstResponder(self)
         // becomeFirstResponder pushes web focus, but call it unconditionally in
         // case AppKit declines promotion (e.g. nested key view already owns it).
@@ -442,6 +495,7 @@ struct BlitWebTerminalView: NSViewRepresentable {
                     focusLog.info(
                         "makeNSView auto-promote SKIPPED allowsFocus=\(webView.allowsFocus, privacy: .public) hasWindow=\(webView.window != nil, privacy: .public) [\(webView.focusLabel, privacy: .public)]"
                     )
+                    FocusFileLog.write("makeNSView auto-promote SKIPPED allowsFocus=\(webView.allowsFocus) hasWindow=\(webView.window != nil) [\(webView.focusLabel)]")
                 }
             }
         }
@@ -485,6 +539,7 @@ struct BlitWebTerminalView: NSViewRepresentable {
             focusLog.info(
                 "updateNSView allowsFocus \(webView.allowsFocus, privacy: .public)->\(active, privacy: .public) (isSuspended=\(self.isSuspended, privacy: .public) suppressed=\(suppressed, privacy: .public) holdsFocus=\(holdsFocus, privacy: .public)) [\(webView.focusLabel, privacy: .public)]"
             )
+            FocusFileLog.write("updateNSView allowsFocus \(webView.allowsFocus)->\(active) (isSuspended=\(isSuspended) suppressed=\(suppressed) holdsFocus=\(holdsFocus)) [\(webView.focusLabel)]")
             webView.allowsFocus = active
             // If we just lost the right to focus WHILE HOLDING it (an overlay
             // appeared over us, or we were suspended), hand first responder
@@ -498,6 +553,7 @@ struct BlitWebTerminalView: NSViewRepresentable {
             // focused relinquishes it.
             if !active, holdsFocus, let window = webView.window {
                 focusLog.info("updateNSView -> makeFirstResponder(nil) (lost focus rights while holding) [\(webView.focusLabel, privacy: .public)]")
+                FocusFileLog.write("updateNSView -> makeFirstResponder(nil) (lost focus rights while holding) [\(webView.focusLabel)]")
                 window.makeFirstResponder(nil)
             }
         }
@@ -505,6 +561,7 @@ struct BlitWebTerminalView: NSViewRepresentable {
             focusLog.info(
                 "updateNSView active \(coordinator.lastActive.map { "\($0)" } ?? "nil", privacy: .public)->\(active, privacy: .public) (isSuspended=\(self.isSuspended, privacy: .public) suppressed=\(suppressed, privacy: .public)) [\(webView.focusLabel, privacy: .public)]"
             )
+            FocusFileLog.write("updateNSView active \(coordinator.lastActive.map { "\($0)" } ?? "nil")->\(active) (isSuspended=\(isSuspended) suppressed=\(suppressed)) [\(webView.focusLabel)]")
             let becameActive = (coordinator.lastActive != true) && active
             coordinator.lastActive = active
             let activeJS = "window.__TBD_BRIDGE__ && window.__TBD_BRIDGE__.setActive(\(active ? "true" : "false"));"
