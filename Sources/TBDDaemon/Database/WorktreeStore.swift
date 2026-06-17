@@ -314,9 +314,16 @@ public struct WorktreeStore: Sendable {
     /// Cycle-safe: a `visited` set (seeded with the starting id, same guard as
     /// `breakCyclicParents`/`move`) stops the walk if the DB contains a cycle
     /// from manual edits or a regression, returning the last node reached
-    /// rather than spinning forever. A worktree with no parent (or a dangling
-    /// parent pointer) is its own root. Returns `worktreeID` unchanged if the
-    /// row doesn't exist, so callers always get a usable teamID.
+    /// rather than spinning forever.
+    ///
+    /// Dangling-parent-safe: if a row's `parentWorktreeID` points at a worktree
+    /// that no longer exists (parent hard-deleted out-of-band), the walk stops at
+    /// the last *existing* node rather than returning the missing parent's id.
+    /// Returning a non-existent id would silently split this child's `teamID`
+    /// from its siblings, who still resolve to the real root.
+    ///
+    /// A worktree with no parent is its own root. Returns `worktreeID` unchanged
+    /// if the starting row doesn't exist, so callers always get a usable teamID.
     public func rootWorktreeID(of worktreeID: UUID) async throws -> UUID {
         try await writer.read { db in
             var currentID = worktreeID.uuidString
@@ -334,6 +341,15 @@ public struct WorktreeStore: Sendable {
                     // Cycle detected — stop at the current node.
                     break
                 }
+                // Dangling parent: the pointer references a row that doesn't
+                // exist. Stop at the current (last existing) node so this child
+                // shares its siblings' root instead of an orphan id.
+                let parentExists = try Bool.fetchOne(
+                    db,
+                    sql: "SELECT EXISTS(SELECT 1 FROM worktree WHERE id = ?)",
+                    arguments: [parent]
+                ) ?? false
+                guard parentExists else { break }
                 currentID = parent
             }
             return UUID(uuidString: currentID) ?? worktreeID

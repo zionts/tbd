@@ -119,6 +119,50 @@ struct RPCRouterChannelHandlerTests {
         let response = await router.handle(request)
         #expect(!response.success)
     }
+
+    @Test func postRejectsOverCapBody() async throws {
+        let db = try TBDDatabase(inMemory: true)
+        let (router, deltas) = makeRouter(db: db)
+        let repo = try await makeRepo(db: db)
+        let worktree = try await makeWorktree(db: db, repo: repo)
+
+        // One byte over the cap (ASCII "a" is 1 byte each).
+        let oversized = String(repeating: "a", count: RPCRouter.maxChannelBodyBytes + 1)
+        let request = try RPCRequest(
+            method: RPCMethod.channelPost,
+            params: ChannelPostParams(senderWorktreeID: worktree.id, body: oversized)
+        )
+        let response = await router.handle(request)
+        #expect(!response.success)
+
+        // Rejected before persistence/broadcast: nothing stored, nothing emitted.
+        let stored = try await db.channel.tail(teamID: worktree.id)
+        #expect(stored.isEmpty)
+        let broadcasts = deltas.snapshot().compactMap { delta -> ChannelMessageDelta? in
+            if case .channelMessage(let d) = delta { return d }
+            return nil
+        }
+        #expect(broadcasts.isEmpty)
+    }
+
+    @Test func postAcceptsAtCapBody() async throws {
+        let db = try TBDDatabase(inMemory: true)
+        let (router, _) = makeRouter(db: db)
+        let repo = try await makeRepo(db: db)
+        let worktree = try await makeWorktree(db: db, repo: repo)
+
+        // Exactly at the cap must succeed.
+        let atCap = String(repeating: "a", count: RPCRouter.maxChannelBodyBytes)
+        let request = try RPCRequest(
+            method: RPCMethod.channelPost,
+            params: ChannelPostParams(senderWorktreeID: worktree.id, body: atCap)
+        )
+        let response = await router.handle(request)
+        #expect(response.success)
+
+        let message = try response.decodeResult(ChannelMessage.self)
+        #expect(message.body.utf8.count == RPCRouter.maxChannelBodyBytes)
+    }
 }
 
 /// Thread-safe collector for broadcast StateDeltas.

@@ -384,4 +384,91 @@ import TBDShared
         #expect(ids == [wt1.id, wt2.id])
         #expect(result.map(\.sortOrder) == [1, 2])
     }
+
+    // MARK: - rootWorktreeID
+
+    @Test func rootWorktreeIDWalksChainToTrueRoot() async throws {
+        let db = try makeDB()
+        let repo = try await createRepo(db: db)
+        let root = try await db.worktrees.create(
+            repoID: repo.id, name: "root", branch: "b-root",
+            path: "/tmp/root-\(UUID())", tmuxServer: "srv"
+        )
+        let child = try await db.worktrees.create(
+            repoID: repo.id, name: "child", branch: "b-child",
+            path: "/tmp/child-\(UUID())", tmuxServer: "srv", parentWorktreeID: root.id
+        )
+        let grandchild = try await db.worktrees.create(
+            repoID: repo.id, name: "grandchild", branch: "b-gc",
+            path: "/tmp/gc-\(UUID())", tmuxServer: "srv", parentWorktreeID: child.id
+        )
+
+        #expect(try await db.worktrees.rootWorktreeID(of: grandchild.id) == root.id)
+        #expect(try await db.worktrees.rootWorktreeID(of: child.id) == root.id)
+        #expect(try await db.worktrees.rootWorktreeID(of: root.id) == root.id)
+    }
+
+    @Test func rootWorktreeIDTerminatesOnCycle() async throws {
+        let db = try makeDB()
+        let repo = try await createRepo(db: db)
+        let a = try await db.worktrees.create(
+            repoID: repo.id, name: "a", branch: "b-a",
+            path: "/tmp/a-\(UUID())", tmuxServer: "srv"
+        )
+        let b = try await db.worktrees.create(
+            repoID: repo.id, name: "b", branch: "b-b",
+            path: "/tmp/b-\(UUID())", tmuxServer: "srv", parentWorktreeID: a.id
+        )
+        // Force a cycle a.parent = b (move() would reject this, so write raw SQL).
+        try await db.worktrees.writer.write { dbConn in
+            try dbConn.execute(
+                sql: "UPDATE worktree SET parentWorktreeID = ? WHERE id = ?",
+                arguments: [b.id.uuidString, a.id.uuidString]
+            )
+        }
+
+        // Must terminate (not spin) and return deterministically. Starting from
+        // a: visited={a}, step to b, step to a -> revisit -> stop at b.
+        let fromA = try await db.worktrees.rootWorktreeID(of: a.id)
+        #expect(fromA == b.id)
+        // Starting from b: visited={b}, step to a, step to b -> revisit -> stop at a.
+        let fromB = try await db.worktrees.rootWorktreeID(of: b.id)
+        #expect(fromB == a.id)
+    }
+
+    @Test func rootWorktreeIDReturnsLastExistingNodeForDanglingParent() async throws {
+        let db = try makeDB()
+        let repo = try await createRepo(db: db)
+        // Create a legitimate parent/child chain (the FK on parentWorktreeID is
+        // ON DELETE SET NULL, so we can't create a dangling pointer directly).
+        let parent = try await db.worktrees.create(
+            repoID: repo.id, name: "parent", branch: "b-parent",
+            path: "/tmp/parent-\(UUID())", tmuxServer: "srv"
+        )
+        let child = try await db.worktrees.create(
+            repoID: repo.id, name: "child", branch: "b-child",
+            path: "/tmp/child-\(UUID())", tmuxServer: "srv", parentWorktreeID: parent.id
+        )
+        // Simulate an out-of-band hard delete of the parent (manual sqlite edit)
+        // that leaves the child's pointer dangling. The FK is ON DELETE SET NULL,
+        // so a normal delete would null the child's pointer; we must drop FK
+        // enforcement to leave a true dangling reference. `PRAGMA foreign_keys`
+        // is a no-op inside a transaction, so use writeWithoutTransaction.
+        try await db.writerForTests.writeWithoutTransaction { dbConn in
+            try dbConn.execute(sql: "PRAGMA foreign_keys = OFF")
+            try dbConn.execute(
+                sql: "DELETE FROM worktree WHERE id = ?",
+                arguments: [parent.id.uuidString]
+            )
+            try dbConn.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        // Sanity: the child still points at the now-missing parent.
+        #expect(try await db.worktrees.get(id: child.id)?.parentWorktreeID == parent.id)
+
+        let resolved = try await db.worktrees.rootWorktreeID(of: child.id)
+        // Must be the child itself (last existing node), NOT the dangling parent
+        // id — otherwise the child's teamID silently splits from its siblings.
+        #expect(resolved == child.id)
+        #expect(resolved != parent.id)
+    }
 }

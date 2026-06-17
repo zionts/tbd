@@ -85,16 +85,85 @@ import TBDShared
         #expect(after.map(\.id) == [second.id, third.id])
     }
 
-    @Test func tailLimitCapsResults() async throws {
+    @Test func tailLimitReturnsNewestNInChronologicalOrder() async throws {
         let db = try makeDB()
         let team = UUID()
         let sender = UUID()
         for i in 0..<5 {
             _ = try await db.channel.post(teamID: team, senderWorktreeID: sender, type: .note, body: "m\(i)")
         }
+        // A chat thread wants the most recent N, displayed oldest-to-newest.
         let limited = try await db.channel.tail(teamID: team, limit: 2)
         #expect(limited.count == 2)
-        #expect(limited.map(\.body) == ["m0", "m1"])
+        #expect(limited.map(\.body) == ["m3", "m4"])
+    }
+
+    // MARK: - newest-N window (cap drops oldest, not newest)
+
+    @Test func tailReturnsNewestNWhenMoreThanLimitExist() async throws {
+        let db = try makeDB()
+        let team = UUID()
+        let sender = UUID()
+        // Post N + k messages.
+        for i in 0..<10 {
+            _ = try await db.channel.post(teamID: team, senderWorktreeID: sender, type: .note, body: "m\(i)")
+        }
+        let limited = try await db.channel.tail(teamID: team, limit: 3)
+        // The last 3, oldest-to-newest — never the oldest 3.
+        #expect(limited.map(\.body) == ["m7", "m8", "m9"])
+    }
+
+    // MARK: - limit clamping
+
+    @Test func tailClampsNegativeLimitToBoundedRead() async throws {
+        let db = try makeDB()
+        let team = UUID()
+        let sender = UUID()
+        for i in 0..<5 {
+            _ = try await db.channel.post(teamID: team, senderWorktreeID: sender, type: .note, body: "m\(i)")
+        }
+        // SQLite treats a raw negative LIMIT as unbounded — clamp must turn it
+        // into a bounded read of exactly one row (the newest).
+        let limited = try await db.channel.tail(teamID: team, limit: -1)
+        #expect(limited.count == 1)
+        #expect(limited.map(\.body) == ["m4"])
+    }
+
+    @Test func tailClampsZeroLimitToBoundedRead() async throws {
+        let db = try makeDB()
+        let team = UUID()
+        let sender = UUID()
+        for i in 0..<5 {
+            _ = try await db.channel.post(teamID: team, senderWorktreeID: sender, type: .note, body: "m\(i)")
+        }
+        let limited = try await db.channel.tail(teamID: team, limit: 0)
+        #expect(limited.count == 1)
+        #expect(limited.map(\.body) == ["m4"])
+    }
+
+    @Test func tailClampsOverMaxLimitToCeiling() async throws {
+        let db = try makeDB()
+        let team = UUID()
+        let sender = UUID()
+        // Far fewer rows than the ceiling: an over-max request must not error and
+        // must return all available rows in chronological order.
+        for i in 0..<3 {
+            _ = try await db.channel.post(teamID: team, senderWorktreeID: sender, type: .note, body: "m\(i)")
+        }
+        let limited = try await db.channel.tail(teamID: team, limit: 1_000_000)
+        #expect(limited.map(\.body) == ["m0", "m1", "m2"])
+    }
+
+    @Test func tailDefaultLimitReturnsChronologicalOrder() async throws {
+        // With no explicit limit, fewer-than-default rows come back oldest-first.
+        let db = try makeDB()
+        let team = UUID()
+        let sender = UUID()
+        for i in 0..<4 {
+            _ = try await db.channel.post(teamID: team, senderWorktreeID: sender, type: .note, body: "m\(i)")
+        }
+        let tailed = try await db.channel.tail(teamID: team)
+        #expect(tailed.map(\.body) == ["m0", "m1", "m2", "m3"])
     }
 
     // MARK: - append-only (store exposes no mutate/delete)

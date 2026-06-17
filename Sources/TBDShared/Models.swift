@@ -566,6 +566,12 @@ public enum ChannelMessageType: String, Codable, Sendable {
 /// (computed daemon-side via `WorktreeStore.rootWorktreeID(of:)`), so every
 /// member of a team reads and writes the same ordered thread. Messages are
 /// never updated or deleted — the channel is an append-only log.
+///
+/// Trust model (v1): `senderWorktreeID` and team scoping are NOT authenticated
+/// beyond worktree existence — the trust boundary is the local user (0o700
+/// socket, loopback HTTP). Any local process can post as / tail any worktree's
+/// team, so provenance tags here are advisory within that boundary. See
+/// `ChannelStore` for the full rationale.
 public struct ChannelMessage: Codable, Sendable, Identifiable, Equatable {
     public let id: UUID
     public let teamID: UUID
