@@ -232,7 +232,9 @@ extension WorktreeLifecycle {
         archivedClaudeSessions: [String]? = nil,
         initialPrompt: String? = nil,
         cols: Int? = nil, rows: Int? = nil,
-        completionAction: PreSessionCompletionAction
+        completionAction: PreSessionCompletionAction,
+        role: AgentRole? = nil,
+        brief: String? = nil
     ) async {
         let outcome = await waitForPreSessionCompletion(
             preSession: preSession, tmuxServer: worktree.tmuxServer
@@ -294,7 +296,9 @@ extension WorktreeLifecycle {
                 archivedClaudeSessions: archivedClaudeSessions,
                 initialPrompt: initialPrompt,
                 cols: cols, rows: rows,
-                preSessionTerminalID: preSession.terminalID
+                preSessionTerminalID: preSession.terminalID,
+                role: role,
+                brief: brief
             )
             for terminal in created {
                 subscriptions?.broadcast(delta: .terminalCreated(TerminalDelta(

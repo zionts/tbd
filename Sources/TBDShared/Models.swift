@@ -518,6 +518,28 @@ public struct TBDNotification: Codable, Sendable, Identifiable {
     }
 }
 
+// MARK: - Agent Role (orchestration spine)
+
+/// The role a spawned session plays inside a parent-orchestrated team.
+///
+/// `orchestrator` coordinates and keeps awareness but does not make product
+/// decisions or edit code on behalf of others — it spawns children to do the
+/// work. `worker` owns its own task and its own decisions. `nil` (absent) means
+/// no explicit role was assigned; the operating-rules brief is still injected
+/// whenever the worktree is a spawned child (i.e. `parentWorktreeID != nil`).
+///
+/// Backed by a string so an unknown future role posted by a newer client still
+/// round-trips through older readers via the `init(from:)` fallback to `.worker`.
+public enum AgentRole: String, Codable, Sendable {
+    case orchestrator
+    case worker
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = AgentRole(rawValue: raw) ?? .worker
+    }
+}
+
 // MARK: - Channel (orchestration spine)
 
 /// Typed kinds of coordination-channel posts. Free-form `.note` is the catch-all;

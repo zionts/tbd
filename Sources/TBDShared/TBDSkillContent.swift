@@ -82,6 +82,29 @@ want to spawn workers under yourself.
 Use `--position=root` to force the new worktree to be top-level.
 Remember all three positions only affect UI-tree placement — every new worktree branches off the default branch regardless (see above).
 
+### Spawn a child with a role + brief (orchestration spine)
+
+When you're orchestrating a team, spawn each unit of work as a child and hand
+it a task **brief**. TBD injects fixed, human-curated operating rules into every
+spawned child (and any worktree given a `--role`) so the team keeps single-owner
+discipline. You can't edit those rules — they're load-bearing and curated by a
+human.
+
+```bash
+tbd worktree create --position child --role worker --brief-file - <<'EOF'
+task-specific brief here
+EOF
+```
+
+`--role orchestrator|worker` tags the role; `--brief <text>` / `--brief-file <path>`
+(use `-` for stdin) supplies the task brief. The injected rules tell the child:
+
+- **Single owner:** make decisions, approvals, and questions with the human IN
+  ITS OWN worktree — never route decisions up to you, the parent. If you're an
+  orchestrator, you coordinate and keep awareness; you do NOT make product
+  decisions or edit code for children — spawn a child to own the work.
+- Coordinate via `tbd channel post` (typed awareness), not by escalating decisions.
+
 ### Reparent a worktree
 
 Move an existing worktree under a different orchestrator, or promote a child

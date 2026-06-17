@@ -185,4 +185,86 @@ struct SystemPromptBuilderTests {
         #expect(prompt != nil)
         #expect(prompt?.contains("`tbd` skill") == true)
     }
+
+    // MARK: - Operating Rules / Brief (orchestration spine Phase B)
+
+    @Test("BriefRole: spawned child (parentWorktreeID set) gets the operating-rules layer")
+    func childWorktreeGetsOperatingRules() {
+        let repo = Repo(path: "/test", displayName: "test", defaultBranch: "main")
+        let parentID = UUID()
+        let wt = Worktree(repoID: repo.id, name: "child-wt", displayName: "🔐 Child",
+                          branch: "tbd/child-wt", path: "/test/.tbd/worktrees/child-wt",
+                          tmuxServer: "tbd-test", parentWorktreeID: parentID)
+
+        let result = SystemPromptBuilder.build(repo: repo, worktree: wt, isResume: false)
+        #expect(result != nil)
+        #expect(result!.contains("Team operating rules"))
+        #expect(result!.contains("Single clear owner"))
+        #expect(result!.contains("One live session per worktree"))
+        #expect(result!.contains("tbd channel post"))
+        #expect(result!.contains("[learning]"))
+        // No explicit role → no orchestrator paragraph.
+        #expect(!result!.contains("Your role: orchestrator"))
+    }
+
+    @Test("BriefRole: brief text is appended to a child's system prompt")
+    func childWorktreeIncludesBrief() {
+        let repo = Repo(path: "/test", displayName: "test", defaultBranch: "main")
+        let wt = Worktree(repoID: repo.id, name: "child-wt", displayName: "🔐 Child",
+                          branch: "tbd/child-wt", path: "/test/.tbd/worktrees/child-wt",
+                          tmuxServer: "tbd-test", parentWorktreeID: UUID())
+
+        let result = SystemPromptBuilder.build(
+            repo: repo, worktree: wt, isResume: false,
+            brief: "Migrate the auth table to GRDB v3."
+        )
+        #expect(result != nil)
+        #expect(result!.contains("Migrate the auth table to GRDB v3."))
+        #expect(result!.contains("Team operating rules"))
+    }
+
+    @Test("BriefRole: orchestrator role adds the no-decisions paragraph")
+    func orchestratorRoleAddsParagraph() {
+        let repo = Repo(path: "/test", displayName: "test", defaultBranch: "main")
+        // Top-level worktree (no parent) but explicit orchestrator role.
+        let wt = Worktree(repoID: repo.id, name: "lead-wt", displayName: "🔐 Lead",
+                          branch: "tbd/lead-wt", path: "/test/.tbd/worktrees/lead-wt",
+                          tmuxServer: "tbd-test")
+
+        let result = SystemPromptBuilder.build(
+            repo: repo, worktree: wt, isResume: false, role: .orchestrator
+        )
+        #expect(result != nil)
+        #expect(result!.contains("Team operating rules"))
+        #expect(result!.contains("Your role: orchestrator"))
+        #expect(result!.contains("tbd worktree create --position child --brief"))
+    }
+
+    @Test("BriefRole: top-level non-team worktree without role does NOT get the rules")
+    func topLevelWorktreeNoRules() {
+        let repo = Repo(path: "/test", displayName: "test", defaultBranch: "main")
+        let wt = Worktree(repoID: repo.id, name: "solo-wt", displayName: "🔐 Solo",
+                          branch: "tbd/solo-wt", path: "/test/.tbd/worktrees/solo-wt",
+                          tmuxServer: "tbd-test")
+
+        let result = SystemPromptBuilder.build(repo: repo, worktree: wt, isResume: false)
+        #expect(result != nil)
+        #expect(!result!.contains("Team operating rules"))
+        // Sanity: the slim pointer is still present.
+        #expect(result!.contains("`tbd` skill"))
+    }
+
+    @Test("BriefRole: isResume still returns nil even with role and brief set")
+    func resumeReturnsNilWithRoleAndBrief() {
+        let repo = Repo(path: "/test", displayName: "test", defaultBranch: "main")
+        let wt = Worktree(repoID: repo.id, name: "child-wt", displayName: "🔐 Child",
+                          branch: "tbd/child-wt", path: "/test/.tbd/worktrees/child-wt",
+                          tmuxServer: "tbd-test", parentWorktreeID: UUID())
+
+        let result = SystemPromptBuilder.build(
+            repo: repo, worktree: wt, isResume: true,
+            role: .orchestrator, brief: "some brief"
+        )
+        #expect(result == nil)
+    }
 }

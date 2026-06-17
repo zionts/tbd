@@ -604,7 +604,16 @@ public struct WorktreeCreateParams: Codable, Sendable {
     /// out into a new worktree — no fresh `tbd/*` branch is created.
     /// Optional/defaulted for backward compatibility with older clients.
     public let useExistingBranch: Bool?
-    public init(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, prompt: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, siblingOfWorktreeID: UUID? = nil, callerWorktreeID: UUID? = nil, suppressAutoParent: Bool? = nil, useExistingBranch: Bool? = nil) {
+    /// Orchestration-spine role for the spawned session. When set (or when the
+    /// worktree is a spawned child via `parentWorktreeID`), the daemon injects
+    /// the fixed, human-curated operating-rules brief into the child's system
+    /// prompt. Optional/defaulted for backward compatibility.
+    public let role: AgentRole?
+    /// Optional task-specific brief appended to the system prompt as the
+    /// child's task instructions. Plain text. Optional/defaulted for
+    /// backward compatibility.
+    public let brief: String?
+    public init(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, prompt: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, siblingOfWorktreeID: UUID? = nil, callerWorktreeID: UUID? = nil, suppressAutoParent: Bool? = nil, useExistingBranch: Bool? = nil, role: AgentRole? = nil, brief: String? = nil) {
         self.repoID = repoID; self.folder = folder; self.branch = branch; self.displayName = displayName; self.prompt = prompt
         self.cols = cols; self.rows = rows
         self.parentWorktreeID = parentWorktreeID
@@ -612,6 +621,8 @@ public struct WorktreeCreateParams: Codable, Sendable {
         self.callerWorktreeID = callerWorktreeID
         self.suppressAutoParent = suppressAutoParent
         self.useExistingBranch = useExistingBranch
+        self.role = role
+        self.brief = brief
     }
 }
 

@@ -333,6 +333,32 @@ import Testing
     #expect(decoded.prompt == nil)
 }
 
+@Test func testWorktreeCreateParamsRoleBriefRoundTrip() throws {
+    let repoID = UUID()
+    let params = WorktreeCreateParams(
+        repoID: repoID,
+        role: .orchestrator,
+        brief: "Coordinate the migration."
+    )
+    let data = try JSONEncoder().encode(params)
+    let decoded = try JSONDecoder().decode(WorktreeCreateParams.self, from: data)
+    #expect(decoded.role == .orchestrator)
+    #expect(decoded.brief == "Coordinate the migration.")
+}
+
+@Test func testWorktreeCreateParamsDecodesLegacyJSONWithoutRoleBrief() throws {
+    // An older client's payload omits role/brief entirely; both must decode nil.
+    let legacy = #"""
+    { "repoID": "11111111-1111-1111-1111-111111111111", "folder": "x" }
+    """#
+    let decoded = try JSONDecoder().decode(
+        WorktreeCreateParams.self, from: Data(legacy.utf8)
+    )
+    #expect(decoded.folder == "x")
+    #expect(decoded.role == nil)
+    #expect(decoded.brief == nil)
+}
+
 @Test func repoDecodesLegacyJSONWithoutNewFields() throws {
     let legacy = #"""
     {

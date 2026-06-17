@@ -2,6 +2,8 @@ import ArgumentParser
 import Foundation
 import TBDShared
 
+extension AgentRole: ExpressibleByArgument {}
+
 struct WorktreeCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "worktree",
@@ -44,6 +46,27 @@ struct WorktreeCreate: AsyncParsableCommand {
 
     @Option(name: .long, help: "Read initial prompt from a file (use - for stdin)")
     var promptFile: String?
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Orchestration role for the spawned session (orchestrator|worker).",
+            discussion: """
+                Sets the team role. When set — or when the worktree is a spawned
+                child — TBD injects fixed, human-curated operating rules
+                (single-owner discipline) into the session's system prompt.
+                orchestrator   Coordinates + keeps awareness; spawns children to do work.
+                worker         Owns its own task and decisions.
+                """
+        )
+    )
+    var role: AgentRole?
+
+    @Option(name: .long, help: "Task-specific brief appended to the spawned session's system prompt")
+    var brief: String?
+
+    @Option(name: .long, help: "Read the brief from a file (use - for stdin)")
+    var briefFile: String?
 
     @Option(
         name: .customLong("position"),
@@ -98,6 +121,13 @@ struct WorktreeCreate: AsyncParsableCommand {
         }
 
         let resolvedPrompt = try resolvePrompt(inline: prompt, file: promptFile)
+        // Reuse resolvePrompt's inline/file/stdin handling for the brief. Guard
+        // against two competing stdin reads: only one of --prompt-file / --brief-file
+        // may be `-`.
+        if promptFile == "-" && briefFile == "-" {
+            throw CLIError.invalidArgument("Only one of --prompt-file - and --brief-file - can read from stdin")
+        }
+        let resolvedBrief = try resolvePrompt(inline: brief, file: briefFile)
 
         let callerEnvID = ProcessInfo.processInfo.environment["TBD_WORKTREE_ID"]
             .flatMap { UUID(uuidString: $0) }
@@ -117,7 +147,9 @@ struct WorktreeCreate: AsyncParsableCommand {
                 parentWorktreeID: nil,
                 siblingOfWorktreeID: parentingFields.siblingOfWorktreeID,
                 callerWorktreeID: parentingFields.callerWorktreeID,
-                suppressAutoParent: parentingFields.suppressAutoParent
+                suppressAutoParent: parentingFields.suppressAutoParent,
+                role: role,
+                brief: resolvedBrief
             ),
             resultType: Worktree.self
         )

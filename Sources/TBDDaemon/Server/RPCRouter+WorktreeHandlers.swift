@@ -37,9 +37,11 @@ extension RPCRouter {
         // Pass the raw branch ref (possibly `origin/...`) to phase 2 so it
         // can dispatch to the right git command.
         let existingBranchRef = useExistingBranch ? params.branch : nil
+        let role = params.role
+        let brief = params.brief
         await repoSerializer.submit(repoID: pending.repoID) {
             do {
-                let completion = try await lifecycle.completeCreateWorktree(worktreeID: pending.id, initialPrompt: initialPrompt, userSpecifiedFolder: userSpecifiedFolder, userSpecifiedBranch: userSpecifiedBranch, cols: cols, rows: rows, existingBranchRef: existingBranchRef)
+                let completion = try await lifecycle.completeCreateWorktree(worktreeID: pending.id, initialPrompt: initialPrompt, userSpecifiedFolder: userSpecifiedFolder, userSpecifiedBranch: userSpecifiedBranch, cols: cols, rows: rows, existingBranchRef: existingBranchRef, role: role, brief: brief)
                 switch completion {
                 case .ready:
                     subs.broadcast(delta: .worktreeCreated(WorktreeDelta(

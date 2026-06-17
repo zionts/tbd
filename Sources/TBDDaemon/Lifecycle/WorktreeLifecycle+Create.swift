@@ -25,12 +25,12 @@ extension WorktreeLifecycle {
     ///
     /// This is the legacy all-in-one method. Prefer `beginCreateWorktree` +
     /// `completeCreateWorktree` for non-blocking creation.
-    public func createWorktree(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, skipClaude: Bool = false, initialPrompt: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, siblingOfWorktreeID: UUID? = nil, callerWorktreeID: UUID? = nil, suppressAutoParent: Bool = false, useExistingBranch: Bool = false) async throws -> Worktree {
+    public func createWorktree(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, skipClaude: Bool = false, initialPrompt: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, siblingOfWorktreeID: UUID? = nil, callerWorktreeID: UUID? = nil, suppressAutoParent: Bool = false, useExistingBranch: Bool = false, role: AgentRole? = nil, brief: String? = nil) async throws -> Worktree {
         let pending = try await beginCreateWorktree(repoID: repoID, folder: folder, branch: branch, displayName: displayName, skipClaude: skipClaude, parentWorktreeID: parentWorktreeID, siblingOfWorktreeID: siblingOfWorktreeID, callerWorktreeID: callerWorktreeID, suppressAutoParent: suppressAutoParent, useExistingBranch: useExistingBranch)
         // Pass the original branch ref (may include `origin/` prefix) through
         // so phase 2 can dispatch to the correct git command.
         let existingBranchRef = useExistingBranch ? branch : nil
-        let completion = try await completeCreateWorktree(worktreeID: pending.id, skipClaude: skipClaude, initialPrompt: initialPrompt, userSpecifiedFolder: folder != nil, userSpecifiedBranch: branch != nil, cols: cols, rows: rows, existingBranchRef: existingBranchRef)
+        let completion = try await completeCreateWorktree(worktreeID: pending.id, skipClaude: skipClaude, initialPrompt: initialPrompt, userSpecifiedFolder: folder != nil, userSpecifiedBranch: branch != nil, cols: cols, rows: rows, existingBranchRef: existingBranchRef, role: role, brief: brief)
         // Legacy synchronous contract: the returned worktree is fully set up.
         // Await phase 3 inline when a preSession hook gated the primary spawn.
         if case .preSessionPending(let phase3) = completion {
@@ -154,7 +154,7 @@ extension WorktreeLifecycle {
     /// When `existingBranchRef` is non-nil, the worktree is checked out from
     /// that existing ref (local or `origin/*`) — no fresh branch is created.
     @discardableResult
-    public func completeCreateWorktree(worktreeID: UUID, skipClaude: Bool = false, initialPrompt: String? = nil, userSpecifiedFolder: Bool = false, userSpecifiedBranch: Bool = false, cols: Int? = nil, rows: Int? = nil, existingBranchRef: String? = nil) async throws -> WorktreeCreateCompletion {
+    public func completeCreateWorktree(worktreeID: UUID, skipClaude: Bool = false, initialPrompt: String? = nil, userSpecifiedFolder: Bool = false, userSpecifiedBranch: Bool = false, cols: Int? = nil, rows: Int? = nil, existingBranchRef: String? = nil, role: AgentRole? = nil, brief: String? = nil) async throws -> WorktreeCreateCompletion {
         guard let worktree = try await db.worktrees.get(id: worktreeID) else {
             throw WorktreeLifecycleError.worktreeNotFound(worktreeID)
         }
@@ -258,7 +258,9 @@ extension WorktreeLifecycle {
                         skipClaude: skipClaude,
                         initialPrompt: initialPrompt,
                         cols: cols, rows: rows,
-                        completionAction: .markActive
+                        completionAction: .markActive,
+                        role: role,
+                        brief: brief
                     )
                 }
                 return .preSessionPending(phase3: phase3)
@@ -273,7 +275,9 @@ extension WorktreeLifecycle {
                 initialPrompt: initialPrompt,
                 cols: cols,
                 rows: rows,
-                preSessionTerminalID: nil
+                preSessionTerminalID: nil,
+                role: role,
+                brief: brief
             )
 
             // 6. Update status to active
@@ -390,7 +394,9 @@ extension WorktreeLifecycle {
         initialPrompt: String? = nil,
         cols: Int? = nil,
         rows: Int? = nil,
-        preSessionTerminalID: UUID?
+        preSessionTerminalID: UUID?,
+        role: AgentRole? = nil,
+        brief: String? = nil
     ) async throws -> [(id: UUID, label: String)] {
         let worktreeID = worktree.id
         let tmuxServer = worktree.tmuxServer
@@ -485,7 +491,7 @@ extension WorktreeLifecycle {
             // already-existing session file would lose the transcript.
             let appendPrompt = isResume
                 ? nil
-                : SystemPromptBuilder.build(repo: repo, worktree: worktree, isResume: false)
+                : SystemPromptBuilder.build(repo: repo, worktree: worktree, isResume: false, role: role, brief: brief)
             let spawn = ClaudeSpawnCommandBuilder.build(
                 resumeID: isResume ? sessionUUID : nil,
                 freshSessionID: isResume ? nil : sessionUUID,
