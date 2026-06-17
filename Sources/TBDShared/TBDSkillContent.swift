@@ -63,32 +63,11 @@ EOF
 
 **Where the new branch starts:** `tbd worktree create` always bases the new branch on the repo's **default branch from origin**, never on the caller's branch. It best-effort `git fetch`es, then branches off `origin/<default>` (e.g. `origin/main`), falling back to the local `<default>` only if the remote ref is missing. `--position` (child/sibling/root) controls only where the worktree sits in the UI tree — never the git base. So a worker spawned from a feature branch still starts clean off `origin/main`; to build on unmerged work, land that work on the default branch first (then rebase the new worktree onto it).
 
-### Spawn worker worktrees from an orchestrator (most common fan-out)
+### Orchestrate a team: spawn children with a role + brief (the orchestration spine)
 
-The default `--position=child` nests the new worktree under the caller. This
-is what you want when an orchestrator is fanning out a batch of workers —
-they'll all be siblings of each other and children of the orchestrator.
-
-```bash
-tbd worktree create --branch tbd/<task> --name "<task>" --prompt-file - <<'EOF'
-briefing here
-EOF
-```
-
-Use `--position=sibling` when you (the caller) are *already* a worker under
-some parent and you want to spawn a peer alongside yourself — not when you
-want to spawn workers under yourself.
-
-Use `--position=root` to force the new worktree to be top-level.
-Remember all three positions only affect UI-tree placement — every new worktree branches off the default branch regardless (see above).
-
-### Spawn a child with a role + brief (orchestration spine)
-
-When you're orchestrating a team, spawn each unit of work as a child and hand
-it a task **brief**. TBD injects fixed, human-curated operating rules into every
-spawned child (and any worktree given a `--role`) so the team keeps single-owner
-discipline. You can't edit those rules — they're load-bearing and curated by a
-human.
+This is the core fan-out workflow. When you're orchestrating, spawn each unit
+of work as a **child** worktree and hand it a task **brief**. Workers spawned
+this way become siblings of each other and children of you, the orchestrator.
 
 ```bash
 tbd worktree create --position child --role worker --brief-file - <<'EOF'
@@ -96,14 +75,29 @@ task-specific brief here
 EOF
 ```
 
-`--role orchestrator|worker` tags the role; `--brief <text>` / `--brief-file <path>`
-(use `-` for stdin) supplies the task brief. The injected rules tell the child:
+Three knobs:
 
-- **Single owner:** make decisions, approvals, and questions with the human IN
-  ITS OWN worktree — never route decisions up to you, the parent. If you're an
-  orchestrator, you coordinate and keep awareness; you do NOT make product
-  decisions or edit code for children — spawn a child to own the work.
-- Coordinate via `tbd channel post` (typed awareness), not by escalating decisions.
+- **`--position`** places the worktree in the UI tree — it does NOT affect the
+  git base (every worktree still branches off the default branch; see above).
+  - `child` (default) nests under the caller — use this to fan out workers under yourself.
+  - `sibling` spawns a peer alongside you — use only when you're *already* a worker
+    under some parent and want a peer, not a child of yourself.
+  - `root` forces a top-level worktree.
+- **`--role orchestrator|worker`** tags the team role.
+- **`--brief <text>` / `--brief-file <path>`** (use `-` for stdin) supplies the
+  task brief, appended to the spawned session's system prompt.
+
+TBD injects fixed, human-curated operating rules into every spawned child (and
+any worktree given a `--role`) so the team keeps single-owner discipline. You
+can't edit those rules — they're load-bearing. They tell each agent:
+
+- **Single owner:** every worktree owns its own work. Make decisions, approvals,
+  and questions with the human IN YOUR OWN worktree — never route decisions up to
+  the parent. As an orchestrator you coordinate and keep awareness; you do NOT
+  make product decisions or edit code for children — spawn a child to own the work.
+- **Coordinate, don't escalate:** share status and surface blockers over the team
+  channel (`tbd channel post`, below) as typed awareness — not by pushing
+  decisions up or down the tree.
 
 ### Reparent a worktree
 
