@@ -8,6 +8,12 @@ enum PaneContent: Codable, Equatable, Sendable {
     case codeViewer(id: UUID, path: String)
     case note(noteID: UUID)
     case liveTranscript(id: UUID, terminalID: UUID)
+    /// Live team coordination channel (orchestration spine). `worktreeID` is the
+    /// pane's own worktree — the daemon resolves it to the shared `teamID` (root
+    /// of the subtree) on tail/post, so any team member opens the same thread.
+    /// `id` is the pane identity; it is distinct from the worktree so the same
+    /// worktree can host the pane in multiple split slots.
+    case thread(id: UUID, worktreeID: UUID)
 
     var paneID: UUID {
         switch self {
@@ -16,6 +22,7 @@ enum PaneContent: Codable, Equatable, Sendable {
         case .codeViewer(let id, _): return id
         case .note(let id): return id
         case .liveTranscript(let id, _): return id
+        case .thread(let id, _): return id
         }
     }
 }

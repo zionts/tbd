@@ -22,7 +22,8 @@ private func makeCoordinator(
         onClaude: {},
         onClaudeProfile: onClaudeProfile,
         onCodex: {},
-        onNote: {}
+        onNote: {},
+        onThread: {}
     )
 }
 

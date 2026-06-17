@@ -51,6 +51,11 @@ final class AppState: ObservableObject {
     @Published var worktrees: [UUID: [Worktree]] = [:]
     @Published var terminals: [UUID: [Terminal]] = [:]
     @Published var notes: [UUID: [Note]] = [:]
+    /// Team coordination-channel messages keyed by `teamID` (the root worktree of
+    /// a subtree, resolved daemon-side). Append-only, deduped by message id, kept
+    /// in chronological order. Fed by `.channelMessage` deltas + `channelTail`
+    /// backfill. Orchestration spine Phase C.
+    @Published var channelMessages: [UUID: [ChannelMessage]] = [:]
     @Published var focusedTabCloseContext: TabCloseContext?
     /// Unread notification summaries keyed by worktree ID. The cmd-K jump
     /// menu sorts by `mostRecentAt`; the sidebar consumes `.type` for the
@@ -233,6 +238,19 @@ final class AppState: ObservableObject {
         var ids = Set<UUID>()
         for (worktreeID, terminalList) in terminals
         where terminalList.contains(where: { $0.activityState == .working }) {
+            ids.insert(worktreeID)
+        }
+        return ids
+    }
+
+    /// Worktrees with at least one terminal whose agent is blocked waiting on the
+    /// human (`activityState == .waitingForUser`). Surfaced as a sidebar
+    /// indicator so the user can see which teams need a barge-in. Orchestration
+    /// spine Phase C. Mirrors `workingWorktreeIDs`.
+    var waitingForUserWorktreeIDs: Set<UUID> {
+        var ids = Set<UUID>()
+        for (worktreeID, terminalList) in terminals
+        where terminalList.contains(where: { $0.activityState == .waitingForUser }) {
             ids.insert(worktreeID)
         }
         return ids
@@ -791,6 +809,8 @@ final class AppState: ObservableObject {
             applyTerminalActivityDelta(d)
         case .worktreeMoved(let d):
             applyWorktreeMovedDelta(d)
+        case .channelMessage(let d):
+            applyChannelMessageDelta(d)
         case .worktreeArchived(let d):
             applyWorktreeArchivedDelta(d)
         case .worktreeRevived(let d):

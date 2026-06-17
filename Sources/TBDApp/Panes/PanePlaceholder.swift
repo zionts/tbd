@@ -163,6 +163,14 @@ struct PanePlaceholder: View {
                     .frame(width: 10)
                 Text(term?.label ?? "Transcript")
             }
+        case .thread:
+            HStack(spacing: 4) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 10)
+                Text("Team Thread")
+            }
         }
     }
 
@@ -240,6 +248,9 @@ struct PanePlaceholder: View {
 
         case .liveTranscript:
             EmptyView()
+
+        case .thread:
+            EmptyView()
         }
     }
 
@@ -269,6 +280,8 @@ struct PanePlaceholder: View {
             } else {
                 transcriptDisabledPlaceholder
             }
+        case .thread:
+            ThreadPaneView(worktreeID: worktree.id)
         }
     }
 

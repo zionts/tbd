@@ -47,6 +47,11 @@ struct WorktreeRowView: View {
         return terminals.contains { $0.activityState == .working }
     }
 
+    private var hasWaitingForUserTerminal: Bool {
+        let terminals = appState.terminals[worktree.id] ?? []
+        return terminals.contains { $0.activityState == .waitingForUser }
+    }
+
     @ViewBuilder
     private func rowIcons() -> some View {
         // Resolved through RowStatusIndicator so at most one indicator renders.
@@ -54,6 +59,7 @@ struct WorktreeRowView: View {
         switch RowStatusIndicator.resolve(
             isPending: isPending && !isEditing,
             isWorking: hasWorkingTerminal,
+            isWaitingForUser: hasWaitingForUserTerminal,
             notification: notification,
             isSuspended: hasSuspendedTerminal,
             hasPRStatus: prPresentation != nil
@@ -75,6 +81,18 @@ struct WorktreeRowView: View {
                     dark: NSColor(srgbRed: 217 / 255, green: 119 / 255, blue: 87 / 255, alpha: 1)
                 ))
                 .frame(width: 12, height: 12)
+        case .waitingForUser:
+            // An agent is blocked waiting on the human — a distinct "needs you"
+            // glyph/color (indigo question bubble), separate from the working
+            // asterisk (terracotta) and the notification badge dots.
+            Image(systemName: "questionmark.bubble.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(adaptiveColor(
+                    light: NSColor(srgbRed: 88 / 255, green: 86 / 255, blue: 214 / 255, alpha: 1),
+                    dark: NSColor(srgbRed: 125 / 255, green: 122 / 255, blue: 255 / 255, alpha: 1)
+                ))
+                .frame(width: 12, height: 12)
+                .help("Waiting for you — an agent needs input")
         case .notificationBadge(let n):
             Circle()
                 .fill(RowStatusIndicator.badgeColor(for: n))

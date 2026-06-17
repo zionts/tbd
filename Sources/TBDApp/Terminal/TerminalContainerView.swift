@@ -162,6 +162,9 @@ struct SingleWorktreeView: View {
                             selectLastTab()
                         }
                     },
+                    onAddThread: {
+                        activeTabIndex = appState.openThreadTab(worktreeID: worktreeID)
+                    },
                     onCloseTab: { index in
                         closeTab(at: index)
                     },

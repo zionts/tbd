@@ -5,6 +5,7 @@ import TBDShared
 enum RowStatusIndicator: Equatable {
     case pending
     case working
+    case waitingForUser
     case notificationBadge(NotificationType)
     case suspended
     case prStatus
@@ -23,11 +24,17 @@ enum RowStatusIndicator: Equatable {
     /// additional stacked icon in `WorktreeRowView`.
     ///
     /// Priority (highest first): pending > high-severity badge (error,
-    /// attentionNeeded, focusRequest) > working > low-severity badge
-    /// (taskComplete, responseComplete) > suspended > PR status.
+    /// attentionNeeded, focusRequest) > waiting-for-user > working >
+    /// low-severity badge (taskComplete, responseComplete) > suspended >
+    /// PR status.
+    ///
+    /// `isWaitingForUser` (a blocked agent that needs a human reply) outranks
+    /// `isWorking` so a team that needs a barge-in isn't masked by the working
+    /// asterisk; it yields only to pending and high-severity notifications.
     static func resolve(
         isPending: Bool,
         isWorking: Bool,
+        isWaitingForUser: Bool = false,
         notification: NotificationType?,
         isSuspended: Bool,
         hasPRStatus: Bool
@@ -36,6 +43,8 @@ enum RowStatusIndicator: Equatable {
             return .pending
         } else if let notification, notification.severity >= highSeverityThreshold {
             return .notificationBadge(notification)
+        } else if isWaitingForUser {
+            return .waitingForUser
         } else if isWorking {
             return .working
         } else if let notification {

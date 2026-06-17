@@ -589,6 +589,34 @@ actor DaemonClient {
         )
     }
 
+    // MARK: - Channel (orchestration spine Phase C)
+
+    /// Post a message to the sender's team coordination channel. The daemon
+    /// resolves `senderWorktreeID` to its team root and returns the persisted
+    /// `ChannelMessage` (the same message is also broadcast as a delta).
+    func channelPost(
+        senderWorktreeID: UUID, type: ChannelMessageType = .note, body: String
+    ) async throws -> ChannelMessage {
+        return try await callAsync(
+            method: RPCMethod.channelPost,
+            params: ChannelPostParams(senderWorktreeID: senderWorktreeID, type: type, body: body),
+            resultType: ChannelMessage.self
+        )
+    }
+
+    /// Tail a team channel. `worktreeID` is any team member; the daemon resolves
+    /// it to the team root. Returns the resolved `teamID` plus chronological
+    /// messages (optionally only those after `sinceID`, capped by `limit`).
+    func channelTail(
+        worktreeID: UUID, sinceID: String? = nil, limit: Int? = nil
+    ) async throws -> ChannelTailResult {
+        return try await callAsync(
+            method: RPCMethod.channelTail,
+            params: ChannelTailParams(worktreeID: worktreeID, sinceID: sinceID, limit: limit),
+            resultType: ChannelTailResult.self
+        )
+    }
+
     /// Get daemon status.
     func daemonStatus() async throws -> DaemonStatusResult {
         return try await callNoParamsAsync(method: RPCMethod.daemonStatus, resultType: DaemonStatusResult.self)

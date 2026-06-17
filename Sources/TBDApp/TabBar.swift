@@ -91,6 +91,7 @@ struct TabBar: View {
     var onAddClaudeProfile: (UUID) -> Void = { _ in }
     var onAddCodex: () -> Void = {}
     var onAddNote: () -> Void = {}
+    var onAddThread: () -> Void = {}
     var onCloseTab: (Int) -> Void
     var terminalForTab: (UUID) -> Terminal? = { _ in nil }
     var onSuspendTab: (UUID) -> Void = { _ in }
@@ -134,7 +135,8 @@ struct TabBar: View {
                 onAddClaude: onAddClaude,
                 onAddClaudeProfile: onAddClaudeProfile,
                 onAddCodex: onAddCodex,
-                onAddNote: onAddNote
+                onAddNote: onAddNote,
+                onAddThread: onAddThread
             )
             Spacer()
 
@@ -169,6 +171,7 @@ private struct AddTabButton: View {
     let onAddClaudeProfile: (UUID) -> Void
     let onAddCodex: () -> Void
     let onAddNote: () -> Void
+    let onAddThread: () -> Void
     @State private var isHovering = false
     @State private var availability = AgentExecutableAvailability.detect()
 
@@ -198,7 +201,8 @@ private struct AddTabButton: View {
             onClaude: onAddClaude,
             onClaudeProfile: onAddClaudeProfile,
             onCodex: onAddCodex,
-            onNote: onAddNote
+            onNote: onAddNote,
+            onThread: onAddThread
         )
         let menu = AddTabMenu.build(
             profiles: profiles,
@@ -274,25 +278,29 @@ final class MenuCoordinator: NSObject {
     let onClaudeProfile: (UUID) -> Void
     let onCodex: () -> Void
     let onNote: () -> Void
+    let onThread: () -> Void
 
     init(
         onShell: @escaping () -> Void,
         onClaude: @escaping () -> Void,
         onClaudeProfile: @escaping (UUID) -> Void,
         onCodex: @escaping () -> Void,
-        onNote: @escaping () -> Void
+        onNote: @escaping () -> Void,
+        onThread: @escaping () -> Void
     ) {
         self.onShell = onShell
         self.onClaude = onClaude
         self.onClaudeProfile = onClaudeProfile
         self.onCodex = onCodex
         self.onNote = onNote
+        self.onThread = onThread
     }
 
     @objc func addShell() { onShell() }
     @objc func addClaude() { onClaude() }
     @objc func addCodex() { onCodex() }
     @objc func addNote() { onNote() }
+    @objc func addThread() { onThread() }
 
     /// Profile menu items carry their `ModelProfile.id` in `representedObject`.
     /// A nil representedObject (should not happen for profile items) is a no-op.
@@ -372,6 +380,15 @@ enum AddTabMenu {
         noteItem.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: nil)
         noteItem.target = coordinator
         menu.addItem(noteItem)
+
+        let threadItem = NSMenuItem(
+            title: "Thread", action: #selector(MenuCoordinator.addThread), keyEquivalent: ""
+        )
+        threadItem.image = NSImage(
+            systemSymbolName: "bubble.left.and.bubble.right", accessibilityDescription: nil
+        )
+        threadItem.target = coordinator
+        menu.addItem(threadItem)
 
         return menu
     }
@@ -758,6 +775,10 @@ private struct TabBarItem: View {
             Image(systemName: "text.bubble")
                 .font(.system(size: 10))
                 .foregroundStyle(style)
+        case .thread:
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.system(size: 10))
+                .foregroundStyle(style)
         }
     }
 
@@ -786,6 +807,8 @@ private struct TabBarItem: View {
             return "Note \(index + 1)"
         case .liveTranscript:
             return "Transcript"
+        case .thread:
+            return "Team Thread"
         }
     }
 }
