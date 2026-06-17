@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import SwiftUI
+import TBDShared
 import WebKit
 import os
 
@@ -495,7 +496,12 @@ struct BlitWebTerminalView: NSViewRepresentable {
         snapshot: String?,
         isSuspended: Bool
     ) -> String {
-        let wsURL = "ws://127.0.0.1:\(port)"
+        // The gateway routes by URL path: `/d/<name>` selects the destination
+        // the daemon registered in the gateway's `blit.remotes` file. Connecting
+        // to the bare root `/` yields `error:no destination specified` and the
+        // client loops forever (verified against blit 0.35.0). See
+        // `TBDConstants.blitGatewayDestinationName` / `BlitManager.ensureGateway`.
+        let wsURL = "ws://127.0.0.1:\(port)/d/\(TBDConstants.blitGatewayDestinationName)"
         let wsJSON = jsonString(wsURL)
         let passJSON = jsonString(passphrase)
         let snapshotJSON = snapshot.map(jsonString) ?? "null"

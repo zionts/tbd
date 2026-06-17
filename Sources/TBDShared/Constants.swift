@@ -3,6 +3,18 @@ import Foundation
 public enum TBDConstants {
     public static let version = "0.1.0"
 
+    /// The single destination name a TBD worktree's `blit gateway` exposes.
+    ///
+    /// Shared contract between the daemon (which writes a `blit.remotes` file
+    /// mapping this name to the server socket and passes it via `BLIT_REMOTES`)
+    /// and the app (which connects the WebView to
+    /// `ws://127.0.0.1:<port>/d/<name>`). The gateway selects its upstream by
+    /// URL path; without `/d/<name>` it answers the passphrase then sends the
+    /// text frame `error:no destination specified` and drops the connection
+    /// (verified against blit 0.35.0). Each gateway fronts exactly one socket,
+    /// so a fixed name suffices.
+    public static let blitGatewayDestinationName = "tbd"
+
     /// Base config directory resolved from the given environment dictionary.
     /// Honors `TBD_HOME`; falls back to `~/tbd` when the key is absent or empty.
     public static func configDir(environment: [String: String]) -> URL {

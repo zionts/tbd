@@ -1,4 +1,5 @@
 import Foundation
+import TBDShared
 import Testing
 @testable import TBDDaemonLib
 
@@ -297,4 +298,30 @@ import Testing
     let calls = recorder.snapshot()
     #expect(calls.count == 1)
     #expect(calls[0] == ["gateway"])
+}
+
+// MARK: - gateway destination / remotes file
+
+// The destination name is the shared contract with the app's `/d/<name>` URL.
+@Test func blitGatewayDestinationMatchesSharedConstant() {
+    #expect(BlitManager.gatewayDestinationName == TBDConstants.blitGatewayDestinationName)
+    #expect(!BlitManager.gatewayDestinationName.isEmpty)
+}
+
+// The remotes file is co-located with the socket: `<name>.sock` → `<name>.remotes`.
+@Test func blitRemotesFilePathDerivesFromSocket() {
+    #expect(BlitManager.remotesFilePath(forSocket: "/tmp/run/tbd-abcd1234.sock")
+        == "/tmp/run/tbd-abcd1234.remotes")
+    // Falls back to appending when the socket lacks the .sock suffix.
+    #expect(BlitManager.remotesFilePath(forSocket: "/tmp/run/weird")
+        == "/tmp/run/weird.remotes")
+}
+
+// The remotes file maps the destination name to the server's unix socket so the
+// gateway can serve `/d/<name>`. Without this line the gateway answers the
+// passphrase then closes with `error:no destination specified`.
+@Test func blitRemotesFileContentsMapsDestinationToSocket() {
+    let socket = "/tmp/run/tbd-abcd1234.sock"
+    let contents = BlitManager.remotesFileContents(socket: socket)
+    #expect(contents == "\(BlitManager.gatewayDestinationName) = socket:\(socket)\n")
 }

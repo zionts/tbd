@@ -179,9 +179,41 @@ public struct BlitManager: Sendable {
     }
 
     /// `blit gateway` — env-only configuration (BLIT_ADDR / BLIT_PASSPHRASE /
-    /// BLIT_SOCK), so there are no flags.
+    /// BLIT_REMOTES), so there are no flags.
     public static func gatewayStartCommand() -> [String] {
         ["gateway"]
+    }
+
+    /// The single destination name the gateway exposes for a TBD worktree.
+    ///
+    /// blit's gateway does NOT connect to the server via `BLIT_SOCK`. It routes
+    /// browser WebSocket connections to *destinations* read from a `blit.remotes`
+    /// file (`BLIT_REMOTES`), selected by URL path: `/d/<name>` picks the named
+    /// destination. The root path `/` does NOT reliably fall back to a default
+    /// (verified against blit 0.35.0: root → `error:no destination specified`),
+    /// so the web client MUST connect to `/d/<name>`. Each gateway only ever
+    /// fronts one server socket, so a fixed name is sufficient. Shared with the
+    /// app (which builds the `/d/<name>` URL) via
+    /// `TBDConstants.blitGatewayDestinationName`.
+    public static let gatewayDestinationName = TBDConstants.blitGatewayDestinationName
+
+    /// Path of the `blit.remotes` file generated for the gateway fronting
+    /// `socket`. Derived directly from the socket path (`<name>.sock` →
+    /// `<name>.remotes`) so it's co-located with the socket and unique per
+    /// server, without needing the repo path.
+    public static func remotesFilePath(forSocket socket: String) -> String {
+        if socket.hasSuffix(".sock") {
+            return String(socket.dropLast(".sock".count)) + ".remotes"
+        }
+        return socket + ".remotes"
+    }
+
+    /// Contents of the `blit.remotes` file: a single `name = uri` line mapping
+    /// the gateway's destination to the server's unix socket. blit's gateway
+    /// reads this (via `BLIT_REMOTES`) and serves the destination at
+    /// `/d/<name>`. The `socket:` URI scheme points at a local unix socket.
+    public static func remotesFileContents(socket: String) -> String {
+        "\(gatewayDestinationName) = socket:\(socket)\n"
     }
 
     /// `blit terminal start [--rows N --cols N] -t <tag> -- /bin/zsh -lic '<wrapper>'`.
@@ -323,13 +355,26 @@ public struct BlitManager: Sendable {
         _ = try await runBlit(args, socket: socket)
     }
 
-    /// Allocates a free loopback TCP port, generates a random passphrase, and
-    /// spawns `blit gateway` (env `BLIT_ADDR`, `BLIT_PASSPHRASE`, `BLIT_SOCK`,
-    /// `BLIT_PROXY=0`) detached, targeting the server on `socket`.
+    /// Allocates a free loopback TCP port, generates a random passphrase, writes
+    /// a `blit.remotes` file pointing the gateway's destination at the server
+    /// `socket`, and spawns `blit gateway` (env `BLIT_ADDR`, `BLIT_PASSPHRASE`,
+    /// `BLIT_REMOTES`, `BLIT_PROXY=0`) detached.
     ///
-    /// Nothing calls this in Phase 2 — the app needs it in a later phase to
-    /// connect a WKWebView client to the gateway.
-    /// - Returns: the allocated port and the generated passphrase.
+    /// ## Why a remotes file (not `BLIT_SOCK`)
+    /// blit's gateway does NOT learn its upstream from `BLIT_SOCK`. It routes
+    /// browser WebSocket connections to *destinations* defined in a
+    /// `blit.remotes` file (`BLIT_REMOTES`), selected by URL path. A client at
+    /// `/d/<name>` reaches the destination named `<name>`. Without a destination,
+    /// the gateway answers the passphrase, then sends the text frame
+    /// `error:no destination specified` and the connection drops — the exact
+    /// handshake failure this fixes (verified against blit 0.35.0). The web
+    /// client therefore connects to `ws://127.0.0.1:<port>/d/<destinationName>`.
+    ///
+    /// The passphrase is returned as PLAINTEXT — `BLIT_PASSPHRASE` accepts a
+    /// plaintext value and the browser sends the same plaintext, which the
+    /// gateway accepts (verified). `blit hash-passphrase` (argon2id PHC) is an
+    /// optional hardening, not required for the handshake.
+    /// - Returns: the allocated port and the generated (plaintext) passphrase.
     @discardableResult
     public func ensureGateway(socket: String) async throws -> (port: Int, passphrase: String) {
         let port = try Self.allocateFreeLoopbackPort()
@@ -339,11 +384,19 @@ public struct BlitManager: Sendable {
             dryRunRecorder?(args)
             return (port: port, passphrase: passphrase)
         }
-        logger.info("ensureGateway: starting blit gateway on 127.0.0.1:\(port, privacy: .public) for socket \(socket, privacy: .public)")
+        // Write the remotes file (0600 — same sensitivity as a socket path) so
+        // the gateway can route `/d/<name>` to the server socket.
+        let remotesPath = Self.remotesFilePath(forSocket: socket)
+        let runDir = (remotesPath as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: runDir, withIntermediateDirectories: true)
+        try Self.remotesFileContents(socket: socket).write(toFile: remotesPath, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: remotesPath)
+
+        logger.info("ensureGateway: starting blit gateway on 127.0.0.1:\(port, privacy: .public) for socket \(socket, privacy: .public) (destination \(Self.gatewayDestinationName, privacy: .public), remotes \(remotesPath, privacy: .public))")
         try spawnDetached(args, extraEnv: [
             "BLIT_ADDR": "127.0.0.1:\(port)",
             "BLIT_PASSPHRASE": passphrase,
-            "BLIT_SOCK": socket,
+            "BLIT_REMOTES": remotesPath,
             "BLIT_PROXY": "0",
         ])
         return (port: port, passphrase: passphrase)
