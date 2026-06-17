@@ -56,6 +56,13 @@ extension AppState {
         guard let arr = tabs[worktreeID], arr.indices.contains(tabIndex) else { return }
         // Activating a tab clears its unread-completion bold.
         unreadTerminals.subtract(terminalIDs(in: arr[tabIndex]))
+        // Move keyboard focus to the newly-selected tab's terminal. Without
+        // this, switching tabs (and `selectLastTab()` after creating a tab)
+        // updated the index but never claimed first responder, so the new
+        // foreground terminal opened unfocused / un-typeable. Terminals that
+        // are still mounting (just-created) are additionally covered by the
+        // proactive claim in BlitWebTerminalView.makeNSView.
+        focusTerminalAfterSelectionChange(worktreeID: worktreeID)
         let tabID = arr[tabIndex].id
         Task {
             do {

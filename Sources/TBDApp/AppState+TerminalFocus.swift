@@ -1,5 +1,8 @@
 import AppKit
 import Foundation
+import os
+
+private let focusLog = Logger(subsystem: "com.tbd.app", category: "terminal.focus")
 
 /// Weak handle to a terminal's backing NSView for first-responder routing.
 ///
@@ -72,17 +75,32 @@ extension AppState {
     }
 
     func focusTerminalAfterSelectionChange(worktreeID: UUID) {
-        guard let terminalID = terminalIDForAutofocus(worktreeID: worktreeID) else { return }
+        guard let terminalID = terminalIDForAutofocus(worktreeID: worktreeID) else {
+            focusLog.info("focusTerminalAfterSelectionChange: no autofocus target for worktree \(worktreeID.uuidString.prefix(8), privacy: .public)")
+            return
+        }
 
         DispatchQueue.main.async { [weak self] in
             guard let self,
                   let terminalView = self.terminalFocusTargets[terminalID]?.view,
                   terminalView.window != nil
             else {
+                // The target terminal's view may not be mounted yet (e.g. a
+                // just-created tab). BlitWebTerminalView.makeNSView proactively
+                // claims focus on appear, so this miss is benign.
+                focusLog.info("focusTerminalAfterSelectionChange: target \(terminalID.uuidString.prefix(8), privacy: .public) not mounted yet")
                 return
             }
 
-            terminalView.window?.makeFirstResponder(terminalView)
+            // Prefer the blit web view's claimFocus so BOTH AppKit first
+            // responder AND blit's hidden-textarea DOM focus are set. Fall back
+            // to a plain makeFirstResponder for any non-blit terminal view.
+            if let blit = terminalView as? TBDTerminalWebView {
+                blit.claimFocus(reason: "selectionChange")
+            } else {
+                focusLog.info("focusTerminalAfterSelectionChange -> makeFirstResponder \(terminalID.uuidString.prefix(8), privacy: .public)")
+                terminalView.window?.makeFirstResponder(terminalView)
+            }
             self.focusedTabCloseContext = self.terminalTabCloseContexts[terminalID]
         }
     }

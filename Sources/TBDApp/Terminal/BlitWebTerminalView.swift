@@ -7,6 +7,15 @@ import os
 
 private let logger = Logger(subsystem: "com.tbd.app", category: "BlitWebTerminal")
 
+/// Focus-path logger. Deliberately `.info` (not `.debug`) so the focus
+/// decision sequence is visible in `log show` WITHOUT a `sudo log config`
+/// step — `.debug` rows are not persisted by default on macOS, which made
+/// the first focus fix impossible to diagnose from logs in the live app.
+/// Read with:
+///   log show --last 5m --predicate 'subsystem == "com.tbd.app" AND category == "terminal.focus"'
+/// (live: `log stream --predicate '…'`).
+private let focusLog = Logger(subsystem: "com.tbd.app", category: "terminal.focus")
+
 // MARK: - Theme bridge
 
 /// The JSON-serializable theme dict the blit web client reads from
@@ -186,11 +195,15 @@ final class TBDTerminalWebView: WKWebView {
     var allowsFocus: Bool = true
     var onBecomeFirstResponder: (() -> Void)?
     var onCloseTab: (() -> Void)?
+    /// Human-legible terminal identity ("<uuid> blit#<n>") stamped into every
+    /// focus log line so the focus sequence is readable across views.
+    var focusLabel: String = "?"
 
     override var acceptsFirstResponder: Bool { allowsFocus }
 
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
+        focusLog.info("becomeFirstResponder ok=\(ok, privacy: .public) allowsFocus=\(self.allowsFocus, privacy: .public) [\(self.focusLabel, privacy: .public)]")
         if ok {
             onBecomeFirstResponder?()
             // Push DOM focus onto blit's hidden input textarea. AppKit
@@ -200,6 +213,12 @@ final class TBDTerminalWebView: WKWebView {
             // textarea is the focused DOM element. (See focus path note below.)
             focusWebContent()
         }
+        return ok
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        focusLog.info("resignFirstResponder ok=\(ok, privacy: .public) [\(self.focusLabel, privacy: .public)]")
         return ok
     }
 
@@ -213,7 +232,10 @@ final class TBDTerminalWebView: WKWebView {
     /// (before blit's listeners are guaranteed wired) and on non-canvas hits.
     override func mouseDown(with event: NSEvent) {
         if allowsFocus, window?.firstResponder !== self, !isDescendantFirstResponder() {
+            focusLog.info("mouseDown -> promoting to first responder [\(self.focusLabel, privacy: .public)]")
             window?.makeFirstResponder(self)
+        } else {
+            focusLog.info("mouseDown (already focused or suppressed, allowsFocus=\(self.allowsFocus, privacy: .public)) [\(self.focusLabel, privacy: .public)]")
         }
         super.mouseDown(with: event)
         if allowsFocus { focusWebContent() }
@@ -222,10 +244,41 @@ final class TBDTerminalWebView: WKWebView {
     /// Ask the web client to focus its terminal input element. No-op until the
     /// bridge is installed (the React app calls `installBridge` on mount).
     func focusWebContent() {
+        focusLog.info("JS __TBD_BRIDGE__.focus() [\(self.focusLabel, privacy: .public)]")
         evaluateJavaScript(
             "window.__TBD_BRIDGE__ && window.__TBD_BRIDGE__.focus && window.__TBD_BRIDGE__.focus();",
             completionHandler: nil
         )
+    }
+
+    /// Proactively make this terminal the window's first responder and push DOM
+    /// focus onto blit's input. Called whenever this terminal *becomes* the
+    /// foreground/active terminal (first appear, tab selected, new tab created).
+    /// Unlike the old "only if nothing already owns focus" auto-promotion, this
+    /// always claims focus so a freshly-shown tab is immediately typeable even
+    /// when a now-background sibling still holds first responder. The caller is
+    /// responsible for only invoking this on the genuinely-foreground terminal.
+    func claimFocus(reason: String) {
+        guard allowsFocus else {
+            focusLog.info("claimFocus SKIPPED (allowsFocus=false) reason=\(reason, privacy: .public) [\(self.focusLabel, privacy: .public)]")
+            return
+        }
+        guard let window else {
+            focusLog.info("claimFocus SKIPPED (no window) reason=\(reason, privacy: .public) [\(self.focusLabel, privacy: .public)]")
+            return
+        }
+        let current = window.firstResponder as? NSView
+        let alreadyFocused = current === self || (current?.isDescendant(of: self) ?? false)
+        if alreadyFocused {
+            focusLog.info("claimFocus (already first responder) reason=\(reason, privacy: .public) [\(self.focusLabel, privacy: .public)] -> refocusing web content")
+            focusWebContent()
+            return
+        }
+        focusLog.info("claimFocus -> makeFirstResponder reason=\(reason, privacy: .public) [\(self.focusLabel, privacy: .public)]")
+        window.makeFirstResponder(self)
+        // becomeFirstResponder pushes web focus, but call it unconditionally in
+        // case AppKit declines promotion (e.g. nested key view already owns it).
+        focusWebContent()
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -354,6 +407,7 @@ struct BlitWebTerminalView: NSViewRepresentable {
         // free of a white flash by matching the theme bg.
         webView.setValue(false, forKey: "drawsBackground")
         webView.allowsFocus = !isSuspended
+        webView.focusLabel = "\(terminalID.uuidString.prefix(8)) blit#\(blitTerminalID)"
         webView.onCloseTab = { [weak coordinator] in
             coordinator?.handleCloseTab()
         }
@@ -369,16 +423,25 @@ struct BlitWebTerminalView: NSViewRepresentable {
 
         // Robust default: a freshly-shown, non-suspended foreground terminal
         // should be interactive without the user having to click first. Once the
-        // view is in a window, grab first responder (if nothing else in this
-        // window already owns it) and focus the web input. This runs after the
-        // current runloop turn so the view is attached to its window.
+        // view is in a window, PROACTIVELY claim first responder + web focus.
+        //
+        // This intentionally claims focus even when a sibling already owns it:
+        // when a new tab is created/selected, the now-background terminal can
+        // still be the window's first responder, and the old "only if nothing
+        // already owns focus" guard made the new tab SKIP promotion — so neither
+        // claimed it and the new tab opened unfocused (the live defocus bug).
+        // A genuinely background panel never reaches here: it's `isSuspended`,
+        // or `allowsFocus` is false, or SwiftUI doesn't mount its makeNSView
+        // while another tab is foreground.
         if !isSuspended {
             DispatchQueue.main.async { [weak webView] in
-                guard let webView, webView.allowsFocus, let window = webView.window else { return }
-                let current = window.firstResponder as? NSView
-                let alreadyFocused = current === webView || (current?.isDescendant(of: webView) ?? false)
-                if !alreadyFocused {
-                    window.makeFirstResponder(webView)
+                guard let webView else { return }
+                if webView.allowsFocus, webView.window != nil {
+                    webView.claimFocus(reason: "makeNSView/appear")
+                } else {
+                    focusLog.info(
+                        "makeNSView auto-promote SKIPPED allowsFocus=\(webView.allowsFocus, privacy: .public) hasWindow=\(webView.window != nil, privacy: .public) [\(webView.focusLabel, privacy: .public)]"
+                    )
                 }
             }
         }
@@ -416,19 +479,48 @@ struct BlitWebTerminalView: NSViewRepresentable {
         // file preview) covering the terminal must receive events itself.
         let suppressed = shouldSuppressEvents()
         let active = !isSuspended && !suppressed
+        let holdsFocus = (webView.window?.firstResponder as? NSView)
+            .map { $0 === webView || $0.isDescendant(of: webView) } ?? false
         if webView.allowsFocus != active {
+            focusLog.info(
+                "updateNSView allowsFocus \(webView.allowsFocus, privacy: .public)->\(active, privacy: .public) (isSuspended=\(self.isSuspended, privacy: .public) suppressed=\(suppressed, privacy: .public) holdsFocus=\(holdsFocus, privacy: .public)) [\(webView.focusLabel, privacy: .public)]"
+            )
             webView.allowsFocus = active
-            // If we just lost the right to focus while holding it, hand first
-            // responder back so the covering overlay / sibling can take it.
-            if !active, let window = webView.window,
-               (window.firstResponder as? NSView)?.isDescendant(of: webView) == true {
+            // If we just lost the right to focus WHILE HOLDING it (an overlay
+            // appeared over us, or we were suspended), hand first responder
+            // back so the covering overlay / sibling can take it.
+            //
+            // Crucially this only blanks the window when THIS view holds focus.
+            // We must never blank focus out from under the foreground terminal:
+            // doing so was a contributor to the defocus bug (a background
+            // terminal's updateNSView nil-ing the window's first responder).
+            // The `holdsFocus` guard ensures only the view that is actually
+            // focused relinquishes it.
+            if !active, holdsFocus, let window = webView.window {
+                focusLog.info("updateNSView -> makeFirstResponder(nil) (lost focus rights while holding) [\(webView.focusLabel, privacy: .public)]")
                 window.makeFirstResponder(nil)
             }
         }
         if coordinator.lastActive != active {
+            focusLog.info(
+                "updateNSView active \(coordinator.lastActive.map { "\($0)" } ?? "nil", privacy: .public)->\(active, privacy: .public) (isSuspended=\(self.isSuspended, privacy: .public) suppressed=\(suppressed, privacy: .public)) [\(webView.focusLabel, privacy: .public)]"
+            )
+            let becameActive = (coordinator.lastActive != true) && active
             coordinator.lastActive = active
             let activeJS = "window.__TBD_BRIDGE__ && window.__TBD_BRIDGE__.setActive(\(active ? "true" : "false"));"
             webView.evaluateJavaScript(activeJS, completionHandler: nil)
+            // When a terminal transitions INTO the active/foreground state (its
+            // covering overlay closed, it was un-suspended, or it is the newly
+            // selected tab being re-rendered active) proactively claim focus so
+            // the visible foreground terminal is always typeable. Deferred to
+            // the next runloop turn so it runs after SwiftUI finishes attaching
+            // the view to its window.
+            if becameActive {
+                DispatchQueue.main.async { [weak webView] in
+                    guard let webView, webView.allowsFocus, webView.window != nil else { return }
+                    webView.claimFocus(reason: "updateNSView/becameActive")
+                }
+            }
         }
     }
 
