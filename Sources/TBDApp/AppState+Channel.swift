@@ -27,6 +27,9 @@ extension AppState {
             label: nil
         )
         tabs[worktreeID, default: []].append(tab)
+        // Persist the thread tab's identity so it can be rehydrated after restart
+        // (thread tabs are not daemon-backed). See `reconcileThreadTabs`.
+        threadTabPaneIDs[worktreeID, default: []].append(paneID)
         return (tabs[worktreeID]?.count ?? 1) - 1
     }
 
@@ -69,19 +72,27 @@ extension AppState {
     /// resulting message also returns via the `.channelMessage` delta, so the
     /// dedup in `insertChannelMessages` keeps the optimistic insert from
     /// double-appending.
+    ///
+    /// Returns `true` on success, `false` if the post failed (empty body, or the
+    /// daemon RPC threw). The caller relies on this to decide whether to clear or
+    /// restore the composer draft — a swallowed failure would silently discard the
+    /// user's typed text.
+    @discardableResult
     func postChannelMessage(
         senderWorktreeID: UUID, type: ChannelMessageType = .note, body: String
-    ) async {
+    ) async -> Bool {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return false }
         do {
             let message = try await daemonClient.channelPost(
                 senderWorktreeID: senderWorktreeID, type: type, body: trimmed
             )
             insertChannelMessages([message], teamID: message.teamID)
+            return true
         } catch {
             logger.error("Failed to post channel message: \(error, privacy: .public)")
             handleConnectionError(error)
+            return false
         }
     }
 

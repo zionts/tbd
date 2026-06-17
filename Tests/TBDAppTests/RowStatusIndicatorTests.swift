@@ -116,4 +116,56 @@ struct RowStatusIndicatorTests {
         )
         #expect(result == nil)
     }
+
+    // MARK: - waitingForUser priority
+
+    @Test func waitingForUserOutranksWorking() {
+        let result = RowStatusIndicator.resolve(
+            isPending: false,
+            isWorking: true,
+            isWaitingForUser: true,
+            notification: nil,
+            isSuspended: false,
+            hasPRStatus: false
+        )
+        #expect(result == .waitingForUser)
+    }
+
+    @Test func pendingWinsOverWaitingForUser() {
+        let result = RowStatusIndicator.resolve(
+            isPending: true,
+            isWorking: false,
+            isWaitingForUser: true,
+            notification: nil,
+            isSuspended: false,
+            hasPRStatus: false
+        )
+        #expect(result == .pending)
+    }
+
+    @Test(arguments: [NotificationType.error, .attentionNeeded, .focusRequest])
+    func highSeverityBadgeWinsOverWaitingForUser(notification: NotificationType) {
+        let result = RowStatusIndicator.resolve(
+            isPending: false,
+            isWorking: false,
+            isWaitingForUser: true,
+            notification: notification,
+            isSuspended: false,
+            hasPRStatus: false
+        )
+        #expect(result == .notificationBadge(notification))
+    }
+
+    @Test(arguments: [NotificationType.taskComplete, .responseComplete])
+    func waitingForUserWinsOverLowSeverityBadge(notification: NotificationType) {
+        let result = RowStatusIndicator.resolve(
+            isPending: false,
+            isWorking: false,
+            isWaitingForUser: true,
+            notification: notification,
+            isSuspended: true,
+            hasPRStatus: true
+        )
+        #expect(result == .waitingForUser)
+    }
 }

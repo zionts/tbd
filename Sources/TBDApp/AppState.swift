@@ -243,19 +243,6 @@ final class AppState: ObservableObject {
         return ids
     }
 
-    /// Worktrees with at least one terminal whose agent is blocked waiting on the
-    /// human (`activityState == .waitingForUser`). Surfaced as a sidebar
-    /// indicator so the user can see which teams need a barge-in. Orchestration
-    /// spine Phase C. Mirrors `workingWorktreeIDs`.
-    var waitingForUserWorktreeIDs: Set<UUID> {
-        var ids = Set<UUID>()
-        for (worktreeID, terminalList) in terminals
-        where terminalList.contains(where: { $0.activityState == .waitingForUser }) {
-            ids.insert(worktreeID)
-        }
-        return ids
-    }
-
     /// Worktrees that must never be evicted from the keep-alive mount set:
     /// open (selected) plus actively working. Consumed by `keepAliveWorktreeIDs`.
     ///
@@ -339,6 +326,15 @@ final class AppState: ObservableObject {
     @Published var tabs: [UUID: [Tab]] = [:]
     @Published var activeTabIndices: [UUID: Int] = [:]
     @Published var worktreeTabOrders: [UUID: [UUID]] = [:]
+    /// Pane ids of standalone `.thread` tabs the user has opened, keyed by
+    /// worktree. Thread tabs are not daemon-backed (the daemon's `TabState` only
+    /// persists label overrides, and the channel itself is daemon-owned), so we
+    /// persist just their identity locally — like `layouts` — and rebuild them on
+    /// launch via `reconcileThreadTabs`. Without this a thread tab would vanish on
+    /// restart while leaving its id dangling in the persisted tab order.
+    @Published var threadTabPaneIDs: [UUID: [UUID]] = [:] {
+        didSet { persistThreadTabs() }
+    }
     @Published var draggingTabID: UUID? = nil
     @Published var repoFilter: UUID? = nil
     @Published var pendingWorktreeIDs: Set<UUID> = []
@@ -529,6 +525,7 @@ final class AppState: ObservableObject {
     private static let layoutsKey = "com.tbd.app.layouts"
     private static let dockRatioKey = "com.tbd.app.dockRatio"
     private static let selectionOrderKey = "com.tbd.app.selectionOrder"
+    private static let threadTabsKey = "com.tbd.app.threadTabs"
 
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var focusObservers: [NSObjectProtocol] = []
@@ -541,6 +538,7 @@ final class AppState: ObservableObject {
     init(userDefaults: UserDefaults = .standard) {
         self.userDefaults = userDefaults
         restoreLayouts()
+        restoreThreadTabs()
         if let saved = userDefaults.object(forKey: Self.dockRatioKey) as? Double {
             dockRatio = max(0.1, min(0.6, CGFloat(saved)))
         }
@@ -716,6 +714,21 @@ final class AppState: ObservableObject {
         guard let data = userDefaults.data(forKey: Self.layoutsKey),
               let restored = try? JSONDecoder().decode([UUID: LayoutNode].self, from: data) else { return }
         layouts = restored
+    }
+
+    // MARK: - Thread Tab Persistence
+
+    private func persistThreadTabs() {
+        guard let data = try? JSONEncoder().encode(threadTabPaneIDs) else { return }
+        userDefaults.set(data, forKey: Self.threadTabsKey)
+    }
+
+    private func restoreThreadTabs() {
+        guard let data = userDefaults.data(forKey: Self.threadTabsKey),
+              let restored = try? JSONDecoder().decode([UUID: [UUID]].self, from: data) else { return }
+        // Assign the backing store directly to avoid re-persisting an identical
+        // value through the didSet during init.
+        threadTabPaneIDs = restored
     }
 
     // MARK: - Selection Persistence
@@ -1237,6 +1250,14 @@ final class AppState: ObservableObject {
                     reconcileNoteTabs(worktreeID: wtID, notes: fetched)
                 }
             }
+
+            // Rebuild locally-persisted thread tabs (not daemon-backed). Run for
+            // every visible worktree so a thread tab opened last session reappears
+            // even when its worktree has no terminals/notes to trigger the loops
+            // above.
+            for wtID in visibleWorktreeIDs {
+                reconcileThreadTabs(worktreeID: wtID)
+            }
         } catch {
             logger.error("Failed to list worktrees: \(error)")
             handleConnectionError(error)
@@ -1347,6 +1368,33 @@ final class AppState: ObservableObject {
             currentTabs.append(Tab(id: note.id, content: .note(noteID: note.id), label: nil))
         }
 
+        tabs[worktreeID] = currentTabs
+        applyStoredOrder(worktreeID: worktreeID)
+    }
+
+    /// Rehydrate standalone `.thread` tabs from the locally-persisted
+    /// `threadTabPaneIDs`. Mirrors `reconcileNoteTabs`, but the source of truth is
+    /// local (UserDefaults) rather than a daemon list, because thread tabs are not
+    /// daemon-backed. Idempotent: only appends tabs that aren't already present, so
+    /// it is safe to call on every worktree refresh. `applyStoredOrder` then slots
+    /// the rebuilt tab back into its persisted position.
+    func reconcileThreadTabs(worktreeID: UUID) {
+        guard let paneIDs = threadTabPaneIDs[worktreeID], !paneIDs.isEmpty else { return }
+        var currentTabs = tabs[worktreeID] ?? []
+        let presentThreadIDs = Set(currentTabs.compactMap { tab -> UUID? in
+            if case .thread(let id, _) = tab.content { return id }
+            return nil
+        })
+        var changed = false
+        for paneID in paneIDs where !presentThreadIDs.contains(paneID) {
+            currentTabs.append(Tab(
+                id: paneID,
+                content: .thread(id: paneID, worktreeID: worktreeID),
+                label: nil
+            ))
+            changed = true
+        }
+        guard changed else { return }
         tabs[worktreeID] = currentTabs
         applyStoredOrder(worktreeID: worktreeID)
     }

@@ -15,7 +15,8 @@ private func makeProfile(name: String) -> ModelProfileWithUsage {
 }
 
 private func makeCoordinator(
-    onClaudeProfile: @escaping (UUID) -> Void = { _ in }
+    onClaudeProfile: @escaping (UUID) -> Void = { _ in },
+    onThread: @escaping () -> Void = {}
 ) -> MenuCoordinator {
     MenuCoordinator(
         onShell: {},
@@ -23,7 +24,7 @@ private func makeCoordinator(
         onClaudeProfile: onClaudeProfile,
         onCodex: {},
         onNote: {},
-        onThread: {}
+        onThread: onThread
     )
 }
 
@@ -147,6 +148,31 @@ private func makeExecutable(named name: String, in directory: URL) throws {
     #expect(item("Claude").action == #selector(MenuCoordinator.addClaude))
     #expect(item("Codex").action == #selector(MenuCoordinator.addCodex))
     #expect(item("Note").action == #selector(MenuCoordinator.addNote))
+
+    let thread = item("Thread")
+    #expect(thread.action == #selector(MenuCoordinator.addThread))
+    #expect(thread.target as? MenuCoordinator === coordinator)
+}
+
+@MainActor
+@Test func addTabMenu_includesThreadItem() {
+    let menu = AddTabMenu.build(profiles: [], coordinator: makeCoordinator())
+    #expect(menu.items.contains { $0.title == "Thread" })
+}
+
+@MainActor
+@Test func menuCoordinator_addThread_forwardsToCallback() {
+    var fired = false
+    // Hold a strong reference: NSMenuItem.target is weak.
+    let coordinator = makeCoordinator(onThread: { fired = true })
+    let menu = AddTabMenu.build(profiles: [], coordinator: coordinator)
+
+    let thread = menu.items.first { $0.title == "Thread" }!
+    #expect(thread.action == #selector(MenuCoordinator.addThread))
+    #expect(thread.target as? MenuCoordinator === coordinator)
+
+    coordinator.addThread()
+    #expect(fired)
 }
 
 @MainActor

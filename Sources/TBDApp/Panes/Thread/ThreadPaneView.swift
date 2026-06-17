@@ -19,6 +19,10 @@ struct ThreadPaneView: View {
     @State private var draft: String = ""
     @State private var selectedType: ChannelMessageType = .note
     @State private var isSending = false
+    /// Set when a post fails so the composer can surface an inline error and the
+    /// user can retry. Cleared on the next send attempt or successful post. The
+    /// typed text is restored to `draft` on failure, so nothing is lost.
+    @State private var sendFailed = false
     @FocusState private var composerFocused: Bool
 
     /// Messages for this pane's team. Until the backfill resolves the team root
@@ -104,60 +108,102 @@ struct ThreadPaneView: View {
     // MARK: - Composer (human barge-in)
 
     private var composer: some View {
-        HStack(spacing: 8) {
-            Menu {
-                ForEach(ThreadMessageType.allDisplayed, id: \.self) { type in
-                    Button {
-                        selectedType = type
-                    } label: {
-                        Label(type.displayLabel, systemImage: type == selectedType ? "checkmark" : "")
+        VStack(alignment: .leading, spacing: 4) {
+            if sendFailed {
+                // Inline failure affordance: the post failed and the typed text has
+                // been restored to the composer. Pressing send again retries.
+                HStack(spacing: 5) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red)
+                    Text("Couldn't send — your message is still here. Press send to retry.")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
+                .transition(.opacity)
+            }
+            HStack(spacing: 8) {
+                Menu {
+                    ForEach(ThreadMessageType.allDisplayed, id: \.self) { type in
+                        Button {
+                            selectedType = type
+                        } label: {
+                            Label(type.displayLabel, systemImage: type == selectedType ? "checkmark" : "")
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(ThreadMessageType.color(for: selectedType))
+                            .frame(width: 7, height: 7)
+                        Text(selectedType.displayLabel)
+                            .font(.caption)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 8))
+                            .foregroundStyle(.secondary)
                     }
                 }
-            } label: {
-                HStack(spacing: 3) {
-                    Circle()
-                        .fill(ThreadMessageType.color(for: selectedType))
-                        .frame(width: 7, height: 7)
-                    Text(selectedType.displayLabel)
-                        .font(.caption)
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.secondary)
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(isSending)
+                .help("Message type")
+
+                TextField("Message the team…", text: $draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...4)
+                    .focused($composerFocused)
+                    .onSubmit(send)
+                    // Disable while a post is in flight so Return can't re-enter
+                    // send() and double-post (or post during the await window).
+                    .disabled(isSending)
+                    .opacity(isSending ? 0.5 : 1)
+
+                Button(action: send) {
+                    if isSending {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "paperplane.fill")
+                            .font(.system(size: 12))
+                    }
                 }
+                .buttonStyle(.borderless)
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSending)
+                .help("Send to team channel")
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Message type")
-
-            TextField("Message the team…", text: $draft, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...4)
-                .focused($composerFocused)
-                .onSubmit(send)
-
-            Button(action: send) {
-                Image(systemName: "paperplane.fill")
-                    .font(.system(size: 12))
-            }
-            .buttonStyle(.borderless)
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSending)
-            .help("Send to team channel")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(Color(nsColor: .controlBackgroundColor))
+        .animation(.easeOut(duration: 0.15), value: sendFailed)
     }
 
     private func send() {
         let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty, !isSending else { return }
         let type = selectedType
+        // Optimistically clear the composer, but keep `body` so we can restore the
+        // exact text on failure — clearing-before-await previously discarded the
+        // user's message silently when the post threw.
         draft = ""
+        sendFailed = false
         isSending = true
         composerFocused = true
         Task {
-            await appState.postChannelMessage(senderWorktreeID: worktreeID, type: type, body: body)
+            let ok = await appState.postChannelMessage(
+                senderWorktreeID: worktreeID, type: type, body: body
+            )
             isSending = false
+            if !ok {
+                // Restore the typed text and surface the failure inline. Don't
+                // clobber anything the user typed into the (disabled) field while
+                // the post was in flight — only restore when it's still empty.
+                if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    draft = body
+                }
+                sendFailed = true
+                composerFocused = true
+            }
         }
     }
 

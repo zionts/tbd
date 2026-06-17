@@ -165,6 +165,15 @@ extension AppState {
             }
         }
 
+        // Drop the persisted thread-tab identity so it isn't rehydrated next
+        // launch and doesn't linger as a ghost in the persisted tab order.
+        if case .thread(let threadID, _) = tab.content {
+            threadTabPaneIDs[worktreeID]?.removeAll { $0 == threadID }
+            if threadTabPaneIDs[worktreeID]?.isEmpty == true {
+                threadTabPaneIDs[worktreeID] = nil
+            }
+        }
+
         let remaining = arr.count
         activeTabIndices[worktreeID] = remaining > 0 ? min(index, remaining - 1) : 0
 
