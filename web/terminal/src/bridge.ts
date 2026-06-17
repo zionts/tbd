@@ -5,6 +5,7 @@
 // Swift→JS (via WKWebView.evaluateJavaScript):
 //   window.__TBD_BRIDGE__.applyTheme(themeJson)   // live theme/font re-apply
 //   window.__TBD_BRIDGE__.setActive(active)       // bg event suppression
+//   window.__TBD_BRIDGE__.focus()                 // focus blit's input element
 //   (initial config still arrives via window.__BLIT__ at document start.)
 //
 // JS→Swift (via window.webkit.messageHandlers.tbd.postMessage):
@@ -56,6 +57,7 @@ export function postToSwift(message: TbdOutboundMessage): void {
 export function installBridge(handlers: {
   onTheme(theme: BlitThemeInput): void;
   onActive(active: boolean): void;
+  onFocus(): void;
 }): () => void {
   window.__TBD_BRIDGE__ = {
     applyTheme(themeJson: string) {
@@ -68,6 +70,9 @@ export function installBridge(handlers: {
     },
     setActive(active: boolean) {
       handlers.onActive(active);
+    },
+    focus() {
+      handlers.onFocus();
     },
   };
   return () => {

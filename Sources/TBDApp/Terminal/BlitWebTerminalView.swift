@@ -165,6 +165,21 @@ enum BlitWebBundle {
 /// A `WKWebView` that participates in the AppKit responder chain so keyboard
 /// routing, tab-close context, and the focus registry track which terminal the
 /// user is interacting with (Phase 8, features 4 + 8).
+///
+/// Focus path (why typing reaches the blit session)
+/// ------------------------------------------------
+/// Two independent focus layers must both be satisfied:
+///  1. AppKit: this WKWebView must be the window's first responder, or AppKit
+///     routes key events away from the web content entirely. We promote it on
+///     `mouseDown` and on first appear (`makeNSView`), gated by `allowsFocus`
+///     (false for suspended/overlaid panels — background event suppression).
+///  2. DOM: blit binds its keydown listener to a hidden `<textarea>` inside the
+///     surface, NOT to the document — so keys only flow once that element is the
+///     focused DOM node. We focus it via `__TBD_BRIDGE__.focus()` after becoming
+///     first responder; blit also self-focuses it on its own click handler.
+/// A plain browser "just works" because the document already holds key focus and
+/// blit's click handler focuses the textarea; inside an unbundled SPM WKWebView
+/// with `drawsBackground=false`, neither promotion is reliable, hence both fixes.
 final class TBDTerminalWebView: WKWebView {
     /// Set false for non-visible / inactive terminals so they neither accept
     /// first responder nor handle Cmd-W etc. (background event suppression).
@@ -176,8 +191,41 @@ final class TBDTerminalWebView: WKWebView {
 
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
-        if ok { onBecomeFirstResponder?() }
+        if ok {
+            onBecomeFirstResponder?()
+            // Push DOM focus onto blit's hidden input textarea. AppKit
+            // first-responder status alone routes key events into the web
+            // content, but the *blit* keyboard listener is bound to that
+            // textarea, not the document — so it only sees keys once the
+            // textarea is the focused DOM element. (See focus path note below.)
+            focusWebContent()
+        }
         return ok
+    }
+
+    /// A click anywhere in the terminal must (a) make this WKWebView the
+    /// window's first responder so AppKit routes keystrokes into the web
+    /// content, and (b) focus blit's hidden input textarea so blit's keydown
+    /// listener actually fires. WKWebView usually self-promotes on click, but
+    /// in this unbundled SPM app with `drawsBackground=false` that promotion is
+    /// unreliable; do it explicitly. blit's own click handler also focuses the
+    /// textarea, but we call it too so focus lands even on the very first click
+    /// (before blit's listeners are guaranteed wired) and on non-canvas hits.
+    override func mouseDown(with event: NSEvent) {
+        if allowsFocus, window?.firstResponder !== self, !isDescendantFirstResponder() {
+            window?.makeFirstResponder(self)
+        }
+        super.mouseDown(with: event)
+        if allowsFocus { focusWebContent() }
+    }
+
+    /// Ask the web client to focus its terminal input element. No-op until the
+    /// bridge is installed (the React app calls `installBridge` on mount).
+    func focusWebContent() {
+        evaluateJavaScript(
+            "window.__TBD_BRIDGE__ && window.__TBD_BRIDGE__.focus && window.__TBD_BRIDGE__.focus();",
+            completionHandler: nil
+        )
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -318,6 +366,22 @@ struct BlitWebTerminalView: NSViewRepresentable {
             "loading blit web client terminalId=\(blitTerminalID, privacy: .public) port=\(port, privacy: .public)"
         )
         webView.loadFileURL(resolution.indexURL, allowingReadAccessTo: resolution.distDir)
+
+        // Robust default: a freshly-shown, non-suspended foreground terminal
+        // should be interactive without the user having to click first. Once the
+        // view is in a window, grab first responder (if nothing else in this
+        // window already owns it) and focus the web input. This runs after the
+        // current runloop turn so the view is attached to its window.
+        if !isSuspended {
+            DispatchQueue.main.async { [weak webView] in
+                guard let webView, webView.allowsFocus, let window = webView.window else { return }
+                let current = window.firstResponder as? NSView
+                let alreadyFocused = current === webView || (current?.isDescendant(of: webView) ?? false)
+                if !alreadyFocused {
+                    window.makeFirstResponder(webView)
+                }
+            }
+        }
 
         // Register focus + screenshot providers (features 4 + 5).
         appState.registerTerminalView(webView, for: terminalID)

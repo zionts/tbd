@@ -57,6 +57,9 @@ declare global {
       applyTheme(themeJson: string): void;
       /** Mark this WebView active/inactive (background event suppression). */
       setActive(active: boolean): void;
+      /** Focus blit's terminal input element (called by Swift after the
+       *  WKWebView becomes AppKit first responder). */
+      focus(): void;
     };
   }
 }

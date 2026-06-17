@@ -70,11 +70,18 @@ function TerminalApp({ config }: { config: BlitRuntimeConfig }) {
   const workspace = useMemo(() => new BlitWorkspace({ wasm: loadWasm() }), []);
   useEffect(() => () => workspace.dispose(), [workspace]);
 
-  // Swift→JS bridge: live theme + active-state updates.
+  // Live handle to the rendered terminal surface so the Swift→JS bridge's
+  // focus() can put DOM focus on blit's hidden input textarea. blit binds its
+  // keydown listener to that textarea (not the document), so focusing it is
+  // what actually makes typed keys reach the session — see index/bridge notes.
+  const surfaceRef = useRef<BlitTerminalSurface | null>(null);
+
+  // Swift→JS bridge: live theme + active-state updates + focus requests.
   useEffect(() => {
     const uninstall = installBridge({
       onTheme: (t) => setTheme(t),
       onActive: (a) => setActive(a),
+      onFocus: () => surfaceRef.current?.focus(),
     });
     postToSwift({ type: "ready" });
     return uninstall;
@@ -106,6 +113,7 @@ function TerminalApp({ config }: { config: BlitRuntimeConfig }) {
         fontFamily={fontFamily}
         fontSize={fontSize}
         active={active}
+        surfaceRef={surfaceRef}
       />
     </BlitWorkspaceProvider>
   );
@@ -117,12 +125,14 @@ function TerminalById({
   fontFamily,
   fontSize,
   active,
+  surfaceRef,
 }: {
   config: BlitRuntimeConfig;
   palette: ReturnType<typeof buildPalette>;
   fontFamily: string;
   fontSize: number;
   active: boolean;
+  surfaceRef: React.MutableRefObject<BlitTerminalSurface | null>;
 }) {
   const terminalId = config.terminalId;
   // Sessions arrive once the gateway sends its terminal list. We render the one
@@ -131,8 +141,6 @@ function TerminalById({
   const session: BlitSession | undefined = sessions.find(
     (s) => s.ptyId === terminalId && s.state !== "closed",
   );
-
-  const surfaceRef = useRef<BlitTerminalSurface | null>(null);
 
   // --- Feature 3: dead-window detection -----------------------------------
   // When the blit session reports `exited`, tell Swift so it can recreate the
@@ -253,6 +261,20 @@ function TerminalById({
     el.addEventListener("focusin", onFocusIn);
     return () => el.removeEventListener("focusin", onFocusIn);
   }, []);
+
+  // Auto-focus a freshly-shown, active terminal so the user can type without
+  // clicking first. blit's keydown listener lives on its hidden input textarea,
+  // which only exists after the surface attaches (i.e. once a session renders);
+  // Swift's makeFirstResponder may fire before that, so we also focus here when
+  // the surface becomes available and the terminal is active. Re-runs when
+  // active flips back on (e.g. an overlay closes).
+  useEffect(() => {
+    if (!active) return;
+    if (!session || session.state !== "active") return;
+    // Defer to let BlitTerminal create/attach the surface for this session.
+    const id = window.setTimeout(() => surfaceRef.current?.focus(), 0);
+    return () => window.clearTimeout(id);
+  }, [active, session?.id, session?.state, surfaceRef]);
 
   // --- Feature 1: suspended snapshot --------------------------------------
   // Render the captured ANSI snapshot until a LIVE (active) session exists.
