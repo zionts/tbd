@@ -151,6 +151,9 @@ extension RPCRouter {
                 shellCommand: CodexSpawnCommandBuilder.build(initialPrompt: params.prompt),
                 env: codexEnv,
                 sensitiveEnv: codexEnvOverrides,
+                pathPrepend: AgentCLIProvisioner().pathPrependForSession(
+                    daemonExecutable: AgentCLIProvisioner.resolvedDaemonExecutablePath
+                ),
                 cols: resolvedCols,
                 rows: resolvedRows
             )
@@ -263,6 +266,13 @@ extension RPCRouter {
         } else {
             primarySensitiveEnv = spawn.sensitiveEnv
         }
+        // Inject the channel-capable `tbd` for agent panes (Claude). Plain
+        // shell / custom-cmd terminals the user drives are out of scope.
+        let createPathPrepend: String? = isClaudeType
+            ? AgentCLIProvisioner().pathPrependForSession(
+                daemonExecutable: AgentCLIProvisioner.resolvedDaemonExecutablePath
+              )
+            : nil
         let window = try await tmux.createWindow(
             server: worktree.tmuxServer,
             session: "main",
@@ -270,6 +280,7 @@ extension RPCRouter {
             shellCommand: spawn.command,
             env: env,
             sensitiveEnv: primarySensitiveEnv,
+            pathPrepend: createPathPrepend,
             cols: resolvedCols,
             rows: resolvedRows
         )
@@ -716,6 +727,10 @@ extension RPCRouter {
             shellCommand: spawn.command,
             env: env,
             sensitiveEnv: mergedEnvOverrides.merging(spawn.sensitiveEnv) { _, builder in builder },
+            // Swapped-in pane is a Claude agent — keep the channel-capable CLI.
+            pathPrepend: AgentCLIProvisioner().pathPrependForSession(
+                daemonExecutable: AgentCLIProvisioner.resolvedDaemonExecutablePath
+            ),
             cols: resolvedCols,
             rows: resolvedRows
         )
@@ -942,28 +957,10 @@ extension RPCRouter {
             version: TBDConstants.version,
             uptime: uptime,
             connectedClients: 0,  // Will be updated when socket server is implemented
-            executablePath: Self.resolvedExecutablePath
+            executablePath: AgentCLIProvisioner.resolvedDaemonExecutablePath
         )
         return try RPCResponse(result: status)
     }
-
-    /// Daemon's own executable path, resolved once at module load. Captures
-    /// CWD at startup (rather than at each `daemon.status` RPC) so a later
-    /// `chdir` can't make the resolution wrong if `argv[0]` is relative.
-    /// Symlinks are followed so we return the real binary path — `cliPath()`
-    /// looks for `TBDCLI` next to the actual TBDDaemon binary, not next to
-    /// a symlink that points at it.
-    private static let resolvedExecutablePath: String? = {
-        guard let argv0 = CommandLine.arguments.first, !argv0.isEmpty else { return nil }
-        let url: URL
-        if argv0.hasPrefix("/") {
-            url = URL(fileURLWithPath: argv0)
-        } else {
-            let cwd = FileManager.default.currentDirectoryPath
-            url = URL(fileURLWithPath: argv0, relativeTo: URL(fileURLWithPath: cwd))
-        }
-        return url.resolvingSymlinksInPath().standardizedFileURL.path
-    }()
 
     // MARK: - Resolve Path
 

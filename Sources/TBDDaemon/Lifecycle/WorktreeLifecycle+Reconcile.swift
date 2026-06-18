@@ -382,6 +382,15 @@ extension WorktreeLifecycle {
             )
         }
 
+        // Agent panes (Claude resume / Codex) get the channel-capable `tbd` on
+        // PATH on reboot recovery too; shells/custom-cmd stay clean.
+        let isAgentPane = terminal.isCodexTerminal
+            || (terminal.isClaudeResumable && terminal.claudeSessionID != nil)
+        let rebootPathPrepend: String? = isAgentPane
+            ? AgentCLIProvisioner().pathPrependForSession(
+                daemonExecutable: AgentCLIProvisioner.resolvedDaemonExecutablePath
+              )
+            : nil
         let window: (windowID: String, paneID: String)
         do {
             window = try await tmux.createWindow(
@@ -390,7 +399,8 @@ extension WorktreeLifecycle {
                 cwd: worktree.path,
                 shellCommand: spawn.command,
                 env: env,
-                sensitiveEnv: primarySensitiveEnv
+                sensitiveEnv: primarySensitiveEnv,
+                pathPrepend: rebootPathPrepend
             )
         } catch {
             // If we just bootstrapped the server and createWindow failed, the

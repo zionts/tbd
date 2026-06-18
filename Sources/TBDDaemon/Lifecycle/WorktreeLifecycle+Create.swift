@@ -524,6 +524,16 @@ extension WorktreeLifecycle {
             primaryProfileID = resolvedProfile?.profileID
             primaryLabel = TerminalLabel.claudeCode
         }
+        // Stage a version-matched, channel-capable `tbd` ahead of any global
+        // install on the agent's PATH. nil when the CLI can't be resolved/staged
+        // — the session then spawns with the user's normal PATH (today's
+        // behavior). Only meaningful for agent panes (Claude/Codex), not plain
+        // shells the user drives themselves.
+        let primaryPathPrepend: String? = primaryTerminalKind == .shell
+            ? nil
+            : AgentCLIProvisioner().pathPrependForSession(
+                daemonExecutable: AgentCLIProvisioner.resolvedDaemonExecutablePath
+            )
         let window1 = try await tmux.createWindow(
             server: tmuxServer,
             session: "main",
@@ -531,6 +541,7 @@ extension WorktreeLifecycle {
             shellCommand: primaryCommand,
             env: primaryEnv,
             sensitiveEnv: primarySensitiveEnv,
+            pathPrepend: primaryPathPrepend,
             cols: resolvedCols,
             rows: resolvedRows
         )
@@ -636,6 +647,11 @@ extension WorktreeLifecycle {
                     env: perTermEnv,
                     // Same free-form-under-auth layering as the primary terminal.
                     sensitiveEnv: mergedEnvOverrides.merging(spawn.sensitiveEnv) { _, builder in builder },
+                    // Restored Claude sessions are agents too — give them the
+                    // same channel-capable `tbd` on PATH as the primary.
+                    pathPrepend: AgentCLIProvisioner().pathPrependForSession(
+                        daemonExecutable: AgentCLIProvisioner.resolvedDaemonExecutablePath
+                    ),
                     cols: resolvedCols,
                     rows: resolvedRows
                 )

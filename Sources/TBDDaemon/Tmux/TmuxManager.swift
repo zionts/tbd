@@ -94,12 +94,22 @@ public struct TmuxManager: Sendable {
         ["-L", server, "has-session", "-t", session]
     }
 
-    public static func newWindowCommand(server: String, session: String, cwd: String, shellCommand: String, env: [String: String] = [:], sensitiveEnv: [String: String] = [:], cols: Int? = nil, rows: Int? = nil) -> [String] {
+    public static func newWindowCommand(server: String, session: String, cwd: String, shellCommand: String, env: [String: String] = [:], sensitiveEnv: [String: String] = [:], pathPrepend: String? = nil, cols: Int? = nil, rows: Int? = nil) -> [String] {
         // Use shell -ic so commands with arguments work (e.g. "claude --dangerously-skip-permissions")
         // -i keeps it interactive (loads .zshrc), -c runs the command
         // After the command exits, the pane closes (tmux default behavior)
         let userShell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         var envPrefix = ""
+        // PATH prepend goes FIRST so a version-matched TBD CLI staged in
+        // `pathPrepend` resolves ahead of any globally-installed `tbd`. The
+        // directory is single-quoted (space/quote safe) but `$PATH` is left
+        // live so it expands against the PATH the interactive `-ic` shell just
+        // built from the user's rc files. Other env vars (below) intentionally
+        // use full single-quoting and must NOT reference shell vars.
+        if let pathPrepend, !pathPrepend.isEmpty {
+            let escaped = pathPrepend.replacingOccurrences(of: "'", with: "'\\''")
+            envPrefix += "export PATH='\(escaped)':\"$PATH\"; "
+        }
         for (key, value) in env.sorted(by: { $0.key < $1.key }) {
             let escaped = value.replacingOccurrences(of: "'", with: "'\\''")
             envPrefix += "export \(key)='\(escaped)'; "
@@ -251,15 +261,15 @@ public struct TmuxManager: Sendable {
         try await runTmux(["-L", server, "kill-server"])
     }
 
-    public func createWindow(server: String, session: String, cwd: String, shellCommand: String, env: [String: String] = [:], sensitiveEnv: [String: String] = [:], cols: Int? = nil, rows: Int? = nil) async throws -> (windowID: String, paneID: String) {
+    public func createWindow(server: String, session: String, cwd: String, shellCommand: String, env: [String: String] = [:], sensitiveEnv: [String: String] = [:], pathPrepend: String? = nil, cols: Int? = nil, rows: Int? = nil) async throws -> (windowID: String, paneID: String) {
         let result: (windowID: String, paneID: String)
         if dryRun {
-            let args = Self.newWindowCommand(server: server, session: session, cwd: cwd, shellCommand: shellCommand, env: env, sensitiveEnv: sensitiveEnv, cols: cols, rows: rows)
+            let args = Self.newWindowCommand(server: server, session: session, cwd: cwd, shellCommand: shellCommand, env: env, sensitiveEnv: sensitiveEnv, pathPrepend: pathPrepend, cols: cols, rows: rows)
             dryRunRecorder?(args)
             let n = counter.next()
             result = (windowID: "@mock-\(n)", paneID: "%mock-\(n)")
         } else {
-            let args = Self.newWindowCommand(server: server, session: session, cwd: cwd, shellCommand: shellCommand, env: env, sensitiveEnv: sensitiveEnv, cols: cols, rows: rows)
+            let args = Self.newWindowCommand(server: server, session: session, cwd: cwd, shellCommand: shellCommand, env: env, sensitiveEnv: sensitiveEnv, pathPrepend: pathPrepend, cols: cols, rows: rows)
             let output = try await runTmux(args)
             let parts = output.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ")
             guard parts.count == 2 else {

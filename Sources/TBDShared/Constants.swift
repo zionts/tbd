@@ -55,6 +55,17 @@ public enum TBDConstants {
     }
     public static var reposDir: URL { reposDir(environment: ProcessInfo.processInfo.environment) }
 
+    /// Per-home `bin` directory. Follows `TBD_HOME`, so each home (tests, CI,
+    /// the developer's real config) gets an isolated bin dir. The daemon stages
+    /// a `tbd` symlink here pointing at its own version-matched CLI sibling and
+    /// prepends this directory to spawned sessions' PATH, so agents always
+    /// invoke a `tbd` that matches the running daemon (and thus has the same
+    /// subcommands, e.g. `channel`) regardless of any global install.
+    public static func binDir(environment: [String: String]) -> URL {
+        configDir(environment: environment).appendingPathComponent("bin")
+    }
+    public static var binDir: URL { binDir(environment: ProcessInfo.processInfo.environment) }
+
     public static func hookPath(repoID: UUID, eventName: String, environment: [String: String]) -> String {
         reposDir(environment: environment)
             .appendingPathComponent(repoID.uuidString)

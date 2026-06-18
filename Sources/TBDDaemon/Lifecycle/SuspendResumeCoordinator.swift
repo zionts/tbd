@@ -424,7 +424,11 @@ public actor SuspendResumeCoordinator {
                 server: server, session: "main",
                 cwd: worktree.path, shellCommand: spawn.command,
                 env: resumeEnv,
-                sensitiveEnv: mergedEnvOverrides.merging(spawn.sensitiveEnv) { _, builder in builder }
+                sensitiveEnv: mergedEnvOverrides.merging(spawn.sensitiveEnv) { _, builder in builder },
+                // Resumed Claude pane is an agent — keep the channel-capable CLI.
+                pathPrepend: AgentCLIProvisioner().pathPrependForSession(
+                    daemonExecutable: AgentCLIProvisioner.resolvedDaemonExecutablePath
+                )
             )
             try await db.terminals.updateTmuxIDs(
                 id: terminal.id, windowID: window.windowID, paneID: window.paneID
