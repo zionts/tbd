@@ -80,6 +80,59 @@ struct RPCRouterChannelHandlerTests {
         #expect(broadcasts.first?.teamID == parent.id)
     }
 
+    @Test func postWithHumanKindPersistsAndBroadcastsHuman() async throws {
+        let db = try TBDDatabase(inMemory: true)
+        let (router, deltas) = makeRouter(db: db)
+        let repo = try await makeRepo(db: db)
+        let worktree = try await makeWorktree(db: db, repo: repo)
+
+        let request = try RPCRequest(
+            method: RPCMethod.channelPost,
+            params: ChannelPostParams(
+                senderWorktreeID: worktree.id, type: .note, senderKind: .human, body: "hi")
+        )
+        let response = await router.handle(request)
+        #expect(response.success)
+
+        let message = try response.decodeResult(ChannelMessage.self)
+        #expect(message.senderKind == .human)
+
+        // Persisted as human.
+        let stored = try await db.channel.tail(teamID: worktree.id)
+        #expect(stored.map(\.senderKind) == [.human])
+
+        // Broadcast carries human.
+        let broadcasts = deltas.snapshot().compactMap { delta -> ChannelMessageDelta? in
+            if case .channelMessage(let d) = delta { return d }
+            return nil
+        }
+        #expect(broadcasts.count == 1)
+        #expect(broadcasts.first?.senderKind == .human)
+    }
+
+    @Test func postWithoutKindDefaultsToAgent() async throws {
+        let db = try TBDDatabase(inMemory: true)
+        let (router, deltas) = makeRouter(db: db)
+        let repo = try await makeRepo(db: db)
+        let worktree = try await makeWorktree(db: db, repo: repo)
+
+        let request = try RPCRequest(
+            method: RPCMethod.channelPost,
+            params: ChannelPostParams(senderWorktreeID: worktree.id, type: .note, body: "hi")
+        )
+        let response = await router.handle(request)
+        #expect(response.success)
+
+        let message = try response.decodeResult(ChannelMessage.self)
+        #expect(message.senderKind == .agent)
+
+        let broadcasts = deltas.snapshot().compactMap { delta -> ChannelMessageDelta? in
+            if case .channelMessage(let d) = delta { return d }
+            return nil
+        }
+        #expect(broadcasts.first?.senderKind == .agent)
+    }
+
     @Test func tailResolvesTeamAndReturnsThread() async throws {
         let db = try TBDDatabase(inMemory: true)
         let (router, _) = makeRouter(db: db)

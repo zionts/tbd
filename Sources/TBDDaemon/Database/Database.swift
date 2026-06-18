@@ -566,6 +566,17 @@ public final class TBDDatabase: Sendable {
             )
         }
 
+        // Distinguish human barge-in posts from agent posts. Existing rows
+        // predate human authorship, so they default to 'agent'.
+        migrator.registerMigration("v33_channel_message_sender_kind") { db in
+            try db.addColumnIfMissing(
+                table: "channel_message",
+                column: "senderKind",
+                type: .text,
+                defaults: "agent"
+            )
+        }
+
         return migrator
     }
 }

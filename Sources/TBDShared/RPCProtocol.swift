@@ -940,11 +940,29 @@ public struct NoteListParams: Codable, Sendable {
 public struct ChannelPostParams: Codable, Sendable {
     public let senderWorktreeID: UUID
     public let type: ChannelMessageType
+    /// Authorship of the post. Optional on the wire for backward compatibility:
+    /// older clients omit it and the daemon defaults to `.agent`.
+    public let senderKind: ChannelSenderKind
     public let body: String
-    public init(senderWorktreeID: UUID, type: ChannelMessageType = .note, body: String) {
+    public init(
+        senderWorktreeID: UUID,
+        type: ChannelMessageType = .note,
+        senderKind: ChannelSenderKind = .agent,
+        body: String
+    ) {
         self.senderWorktreeID = senderWorktreeID
         self.type = type
+        self.senderKind = senderKind
         self.body = body
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.senderWorktreeID = try container.decode(UUID.self, forKey: .senderWorktreeID)
+        self.type = try container.decode(ChannelMessageType.self, forKey: .type)
+        self.senderKind = try container.decodeIfPresent(
+            ChannelSenderKind.self, forKey: .senderKind) ?? .agent
+        self.body = try container.decode(String.self, forKey: .body)
     }
 }
 

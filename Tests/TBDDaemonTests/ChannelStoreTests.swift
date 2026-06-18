@@ -51,6 +51,47 @@ import TBDShared
         #expect(tailed.map(\.type) == [.start, .blocker, .done])
     }
 
+    // MARK: - senderKind round-trips
+
+    @Test func postDefaultsToAgentSenderKind() async throws {
+        let db = try makeDB()
+        let team = UUID()
+        let sender = UUID()
+        let posted = try await db.channel.post(
+            teamID: team, senderWorktreeID: sender, type: .note, body: "hi")
+        #expect(posted.senderKind == .agent)
+
+        let tailed = try await db.channel.tail(teamID: team)
+        #expect(tailed.map(\.senderKind) == [.agent])
+    }
+
+    @Test func postPersistsHumanSenderKind() async throws {
+        let db = try makeDB()
+        let team = UUID()
+        let sender = UUID()
+        let posted = try await db.channel.post(
+            teamID: team, senderWorktreeID: sender, type: .note, senderKind: .human, body: "barge-in")
+        #expect(posted.senderKind == .human)
+
+        // Survives the DB round-trip.
+        let tailed = try await db.channel.tail(teamID: team)
+        #expect(tailed.count == 1)
+        #expect(tailed.first?.senderKind == .human)
+    }
+
+    @Test func tailPreservesMixedSenderKinds() async throws {
+        let db = try makeDB()
+        let team = UUID()
+        let sender = UUID()
+        _ = try await db.channel.post(
+            teamID: team, senderWorktreeID: sender, type: .note, senderKind: .agent, body: "a")
+        _ = try await db.channel.post(
+            teamID: team, senderWorktreeID: sender, type: .note, senderKind: .human, body: "h")
+
+        let tailed = try await db.channel.tail(teamID: team)
+        #expect(tailed.map(\.senderKind) == [.agent, .human])
+    }
+
     // MARK: - tail scopes by teamID
 
     @Test func tailReturnsOnlyMessagesForTheTeam() async throws {

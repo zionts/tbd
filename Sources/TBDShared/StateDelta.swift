@@ -35,6 +35,9 @@ public struct ChannelMessageDelta: Codable, Sendable {
     public let teamID: UUID
     public let senderWorktreeID: UUID
     public let type: ChannelMessageType
+    /// Authorship (agent vs human). Decodes to `.agent` when absent so deltas
+    /// emitted by an older daemon still round-trip.
+    public let senderKind: ChannelSenderKind
     public let body: String
     public let createdAt: Date
     public init(
@@ -42,6 +45,7 @@ public struct ChannelMessageDelta: Codable, Sendable {
         teamID: UUID,
         senderWorktreeID: UUID,
         type: ChannelMessageType,
+        senderKind: ChannelSenderKind = .agent,
         body: String,
         createdAt: Date
     ) {
@@ -49,6 +53,7 @@ public struct ChannelMessageDelta: Codable, Sendable {
         self.teamID = teamID
         self.senderWorktreeID = senderWorktreeID
         self.type = type
+        self.senderKind = senderKind
         self.body = body
         self.createdAt = createdAt
     }
@@ -58,8 +63,21 @@ public struct ChannelMessageDelta: Codable, Sendable {
         self.teamID = message.teamID
         self.senderWorktreeID = message.senderWorktreeID
         self.type = message.type
+        self.senderKind = message.senderKind
         self.body = message.body
         self.createdAt = message.createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.messageID = try container.decode(UUID.self, forKey: .messageID)
+        self.teamID = try container.decode(UUID.self, forKey: .teamID)
+        self.senderWorktreeID = try container.decode(UUID.self, forKey: .senderWorktreeID)
+        self.type = try container.decode(ChannelMessageType.self, forKey: .type)
+        self.senderKind = try container.decodeIfPresent(
+            ChannelSenderKind.self, forKey: .senderKind) ?? .agent
+        self.body = try container.decode(String.self, forKey: .body)
+        self.createdAt = try container.decode(Date.self, forKey: .createdAt)
     }
 }
 

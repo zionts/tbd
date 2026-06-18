@@ -39,6 +39,7 @@ extension RPCRouter {
             teamID: teamID,
             senderWorktreeID: params.senderWorktreeID,
             type: params.type,
+            senderKind: params.senderKind,
             body: params.body
         )
 

@@ -560,6 +560,21 @@ public enum ChannelMessageType: String, Codable, Sendable {
     }
 }
 
+/// Distinguishes who authored a channel post: an `agent` (a Claude Code
+/// session, the default) versus a `human` who barged into the Thread pane.
+/// Backed by a string so an unknown future kind posted by a newer client still
+/// round-trips through older readers, falling back to `.agent` (mirrors
+/// `ChannelMessageType`'s forward-compat decoder).
+public enum ChannelSenderKind: String, Codable, Sendable, CaseIterable {
+    case agent
+    case human
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = ChannelSenderKind(rawValue: raw) ?? .agent
+    }
+}
+
 /// One immutable message in a team's append-only coordination channel.
 ///
 /// `teamID` is the root worktree of the sender's parent+children subtree
@@ -577,6 +592,10 @@ public struct ChannelMessage: Codable, Sendable, Identifiable, Equatable {
     public let teamID: UUID
     public let senderWorktreeID: UUID
     public let type: ChannelMessageType
+    /// Whether this post was authored by an agent or a human. Defaults to
+    /// `.agent` and decodes to `.agent` when absent so messages persisted /
+    /// serialized before this field existed still round-trip.
+    public let senderKind: ChannelSenderKind
     public let body: String
     public let createdAt: Date
 
@@ -585,6 +604,7 @@ public struct ChannelMessage: Codable, Sendable, Identifiable, Equatable {
         teamID: UUID,
         senderWorktreeID: UUID,
         type: ChannelMessageType = .note,
+        senderKind: ChannelSenderKind = .agent,
         body: String,
         createdAt: Date = Date()
     ) {
@@ -592,8 +612,22 @@ public struct ChannelMessage: Codable, Sendable, Identifiable, Equatable {
         self.teamID = teamID
         self.senderWorktreeID = senderWorktreeID
         self.type = type
+        self.senderKind = senderKind
         self.body = body
         self.createdAt = createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(UUID.self, forKey: .id)
+        self.teamID = try container.decode(UUID.self, forKey: .teamID)
+        self.senderWorktreeID = try container.decode(UUID.self, forKey: .senderWorktreeID)
+        self.type = try container.decode(ChannelMessageType.self, forKey: .type)
+        // Backward-compat: pre-senderKind JSON omits this field → default agent.
+        self.senderKind = try container.decodeIfPresent(
+            ChannelSenderKind.self, forKey: .senderKind) ?? .agent
+        self.body = try container.decode(String.self, forKey: .body)
+        self.createdAt = try container.decode(Date.self, forKey: .createdAt)
     }
 }
 

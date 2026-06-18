@@ -60,6 +60,9 @@ struct ChannelPost: AsyncParsableCommand {
     @Option(name: .long, help: "Sender worktree ID/name (defaults to TBD_WORKTREE_ID)")
     var worktree: String?
 
+    @Flag(name: .long, help: "Mark this post as a human barge-in (default: agent)")
+    var human = false
+
     @Argument(help: "Message body")
     var body: String
 
@@ -72,7 +75,12 @@ struct ChannelPost: AsyncParsableCommand {
 
         let message: ChannelMessage = try client.call(
             method: RPCMethod.channelPost,
-            params: ChannelPostParams(senderWorktreeID: senderWorktreeID, type: type, body: body),
+            params: ChannelPostParams(
+                senderWorktreeID: senderWorktreeID,
+                type: type,
+                senderKind: human ? .human : .agent,
+                body: body
+            ),
             resultType: ChannelMessage.self
         )
 
@@ -121,7 +129,7 @@ struct ChannelTail: AsyncParsableCommand {
             for message in result.messages {
                 let ts = formatter.string(from: message.createdAt)
                 let sender = message.senderWorktreeID.uuidString.prefix(8)
-                print("\(ts)  [\(message.type.rawValue)]  \(sender)  \(message.body)")
+                print("\(ts)  [\(message.type.rawValue)]  \(message.senderKind.rawValue)  \(sender)  \(message.body)")
             }
         }
     }

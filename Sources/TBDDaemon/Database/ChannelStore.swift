@@ -10,6 +10,7 @@ struct ChannelMessageRecord: Codable, FetchableRecord, PersistableRecord, Sendab
     var teamID: String
     var senderWorktreeID: String
     var type: String
+    var senderKind: String
     var body: String
     var createdAt: Date
 
@@ -18,6 +19,7 @@ struct ChannelMessageRecord: Codable, FetchableRecord, PersistableRecord, Sendab
         self.teamID = message.teamID.uuidString
         self.senderWorktreeID = message.senderWorktreeID.uuidString
         self.type = message.type.rawValue
+        self.senderKind = message.senderKind.rawValue
         self.body = message.body
         self.createdAt = message.createdAt
     }
@@ -28,6 +30,7 @@ struct ChannelMessageRecord: Codable, FetchableRecord, PersistableRecord, Sendab
             teamID: UUID(uuidString: teamID)!,
             senderWorktreeID: UUID(uuidString: senderWorktreeID)!,
             type: ChannelMessageType(rawValue: type) ?? .note,
+            senderKind: ChannelSenderKind(rawValue: senderKind) ?? .agent,
             body: body,
             createdAt: createdAt
         )
@@ -67,6 +70,7 @@ public struct ChannelStore: Sendable {
         teamID: UUID,
         senderWorktreeID: UUID,
         type: ChannelMessageType,
+        senderKind: ChannelSenderKind = .agent,
         body: String
     ) async throws -> ChannelMessage {
         try await writer.write { db in
@@ -74,6 +78,7 @@ public struct ChannelStore: Sendable {
                 teamID: teamID,
                 senderWorktreeID: senderWorktreeID,
                 type: type,
+                senderKind: senderKind,
                 body: body
             )
             let record = ChannelMessageRecord(from: message)

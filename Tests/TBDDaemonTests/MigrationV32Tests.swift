@@ -11,7 +11,9 @@ import GRDB
             #expect(try dbConn.tableExists("channel_message"))
             let columns = try Row.fetchAll(dbConn, sql: "PRAGMA table_info(channel_message)")
             let names = Set(columns.compactMap { $0["name"] as String? })
-            #expect(names == ["id", "teamID", "senderWorktreeID", "type", "body", "createdAt"])
+            // senderKind added in v33; assert the v32 columns are present (the
+            // full live schema is a superset once later migrations have run).
+            #expect(names.isSuperset(of: ["id", "teamID", "senderWorktreeID", "type", "body", "createdAt"]))
         }
     }
 
