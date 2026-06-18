@@ -17,7 +17,6 @@ struct ThreadPaneView: View {
 
     @State private var resolvedTeamID: UUID?
     @State private var draft: String = ""
-    @State private var selectedType: ChannelMessageType = .note
     @State private var isSending = false
     /// Set when a post fails so the composer can surface an inline error and the
     /// user can retry. Cleared on the next send attempt or successful post. The
@@ -123,30 +122,13 @@ struct ThreadPaneView: View {
                 .transition(.opacity)
             }
             HStack(spacing: 8) {
-                Menu {
-                    ForEach(ThreadMessageType.allDisplayed, id: \.self) { type in
-                        Button {
-                            selectedType = type
-                        } label: {
-                            Label(type.displayLabel, systemImage: type == selectedType ? "checkmark" : "")
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 3) {
-                        Circle()
-                            .fill(ThreadMessageType.color(for: selectedType))
-                            .frame(width: 7, height: 7)
-                        Text(selectedType.displayLabel)
-                            .font(.caption)
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.system(size: 8))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .disabled(isSending)
-                .help("Message type")
+                // A human barge-in is just plain text — no type picker. The glyph
+                // signals "you, the human, are posting" to mirror how human
+                // messages render in the list (see ThreadMessageRow).
+                Image(systemName: "person.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .help("You'll post to the team channel as a human")
 
                 TextField("Message the team…", text: $draft, axis: .vertical)
                     .textFieldStyle(.plain)
@@ -181,7 +163,6 @@ struct ThreadPaneView: View {
     private func send() {
         let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty, !isSending else { return }
-        let type = selectedType
         // Optimistically clear the composer, but keep `body` so we can restore the
         // exact text on failure — clearing-before-await previously discarded the
         // user's message silently when the post threw.
@@ -190,8 +171,11 @@ struct ThreadPaneView: View {
         isSending = true
         composerFocused = true
         Task {
+            // Human barge-in: always `.human`, with `.note` as the under-the-hood
+            // type (the human never picks one). senderWorktreeID still scopes the
+            // team; senderKind is what attributes the post to the user.
             let ok = await appState.postChannelMessage(
-                senderWorktreeID: worktreeID, type: type, body: body
+                senderWorktreeID: worktreeID, type: .note, senderKind: .human, body: body
             )
             isSending = false
             if !ok {
@@ -220,19 +204,72 @@ struct ThreadPaneView: View {
     }
 }
 
+// MARK: - Row presentation (pure, testable)
+
+/// Pure rendering decision for one channel message row, factored out of the
+/// SwiftUI view so the human-vs-agent branch is unit-testable without a view
+/// host. Chat convention: a human's own posts are offset (right-aligned,
+/// accented, labelled "You", no type badge); agent posts keep the worktree name
+/// + a `[TYPE]` badge.
+struct ThreadMessageRowStyle: Equatable {
+    let isHuman: Bool
+    /// Author shown in the row header. "You" for a human; the worktree name for
+    /// an agent.
+    let authorLabel: String
+    /// Whether to render the `[TYPE]` badge. Suppressed for human posts (the
+    /// human never picks a type).
+    let showsTypeBadge: Bool
+
+    init(senderKind: ChannelSenderKind, senderName: String) {
+        switch senderKind {
+        case .human:
+            self.isHuman = true
+            self.authorLabel = "You"
+            self.showsTypeBadge = false
+        case .agent:
+            self.isHuman = false
+            self.authorLabel = senderName
+            self.showsTypeBadge = true
+        }
+    }
+}
+
 // MARK: - Message row
 
 private struct ThreadMessageRow: View {
     let message: ChannelMessage
     let senderName: String
 
+    private var style: ThreadMessageRowStyle {
+        ThreadMessageRowStyle(senderKind: message.senderKind, senderName: senderName)
+    }
+
     var body: some View {
+        // Human posts are offset to the trailing edge (chat convention: your own
+        // messages sit on the right); agent posts stay leading-aligned.
+        HStack(spacing: 0) {
+            if style.isHuman { Spacer(minLength: 40) }
+            bubble
+            if !style.isHuman { Spacer(minLength: 40) }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var bubble: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
-                Text(senderName)
+                if style.isHuman {
+                    Image(systemName: "person.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tint)
+                }
+                Text(style.authorLabel)
                     .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(style.isHuman ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
                     .lineLimit(1)
-                typeTag
+                if style.showsTypeBadge {
+                    typeTag
+                }
                 Spacer(minLength: 4)
                 Text(ThreadMessageType.timeString(message.createdAt))
                     .font(.caption2)
@@ -244,7 +281,17 @@ private struct ThreadMessageRow: View {
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, style.isHuman ? 10 : 0)
+        .padding(.vertical, style.isHuman ? 7 : 0)
+        .background(humanBackground)
+    }
+
+    @ViewBuilder
+    private var humanBackground: some View {
+        if style.isHuman {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.accentColor.opacity(0.12))
+        }
     }
 
     private var typeTag: some View {
@@ -264,9 +311,6 @@ private struct ThreadMessageRow: View {
 /// Presentation helpers for `ChannelMessageType`. Kept in the app layer (not the
 /// shared model) so colors/labels stay a UI concern.
 private enum ThreadMessageType {
-    /// Types offered in the composer picker, in a sensible barge-in order.
-    static let allDisplayed: [ChannelMessageType] = [.note, .blocker, .start, .pr, .done, .learning]
-
     static func color(for type: ChannelMessageType) -> Color {
         switch type {
         case .start: return .blue

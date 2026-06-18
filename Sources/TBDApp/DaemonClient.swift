@@ -594,12 +594,20 @@ actor DaemonClient {
     /// Post a message to the sender's team coordination channel. The daemon
     /// resolves `senderWorktreeID` to its team root and returns the persisted
     /// `ChannelMessage` (the same message is also broadcast as a delta).
+    ///
+    /// `senderKind` defaults to `.agent` so existing callers are unaffected; the
+    /// human barge-in path passes `.human` so the post is attributed to the user
+    /// rather than to the worktree being viewed.
     func channelPost(
-        senderWorktreeID: UUID, type: ChannelMessageType = .note, body: String
+        senderWorktreeID: UUID, type: ChannelMessageType = .note,
+        senderKind: ChannelSenderKind = .agent, body: String
     ) async throws -> ChannelMessage {
         return try await callAsync(
             method: RPCMethod.channelPost,
-            params: ChannelPostParams(senderWorktreeID: senderWorktreeID, type: type, body: body),
+            params: ChannelPostParams(
+                senderWorktreeID: senderWorktreeID, type: type,
+                senderKind: senderKind, body: body
+            ),
             resultType: ChannelMessage.self
         )
     }

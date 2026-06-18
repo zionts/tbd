@@ -43,6 +43,7 @@ extension AppState {
             teamID: delta.teamID,
             senderWorktreeID: delta.senderWorktreeID,
             type: delta.type,
+            senderKind: delta.senderKind,
             body: delta.body,
             createdAt: delta.createdAt
         )
@@ -67,9 +68,14 @@ extension AppState {
         }
     }
 
-    /// Post a human "barge-in" message into a worktree's team channel. The sender
-    /// is the pane's own worktree; the daemon resolves the team root. The
-    /// resulting message also returns via the `.channelMessage` delta, so the
+    /// Post a "barge-in" message into a worktree's team channel. The sender is the
+    /// pane's own worktree (which scopes the team — the daemon resolves the team
+    /// root from it); `senderKind` carries authorship. The Thread pane passes
+    /// `.human` so the post is attributed to the user rather than to whatever
+    /// worktree they happen to be viewing, which previously made human posts
+    /// indistinguishable from that worktree's agent.
+    ///
+    /// The resulting message also returns via the `.channelMessage` delta, so the
     /// dedup in `insertChannelMessages` keeps the optimistic insert from
     /// double-appending.
     ///
@@ -79,13 +85,15 @@ extension AppState {
     /// user's typed text.
     @discardableResult
     func postChannelMessage(
-        senderWorktreeID: UUID, type: ChannelMessageType = .note, body: String
+        senderWorktreeID: UUID, type: ChannelMessageType = .note,
+        senderKind: ChannelSenderKind = .agent, body: String
     ) async -> Bool {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         do {
             let message = try await daemonClient.channelPost(
-                senderWorktreeID: senderWorktreeID, type: type, body: trimmed
+                senderWorktreeID: senderWorktreeID, type: type,
+                senderKind: senderKind, body: trimmed
             )
             insertChannelMessages([message], teamID: message.teamID)
             return true
