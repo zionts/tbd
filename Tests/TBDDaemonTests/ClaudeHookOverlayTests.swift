@@ -22,10 +22,11 @@ extension TBDHomeSerialized {
         let cmd0 = inner?.first?["command"] as? String
         #expect(cmd0?.contains("tbd session-event") == true)
 
-        // Stop entry registers `tbd notify` as the first matcher and
-        // `tbd hooks stop-rename-check` as a sibling matcher.
+        // Stop entry registers `tbd notify` as the first matcher,
+        // `tbd hooks stop-rename-check` as a sibling matcher, and
+        // `tbd hooks bench-capture` as an additive third matcher.
         let stop = hooks?["Stop"] as? [[String: Any]]
-        #expect(stop?.count == 2)
+        #expect(stop?.count == 3)
         let stopHooks = stop?.first?["hooks"] as? [[String: Any]]
         let stopCmd = stopHooks?.first?["command"] as? String
         #expect(stopCmd?.contains("tbd notify") == true)
@@ -34,6 +35,7 @@ extension TBDHomeSerialized {
             return inner.compactMap { $0["command"] as? String }
         }
         #expect(allStopCommands.contains(where: { $0.contains("stop-rename-check") }))
+        #expect(allStopCommands.contains(where: { $0.contains("bench-capture") }))
     }
 
     @Test func registersStopFailureNotifyHook() throws {

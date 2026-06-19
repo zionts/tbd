@@ -67,6 +67,14 @@ public enum ClaudeHookOverlay {
     static let stopRenameCheckCommand =
         #"tbd hooks stop-rename-check 2>/dev/null || true"#
 
+    /// Third Stop hook: auto-capture a Bench run's transcript at end-of-turn.
+    /// A strict no-op unless the session cwd holds a `.tbd-bench-run.json`
+    /// marker (dropped by `tbd bench run`), so ordinary sessions are
+    /// unaffected. Additive — independent of the notification and rename-check
+    /// Stop hooks above. Silent failure so it never wedges the agent.
+    static let stopBenchCaptureCommand =
+        #"tbd hooks bench-capture 2>/dev/null || true"#
+
     /// The shell command for the StopFailure hook. Delegates to
     /// `tbd hooks stop-failure`, which reads the verbatim API-error text from
     /// the transcript (so a session limit reads "You've hit your session limit
@@ -128,6 +136,11 @@ public enum ClaudeHookOverlay {
                     [
                         "hooks": [
                             ["type": "command", "command": stopRenameCheckCommand]
+                        ]
+                    ],
+                    [
+                        "hooks": [
+                            ["type": "command", "command": stopBenchCaptureCommand]
                         ]
                     ]
                 ],

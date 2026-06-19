@@ -66,6 +66,16 @@ public enum TBDConstants {
     }
     public static var binDir: URL { binDir(environment: ProcessInfo.processInfo.environment) }
 
+    /// Per-home `benches` directory. Follows `TBD_HOME`, so each home (tests,
+    /// CI, the developer's real config) gets an isolated benches dir. A Bench
+    /// is a persistent home for a recurring task: `$benchesDir/<name>/` holds
+    /// the runbook (`bench.md`), domain `skills/`, and one `runs/<timestamp>/`
+    /// dir per run.
+    public static func benchesDir(environment: [String: String]) -> URL {
+        configDir(environment: environment).appendingPathComponent("benches")
+    }
+    public static var benchesDir: URL { benchesDir(environment: ProcessInfo.processInfo.environment) }
+
     public static func hookPath(repoID: UUID, eventName: String, environment: [String: String]) -> String {
         reposDir(environment: environment)
             .appendingPathComponent(repoID.uuidString)
