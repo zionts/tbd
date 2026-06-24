@@ -74,6 +74,34 @@ struct PluginDirWriter {
             encoding: .utf8
         )
 
+        // Bundled `nightwatch` skill (quota-lean fleet babysitter). Ships its
+        // SKILL.md + scripts/tick.py + config/* so it works against a TBD fleet
+        // out of the box. Dormant until its description matches a babysitting task.
+        try writeNightwatch(pluginDir: pluginDir)
+
         Self.logger.info("Wrote TBD plugin at \(pluginDir, privacy: .public)")
+    }
+
+    /// Install the `nightwatch` skill into the plugin's skills dir. `tick.py`
+    /// is written with the executable bit so cron/launchd can run it directly.
+    private func writeNightwatch(pluginDir: String) throws {
+        let fm = FileManager.default
+        let root = pluginDir + "/skills/nightwatch"
+        let scripts = root + "/scripts"
+        let config = root + "/config"
+        try fm.createDirectory(atPath: scripts, withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: config, withIntermediateDirectories: true)
+
+        try NightwatchSkillContent.skillMd.write(toFile: root + "/SKILL.md", atomically: true, encoding: .utf8)
+        try NightwatchSkillContent.prioritiesTxt.write(toFile: config + "/priorities.txt", atomically: true, encoding: .utf8)
+        try NightwatchSkillContent.safeWedgesTxt.write(toFile: config + "/safe_wedges.txt", atomically: true, encoding: .utf8)
+        try NightwatchSkillContent.dontTouchTxt.write(toFile: config + "/dont_touch.txt", atomically: true, encoding: .utf8)
+
+        for (name, body) in [("tick.py", NightwatchSkillContent.tickPy),
+                             ("judge.py", NightwatchSkillContent.judgePy)] {
+            let path = scripts + "/" + name
+            try body.write(toFile: path, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        }
     }
 }
