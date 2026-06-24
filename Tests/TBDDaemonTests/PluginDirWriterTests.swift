@@ -73,6 +73,8 @@ struct PluginDirWriterTests {
         #expect(FileManager.default.fileExists(atPath: nw + "/SKILL.md"))
         #expect(FileManager.default.fileExists(atPath: tick))
         #expect(FileManager.default.fileExists(atPath: nw + "/scripts/judge.py"))
+        #expect(FileManager.default.fileExists(atPath: nw + "/scripts/scheduler.sh"))
+        #expect(FileManager.default.fileExists(atPath: nw + "/scripts/tick-cron.sh"))
         #expect(FileManager.default.fileExists(atPath: nw + "/config/priorities.txt"))
         #expect(FileManager.default.fileExists(atPath: nw + "/config/safe_wedges.txt"))
         #expect(FileManager.default.fileExists(atPath: nw + "/config/dont_touch.txt"))

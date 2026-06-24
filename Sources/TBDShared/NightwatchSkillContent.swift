@@ -2,8 +2,9 @@ import Foundation
 
 /// Canonical content for the `nightwatch` skill — a quota-lean TBD-fleet
 /// babysitter bundled into the TBD Claude plugin. Repo-agnostic core; each
-/// child repo plugs in policy via <repo>/.nightwatch/policy.json. Single
-/// source of truth, written by PluginDirWriter. Generated from the skill files.
+/// child repo plugs in policy via <repo>/.nightwatch/policy.json. The scheduler
+/// (scheduler.sh / tick-cron.sh) ships but is opt-in — never auto-loaded.
+/// Single source of truth, written by PluginDirWriter. Generated from the skill files.
 public enum NightwatchSkillContent {
 
     public static let skillMd: String = #"""
@@ -62,6 +63,21 @@ These keep the critical safety net running even when Opus is fully capped. (Curr
 ## TBD integration
 - **Read:** `~/tbd/state.db` (worktrees/terminals/`tmuxServer` per pane — pane IDs collide across servers, always read the server, never hardcode)
 - **Act:** `tbd terminal send --submit` (nudge/resolve) · `tbd worktree archive` (prune) · `tbd worktree create` (spawn)
+
+## Durable scheduling (opt-in — never auto-runs)
+
+The skill ships a model-free heartbeat but **does not start it**. Enable it deliberately:
+
+```
+scripts/scheduler.sh enable [interval_seconds]   # default 900 (15m); launchd runs tick.py
+scripts/scheduler.sh disable
+scripts/scheduler.sh status
+```
+
+When enabled, launchd runs `tick.py` on the interval ($0, no model), stays silent on exit 0,
+and on exit 10 (judgment queued) records a marker + fires `tbd notify`. This is the durable,
+quota-free replacement for waking Opus on a timer. It is intentionally NOT loaded by the
+plugin installer — you turn it on only where you want a fleet babysat.
 
 """#
 
@@ -458,6 +474,78 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""#
+
+    public static let tickCronSh: String = #"""
+#!/bin/bash
+# nightwatch heartbeat — runs the Tier-0 tick ($0, no model). Silent on exit 0;
+# on exit 10 (judgment queued) it records a marker so Opus/human is paged on exception.
+LOG=/tmp/nightwatch-tick.log
+TICK="$HOME/.claude/skills/nightwatch/scripts/tick.py"
+out=$(/usr/bin/env python3 "$TICK" 2>&1); rc=$?
+ts=$(date '+%Y-%m-%d %H:%M:%S')
+echo "[$ts] exit=$rc" >> "$LOG"
+if [ "$rc" = "10" ]; then
+  echo "$out" | grep -E "BURN-RISK|DECISIONS|PRIORITY|SATURATED" >> "$LOG"
+  echo "[$ts] >> JUDGMENT NEEDED — run: nightwatch judge" >> "$LOG"
+  command -v tbd >/dev/null && tbd notify --title "nightwatch" --message "judgment items queued" >/dev/null 2>&1 || true
+fi
+
+"""#
+
+    public static let schedulerSh: String = #"""
+#!/bin/bash
+# nightwatch scheduler — INTENTIONAL enable/disable of the model-free heartbeat.
+#
+# Nothing here auto-runs. The skill ships this script but never loads it; you opt
+# in deliberately. When enabled, a launchd job runs `tick.py` (Tier-0, $0, no model)
+# on an interval, silent on exit 0, paging you (marker + `tbd notify`) only on exit 10.
+#
+#   scheduler.sh enable [interval_seconds]   # default 900 (15m)
+#   scheduler.sh disable
+#   scheduler.sh status
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"            # .../skills/nightwatch/scripts
+LABEL="com.nightwatch-tick"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+case "${1:-}" in
+  enable)
+    INTERVAL="${2:-900}"
+    cat > "$PLIST" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>$DIR/tick-cron.sh</string>
+  </array>
+  <key>StartInterval</key><integer>$INTERVAL</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/tmp/nightwatch-tick.err</string>
+</dict></plist>
+PL
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load "$PLIST"
+    echo "nightwatch scheduler ENABLED — every ${INTERVAL}s, model-free. Disable: $0 disable"
+    ;;
+  disable)
+    launchctl unload "$PLIST" 2>/dev/null || true
+    rm -f "$PLIST"
+    echo "nightwatch scheduler DISABLED"
+    ;;
+  status)
+    if launchctl list | grep -q "$LABEL"; then
+      echo "ENABLED:"; launchctl list | grep "$LABEL"
+      tail -3 /tmp/nightwatch-tick.log 2>/dev/null
+    else
+      echo "DISABLED (not loaded)"
+    fi
+    ;;
+  *)
+    echo "usage: $0 enable [interval_seconds] | disable | status"; exit 1 ;;
+esac
 
 """#
 
