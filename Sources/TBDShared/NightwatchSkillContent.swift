@@ -149,6 +149,23 @@ def _lastmeaning(lines):
         return s[:90]
     return ""
 
+CTX_PAT = re.compile(r"(\d+)%\s*context used")
+COMPACT_PAT = re.compile(r"(\d+)%\s*until auto-compact")
+def burn_risk(cap):
+    """The dominant quota driver is token WEIGHT per request: a session dragging a
+    near-full context window (esp. 1M Opus) sends up to ~1M input tokens EVERY request.
+    Flag agents at high context — they incinerate the weekly cap fastest. Returns
+    (pct:int|None, is_1m:bool, risk:bool)."""
+    pct = None
+    m = CTX_PAT.search(cap)
+    if m: pct = int(m.group(1))
+    else:
+        c = COMPACT_PAT.search(cap)
+        if c: pct = 100 - int(c.group(1))
+    is_1m = "opus[1m]" in cap or "[1m]" in cap
+    risk = pct is not None and pct >= 85
+    return pct, is_1m, risk
+
 def _composer(lines):
     for i, x in enumerate(lines):
         if "bypass permissions" in x and i > 0:
@@ -194,6 +211,7 @@ def fleet():
         pane, name, srv, tid, rid = p
         cap = sh(["tmux","-L",srv,"capture-pane","-p","-t",pane])
         state, note = classify(cap)
+        ctx_pct, is_1m, burn = burn_risk(cap)
         hook = POLICIES.get(rid, {})
         pol = hook.get("policy", {})
         # priorities/dont-touch are the UNION of global config + the repo's own hook
@@ -204,7 +222,8 @@ def fleet():
         out.append({"pane": pane, "name": name, "server": srv, "tid": tid,
                     "state": state, "note": note, "priority": prio, "protected": protect,
                     "repo": hook.get("name"), "gate": pol.get("gate", {}).get("ready_when"),
-                    "advance_skill": pol.get("advance_skill"), "deploy_skill": pol.get("deploy_skill")})
+                    "advance_skill": pol.get("advance_skill"), "deploy_skill": pol.get("deploy_skill"),
+                    "ctx_pct": ctx_pct, "is_1m": is_1m, "burn_risk": burn})
     return out
 
 def main():
@@ -284,6 +303,13 @@ def main():
     if decisions:
         print("DECISIONS (need judgment → queued):")
         for a in decisions: print(f"  ▸ {a['name']} ({a['server']} {a['pane']}): {a['note'][:70]}")
+    burners = sorted([a for a in rep["agents"] if a.get("burn_risk")],
+                     key=lambda a: -(a.get("ctx_pct") or 0))
+    if burners:
+        print(f"🔥 BURN-RISK ({len(burners)} at ctx≥85% — top quota drivers, weight not count):")
+        for a in burners[:8]:
+            print(f"  · {a['name']} ({a['pane']}): {a['ctx_pct']}% ctx{' [1M]' if a['is_1m'] else ''}"
+                  f" — {'compact/clear' if a['ctx_pct']>=95 else 'watch'}")
     if auto:
         print(f"AUTO (Tier-0 safe, {len(auto)}):")
         for x in auto: print(f"  · {x['kind']}: {x['name']} ({x['pane']})")
