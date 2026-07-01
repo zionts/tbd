@@ -660,16 +660,44 @@ public struct TokenUsage: Codable, Sendable, Equatable, Hashable {
     public let inputTokens: Int
     public let cacheCreationTokens: Int
     public let cacheReadTokens: Int
+    /// Model id from `message.model` on the same assistant JSONL line
+    /// (e.g. `claude-opus-4-8`). Used to derive the context-window
+    /// denominator — see `ClaudeContextWindow`. Optional so JSON produced
+    /// by older daemons still decodes.
+    public let model: String?
 
-    public init(inputTokens: Int, cacheCreationTokens: Int, cacheReadTokens: Int) {
+    public init(inputTokens: Int, cacheCreationTokens: Int, cacheReadTokens: Int, model: String? = nil) {
         self.inputTokens = inputTokens
         self.cacheCreationTokens = cacheCreationTokens
         self.cacheReadTokens = cacheReadTokens
+        self.model = model
     }
 
     /// Total prompt size for this request — what `/context` reports.
     public var contextTotal: Int {
         inputTokens + cacheCreationTokens + cacheReadTokens
+    }
+}
+
+/// Maps a Claude model id to its context-window size in tokens.
+///
+/// Shared between the transcript viewer and any future hook scripts so
+/// both agree on the denominator (docs/transcript-context-usage.md,
+/// "Window size is model-dependent"). Deliberately permissive — model ids
+/// evolve, so we match on the `claude` prefix rather than a hardcoded list.
+public enum ClaudeContextWindow {
+    /// Standard context window for current Claude models.
+    public static let standardLimit = 200_000
+    /// Extended (1M-context beta) window. The beta flag is invisible in the
+    /// transcript — the model string doesn't change — so callers infer it
+    /// when observed usage exceeds `standardLimit`.
+    public static let extendedLimit = 1_000_000
+
+    /// Nominal window for the given model id, or nil when unknown
+    /// (nil / non-Claude model, or Claude Code's `<synthetic>` placeholder).
+    public static func limit(forModel model: String?) -> Int? {
+        guard let model, model.lowercased().hasPrefix("claude") else { return nil }
+        return standardLimit
     }
 }
 

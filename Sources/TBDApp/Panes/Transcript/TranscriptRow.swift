@@ -58,7 +58,7 @@ struct TranscriptRow: View {
         if let usage = node.badgeUsage {
             VStack(alignment: .leading, spacing: 2) {
                 content
-                ContextUsageBadge(total: usage.contextTotal)
+                ContextUsageBadge(total: usage.contextTotal, model: usage.model)
                     .padding(.leading, 12)
                     .padding(.top, 2)
             }

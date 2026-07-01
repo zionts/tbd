@@ -250,10 +250,16 @@ enum TranscriptParser {
         // for those sessions.
         let cacheCreation = usage["cache_creation_input_tokens"] as? Int ?? 0
         let cacheRead = usage["cache_read_input_tokens"] as? Int ?? 0
+        // `message.model` feeds the context-window denominator. Claude Code
+        // writes the literal placeholder "<synthetic>" on API-error lines —
+        // treat it as no model.
+        var model = message["model"] as? String
+        if model == "<synthetic>" { model = nil }
         return TokenUsage(
             inputTokens: input,
             cacheCreationTokens: cacheCreation,
-            cacheReadTokens: cacheRead
+            cacheReadTokens: cacheRead,
+            model: model
         )
     }
 

@@ -452,6 +452,34 @@ struct TranscriptParserTests {
         #expect(usage?.cacheCreationTokens == 1000)
         #expect(usage?.cacheReadTokens == 40000)
         #expect(usage?.contextTotal == 41005)
+        #expect(usage?.model == nil, "no model key on the line means TokenUsage.model is nil")
+    }
+
+    @Test func extracts_model_alongside_usage() throws {
+        let line = """
+        {"type":"assistant","uuid":"a1","timestamp":"2026-05-05T10:00:00Z","message":{"role":"assistant","model":"claude-fable-5","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":5,"cache_creation_input_tokens":1000,"cache_read_input_tokens":40000,"output_tokens":7}}}
+        """
+        let tmp = try writeTempJSONL(line)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+        let items = TranscriptParser.parse(filePath: tmp)
+        #expect(items.count == 1)
+        #expect(items[0].usage?.model == "claude-fable-5")
+    }
+
+    @Test func synthetic_model_placeholder_treated_as_nil() throws {
+        // Claude Code writes the literal "<synthetic>" model on API-error
+        // lines — it must not be surfaced as a real model id.
+        let line = """
+        {"type":"assistant","uuid":"a1","timestamp":"2026-05-05T10:00:00Z","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API error"}],"usage":{"input_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}
+        """
+        let tmp = try writeTempJSONL(line)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+        let items = TranscriptParser.parse(filePath: tmp)
+        #expect(items.count == 1)
+        #expect(items[0].usage != nil, "usage itself should still be extracted")
+        #expect(items[0].usage?.model == nil)
     }
 
     @Test func usage_stamped_on_every_item_from_same_assistant_line() throws {

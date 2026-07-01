@@ -108,4 +108,39 @@ struct TranscriptItemTests {
         #expect(decoded.truncatedTo == 50_000)
         #expect(decoded.isError == false)
     }
+
+    @Test func tokenUsage_decodes_json_without_model_key() throws {
+        // Back-compat guard for the daemon→app RPC: JSON serialized before
+        // the `model` field existed must still decode.
+        let legacyJSON = Data(#"{"inputTokens":5,"cacheCreationTokens":1000,"cacheReadTokens":40000}"#.utf8)
+        let decoded = try JSONDecoder().decode(TokenUsage.self, from: legacyJSON)
+        #expect(decoded.model == nil)
+        #expect(decoded.contextTotal == 41_005)
+    }
+
+    @Test func tokenUsage_roundtrips_model() throws {
+        let original = TokenUsage(inputTokens: 1, cacheCreationTokens: 2, cacheReadTokens: 3, model: "claude-fable-5")
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(TokenUsage.self, from: data)
+        #expect(decoded == original)
+        #expect(decoded.model == "claude-fable-5")
+    }
+}
+
+@Suite("ClaudeContextWindow")
+struct ClaudeContextWindowTests {
+    @Test func claude_prefixed_models_map_to_standard_window() {
+        #expect(ClaudeContextWindow.limit(forModel: "claude-fable-5") == 200_000)
+        #expect(ClaudeContextWindow.limit(forModel: "claude-opus-4-8") == 200_000)
+        #expect(ClaudeContextWindow.limit(forModel: "claude-sonnet-4-6") == 200_000)
+        // Prefix match is case-insensitive and permissive about suffixes.
+        #expect(ClaudeContextWindow.limit(forModel: "Claude-Future-9") == 200_000)
+    }
+
+    @Test func unknown_models_map_to_nil() {
+        #expect(ClaudeContextWindow.limit(forModel: nil) == nil)
+        #expect(ClaudeContextWindow.limit(forModel: "<synthetic>") == nil)
+        #expect(ClaudeContextWindow.limit(forModel: "gpt-5") == nil)
+        #expect(ClaudeContextWindow.limit(forModel: "") == nil)
+    }
 }
