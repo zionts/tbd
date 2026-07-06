@@ -103,6 +103,11 @@ struct ModelProfileRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if let usageLine {
+                Text(usageLine)
+                    .font(.caption)
+                    .foregroundStyle(Color(nsColor: .secondaryLabelColor))
+            }
         }
         .contentShape(Rectangle())
         .confirmationDialog("Delete profile?", isPresented: $showDeleteConfirm, titleVisibility: .visible) {
@@ -128,6 +133,12 @@ struct ModelProfileRow: View {
     }
 
     private var endpointCaption: String? { profile.detailCaption }
+
+    /// Per-account usage summary shown under the identity/endpoint caption,
+    /// reusing `ModelProfileUsage.usageLine` so the format matches everywhere
+    /// usage is rendered. `nil` (no line) for profiles that carry no usage
+    /// snapshot — e.g. Bedrock/proxy profiles, which have no usage concept.
+    private var usageLine: String? { usage?.usageLine() }
 
     @ViewBuilder
     private var nameView: some View {
