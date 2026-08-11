@@ -27,10 +27,16 @@
 #   - never `jobs -p` (job control is off in a non-interactive shell)
 #   - never `trap 'kill 0'` (signals this shell's own process group)
 #   - never `pkill -f <pattern>` (matches sibling worktrees' identical bundles)
+#   - the deadline kills the iteration's whole process TREE, leaves first, by
+#     walking `pgrep -P` from the captured pid — one level would orphan the
+#     grandchild swift-frontend / test bundle under scripts/test.sh
 #   - post-cleanup verification is `ps -p <captured pid>`, never `pgrep -x yes`
 #   - trap on INT/TERM as well as EXIT, so an externally killed run still cleans up
 
 set -uo pipefail
+
+# Absolute, so the wrapper is found regardless of the caller's cwd.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # target|swift-test-filter-args|floor|issue|description
 #
@@ -60,6 +66,9 @@ DEFAULT_ITERATIONS=10
 # its own much smaller count. Sized from the step budget, not from ambition.
 WHOLE_TARGET_ITERATIONS=3
 ITERATION_DEADLINE_S=600
+BUILD_DEADLINE_S=1800
+SWIFT_LOCK_TIMEOUT_S=1800
+SWIFT_DEADLINE_GRACE_S=30
 
 SPINNER_PIDS=()
 REPORT_DIR=""
@@ -107,6 +116,27 @@ trap cleanup EXIT INT TERM
 
 # --- bounded execution --------------------------------------------------------
 
+# Every descendant of $1, deepest first, one PID per line. `pgrep -P` walks the
+# parent-PID edge only — it is NOT `pkill -f <pattern>`, which matches a sibling
+# worktree's identically-named bundles (Tests/CLAUDE.md "The kill hazards").
+descendants_of() {
+  local pid="$1" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    descendants_of "$child"
+    echo "$child"
+  done
+}
+
+# Signal $1 to the whole tree rooted at $2, leaves first so nothing is orphaned
+# by the death of its parent.
+kill_tree() {
+  local sig="$1" root="$2" pid
+  for pid in $(descendants_of "$root"); do
+    kill "-$sig" "$pid" 2>/dev/null
+  done
+  kill "-$sig" "$root" 2>/dev/null
+}
+
 # Run a command with an OUTER deadline. `.clockDriven` was measured failing to
 # bound a hang (it sat past 10 minutes with the trait applied), so a stress
 # harness cannot delegate its hang-guard to a test trait. Returns 124 on deadline.
@@ -117,13 +147,14 @@ run_with_deadline() {
   local waited=0
   while kill -0 "$pid" 2>/dev/null; do
     if [[ "$waited" -ge "$deadline_s" ]]; then
-      # Children first: killing the parent orphans them, and an orphaned
-      # swift-frontend keeps burning the CPU this harness is trying to control.
-      pkill -P "$pid" 2>/dev/null
-      kill -TERM "$pid" 2>/dev/null
+      # The WHOLE tree, not `pkill -P "$pid"`. $pid is `scripts/test.sh`, so
+      # `swift test` is its child and swift-frontend / the test bundle are
+      # GRANDchildren — one level of `pkill -P` leaves exactly the CPU burners
+      # this harness exists to control orphaned to launchd. Re-enumerated
+      # before the KILL pass because the TERM pass reparents survivors.
+      kill_tree TERM "$pid"
       sleep 2
-      pkill -P "$pid" 2>/dev/null
-      kill -KILL "$pid" 2>/dev/null
+      kill_tree KILL "$pid"
       wait "$pid" 2>/dev/null
       return 124
     fi
@@ -132,6 +163,41 @@ run_with_deadline() {
   done
   wait "$pid"
   return $?
+}
+
+governed_outer_deadline() {
+  local command_deadline_s="$1"
+  echo $((SWIFT_LOCK_TIMEOUT_S + command_deadline_s + SWIFT_DEADLINE_GRACE_S))
+}
+
+# The command deadline starts only after swift-safe wins the machine-global
+# compile slot. The outer harness deadline must therefore cover both phases;
+# otherwise ordinary contention is mislabeled as a wedged test.
+run_governed_swift() {
+  local command_deadline_s="$1" log="$2"; shift 2
+  local outer_deadline_s; outer_deadline_s="$(governed_outer_deadline "$command_deadline_s")"
+  run_with_deadline "$outer_deadline_s" "$log" env \
+    TBD_SWIFT_LOCK_TIMEOUT_SECONDS="$SWIFT_LOCK_TIMEOUT_S" \
+    "$SCRIPT_DIR/swift-safe" "$@"
+}
+
+# Same governance as `run_governed_swift`, but through `scripts/test.sh` so the
+# run is also fenced off the developer's real `~/tbd`, `~/.claude` and
+# `~/.codex`. The two wrappers are orthogonal and stack: `test.sh` sets the
+# fence, pins `TBD_SWIFT_LOCK_PATH` at the shared machine-global lock so its
+# scratch `TBD_HOME` cannot turn that lock private, and then invokes SwiftPM via
+# `swift-safe` — so the admission lock and the lock-timeout env var below apply
+# exactly as they do to `run_governed_swift`. That matters most here: an
+# iteration that took a private lock would run its whole compile alongside every
+# sibling worktree's, which is the load this harness is trying to CONTROL rather
+# than add to. This harness is documented for local use, where an unfenced run
+# would write into the real config dirs.
+run_governed_fenced() {
+  local command_deadline_s="$1" log="$2"; shift 2
+  local outer_deadline_s; outer_deadline_s="$(governed_outer_deadline "$command_deadline_s")"
+  run_with_deadline "$outer_deadline_s" "$log" env \
+    TBD_SWIFT_LOCK_TIMEOUT_SECONDS="$SWIFT_LOCK_TIMEOUT_S" \
+    "$SCRIPT_DIR/test.sh" "$@"
 }
 
 # The 1-MINUTE load average, which LAGS: measured here, the first iterations
@@ -151,7 +217,7 @@ judge_iteration() {
   count="$(grep -oE 'Test run with [0-9]+ tests?' "$log" | grep -oE '[0-9]+' | head -1)"
 
   if [[ "$rc" -eq 124 ]]; then
-    echo "FAIL wedged — no completion within ${ITERATION_DEADLINE_S}s (killed by the harness deadline)"
+    echo "FAIL wedged — no completion within the governed outer deadline (lock wait + ${ITERATION_DEADLINE_S}s execution budget + grace)"
     return
   fi
   # A TRUNCATED LOG IS A FAILURE, NOT A PASS. A wedged run exits with no summary
@@ -197,8 +263,15 @@ run_target() {
     log="$work_dir/$name-$i.log"
     load_before="$(loadavg)"
     local rc=0
+    # Through scripts/test.sh, not bare `swift test`: this script's documented
+    # use is LOCAL reproduction under induced load, where a bare run writes into
+    # the developer's real ~/tbd and ~/.claude. `--no-fingerprint` for the same
+    # reason the pre-push hook uses it — a live daemon writes to ~/tbd
+    # legitimately across the many minutes these iterations take, so the
+    # detection layer would report the machine rather than the run. The fence,
+    # which is what actually prevents the leak, is always on.
     # shellcheck disable=SC2086 # $filter is a deliberately word-split arg list
-    run_with_deadline "$ITERATION_DEADLINE_S" "$log" swift test $filter || rc=$?
+    run_governed_fenced "$ITERATION_DEADLINE_S" "$log" --no-fingerprint $filter || rc=$?
     verdict="$(judge_iteration "$rc" "$log" "$floor")"
     if [[ "$verdict" == PASS* ]]; then
       pass_counts+=("${verdict#PASS }")
@@ -222,8 +295,8 @@ run_target() {
     echo
     echo "- Machine: $(sysctl -n hw.ncpu 2>/dev/null || nproc) cores, ${#SPINNER_PIDS[@]} induced spinners, load1m now: $(loadavg)"
     echo "  (\`load1m\` is the 1-minute average and LAGS the induced load — early iterations under-report it. The spinner count is the reliable half.)"
-    echo "- Filter: \`swift test $filter\`, executed-test floor $floor"
-    echo "- Iteration deadline: ${ITERATION_DEADLINE_S}s (an outer timeout — \`.clockDriven\` was measured NOT bounding a hang)"
+    echo "- Filter: \`scripts/test.sh --no-fingerprint $filter\`, executed-test floor $floor"
+    echo "- Execution budget: ${ITERATION_DEADLINE_S}s after admission; lock wait: up to ${SWIFT_LOCK_TIMEOUT_S}s; outer backstop: $(governed_outer_deadline "$ITERATION_DEADLINE_S")s"
     echo
     echo "Signatures:"
     echo
@@ -266,8 +339,9 @@ main() {
   # Build ONCE up front so the first iteration's timing is not dominated by the
   # compile. `swift build` alone does NOT build test targets — `--build-tests` does.
   echo
-  echo "building test targets (swift build --build-tests -j 2)…"
-  if ! run_with_deadline 1800 "$work_dir/build.log" swift build --build-tests -j 2; then
+  echo "building test targets (swift-safe build --build-tests -j 2)…"
+  if ! run_governed_swift "$BUILD_DEADLINE_S" "$work_dir/build.log" \
+    build --build-tests -j 2; then
     echo "nightly-flake-stress: BUILD FAILED — see $work_dir/build.log" >&2
     tail -30 "$work_dir/build.log" >&2
     exit 2

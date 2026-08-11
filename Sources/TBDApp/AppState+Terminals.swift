@@ -257,12 +257,20 @@ extension AppState {
     }
 
     /// Send text to a terminal.
+    ///
+    /// The daemon now refuses a send whose pane is gone, dead, or has been
+    /// reused by a different session, so this can fail for a reason the user
+    /// can act on ("recreate the window"). `handleConnectionError` only flips
+    /// the connected flag for disconnects, which would leave such a refusal
+    /// invisible — so it is surfaced the way this file's sibling failures are,
+    /// as an error alert carrying the daemon's own message.
     func sendToTerminal(terminalID: UUID, text: String) async {
         do {
             try await daemonClient.sendToTerminal(terminalID: terminalID, text: text)
         } catch {
             logger.error("Failed to send to terminal: \(error)")
             handleConnectionError(error)
+            showAlert("Couldn't send to terminal: \(error.localizedDescription)", isError: true)
         }
     }
 
@@ -344,6 +352,41 @@ extension AppState {
             tabs[worktreeID, default: []].append(tab)
         } catch {
             logger.error("Failed to create Codex terminal: \(error)")
+            handleConnectionError(error)
+        }
+    }
+
+    /// Import a Claude transcript through Codex's native app-server surface,
+    /// then select the ordinary Codex tab created by the daemon.
+    func continueInCodex(sourceTerminalID: UUID) async {
+        guard let source = terminals.values
+            .flatMap({ $0 })
+            .first(where: { $0.id == sourceTerminalID }) else {
+            showAlert("Couldn't continue in Codex: source terminal not found.", isError: true)
+            return
+        }
+
+        do {
+            let result = try await daemonClient.continueInCodex(
+                terminalID: sourceTerminalID)
+            let rows = try await daemonClient.listTerminals(
+                worktreeID: source.worktreeID)
+            guard let terminal = rows.first(where: { $0.id == result.terminalID }) else {
+                throw DaemonClientError.invalidResponse
+            }
+            appendCreatedTerminal(terminal)
+            if let index = tabs[source.worktreeID]?.firstIndex(where: { tab in
+                (layouts[tab.id] ?? .pane(tab.content))
+                    .allTerminalIDs().contains(terminal.id)
+            }) {
+                setActiveTab(worktreeID: source.worktreeID, tabIndex: index)
+            }
+        } catch {
+            logger.error(
+                "Continue in Codex failed: \(error.localizedDescription, privacy: .public)")
+            showAlert(
+                "Couldn't continue in Codex: \(error.localizedDescription)",
+                isError: true)
             handleConnectionError(error)
         }
     }

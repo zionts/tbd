@@ -2,6 +2,7 @@ import Testing
 import Foundation
 @testable import TBDDaemonLib
 @testable import TBDShared
+import TestSupport
 
 /// Thread-safe collector for broadcast StateDeltas. Mirrors the pattern in
 /// `RemoteProviderManagerTests`'s private `BroadcastDeltas` (not reusable
@@ -64,7 +65,7 @@ struct RPCRouterRemoteTests: ~Copyable {
             tmux: TmuxManager(dryRun: true),
             startTime: Date(),
             subscriptions: subs,
-            remoteManager: manager)
+            remoteManager: manager, actuationLog: makeTestActuationLog())
     }
 
     private func router(invoker: FakeProviderInvoker) -> RPCRouter {
@@ -117,6 +118,94 @@ struct RPCRouterRemoteTests: ~Copyable {
         #expect(response.success)
         let result = try response.decodeResult(RemoteSessionsResult.self)
         #expect(result.sessions.map(\.payload.id) == ["a"])
+    }
+
+    @Test func sessionsProjectsCachedActiveRowsUnknownAfterInventoryFailure() async throws {
+        try await db.config.setRemoteBackendsEnabled(true)
+        let invoker = FakeProviderInvoker(script: [
+            providerOK(#"{"sessions": [{"id": "a", "state": "running", "agent_state": "working"}]}"#),
+            ProviderResult(exitCode: 3, stdout: Data(), stderr: "inventory unavailable"),
+        ])
+        let manager = RemoteProviderManager(
+            db: db, subscriptions: subs, runner: invoker, registryURL: registryURL)
+        let provider = RemoteProviderConfig(name: "fake", exec: "/x")
+        await manager.pollOnce(provider: provider)
+        await manager.pollOnce(provider: provider)
+
+        let response = await call(router(manager: manager), "remote.sessions")
+        let result = try response.decodeResult(RemoteSessionsResult.self)
+        let projected = try #require(result.sessions.first?.payload)
+        #expect(projected.state == .unknown)
+        #expect(projected.agentState == .unknown)
+
+        // Projection is non-destructive: recovery still has the complete
+        // last-good payload to replace or inspect.
+        let rawRows = try await db.remoteSessions.list()
+        let raw = rawRows.first?.decodedPayload
+        #expect(raw?.state == .running)
+        #expect(raw?.agentState == .working)
+    }
+
+    /// The display projection and the mutation gate must agree even when the
+    /// persisted freshness row is unreadable. They previously did not: the gate
+    /// failed closed off the actor's own state while `remote.sessions` consulted
+    /// the DTO, whose `lastSuccessfulSnapshotAt` is nil after a failed read — so
+    /// cached rows kept rendering as confidently `running` in exactly the case
+    /// the daemon knew the least. Dropping `tbd_meta` makes the SELECT throw.
+    @Test func sessionsDemoteCachedRowsWhenFreshnessRowIsUnreadable() async throws {
+        try await db.config.setRemoteBackendsEnabled(true)
+        _ = try await db.remoteSessions.applySnapshot(
+            provider: "fake",
+            sessions: [RemoteSessionPayload(id: "a", state: .running, agentState: .working)],
+            now: Date(timeIntervalSince1970: 1_700_000_000))
+        try await db.writerForTests.write { conn in
+            try conn.execute(sql: "DROP TABLE tbd_meta")
+        }
+        let manager = RemoteProviderManager(
+            db: db, subscriptions: subs,
+            runner: FakeProviderInvoker(script: [
+                ProviderResult(exitCode: 3, stdout: Data(), stderr: "inventory unavailable")
+            ]),
+            registryURL: registryURL)
+        await manager.pollOnce(provider: RemoteProviderConfig(name: "fake", exec: "/x"))
+        let r = router(manager: manager)
+
+        let response = await call(r, "remote.sessions")
+        let result = try response.decodeResult(RemoteSessionsResult.self)
+        let projected = try #require(result.sessions.first?.payload)
+        #expect(projected.state == .unknown)
+        #expect(projected.agentState == .unknown)
+
+        // And the gate the projection is supposed to match still refuses.
+        let stop = await call(r, "remote.stop", #"{"provider":"fake","sessionID":"a"}"#)
+        #expect(stop.success == false)
+        #expect(stop.error?.contains("inventory is stale") == true)
+    }
+
+    @Test func staleInventoryBlocksMutationsButKeepsLogInspectionAvailable() async throws {
+        try await db.config.setRemoteBackendsEnabled(true)
+        let invoker = FakeProviderInvoker(script: [
+            providerOK(#"{"sessions": [{"id": "a", "state": "running"}]}"#),
+            ProviderResult(exitCode: 3, stdout: Data(), stderr: "inventory unavailable"),
+            providerOK("last output"),
+        ])
+        let manager = RemoteProviderManager(
+            db: db, subscriptions: subs, runner: invoker, registryURL: registryURL)
+        let provider = RemoteProviderConfig(name: "fake", exec: "/x")
+        await manager.pollOnce(provider: provider)
+        await manager.pollOnce(provider: provider)
+        let r = router(manager: manager)
+
+        let stop = await call(r, "remote.stop", #"{"provider":"fake","sessionID":"a"}"#)
+        #expect(stop.success == false)
+        #expect(stop.error?.contains("inventory is stale") == true)
+
+        let log = await call(r, "remote.log", #"{"provider":"fake","sessionID":"a"}"#)
+        #expect(log.success)
+        #expect(try log.decodeResult(RemoteLogResult.self).text == "last output")
+        #expect(invoker.calls == [["list"], ["list"], ["log", "a"]])
+        #expect(await manager.providerStatuses().first?.health == .stale,
+                "a successful read-only verb must not claim inventory recovered")
     }
 
     /// `remote.sessions` must surface the daemon's pinned repo resolution on
@@ -261,6 +350,45 @@ struct RPCRouterRemoteTests: ~Copyable {
             #"{"provider": "fake", "paramsJSON": "{}"}"#)
         #expect(response.success == false)
         #expect(response.error?.contains("branch required") == true)
+    }
+
+    /// A provider that exits 0 and hands back a truncated payload has failed at
+    /// the transport, however healthy its exit code looks. The decode throw
+    /// must confirm the request row as `transport-failed` — an unconfirmed row
+    /// is indistinguishable from a lost outcome — and still surface unchanged
+    /// to the caller.
+    @Test func createRecordsTransportFailureWhenTheProviderPayloadDoesNotDecode() async throws {
+        try await db.config.setRemoteBackendsEnabled(true)
+        let logPath = dir.appendingPathComponent("create-decode-actuations.jsonl").path
+        let manager = RemoteProviderManager(
+            db: db, subscriptions: subs,
+            runner: FakeProviderInvoker(script: [providerOK(#"{"id": "new-1", "sta"#)]),
+            registryURL: registryURL)
+        let r = RPCRouter(
+            db: db,
+            lifecycle: WorktreeLifecycle(
+                db: db, git: GitManager(), tmux: TmuxManager(dryRun: true), hooks: HookResolver()),
+            tmux: TmuxManager(dryRun: true),
+            startTime: Date(),
+            subscriptions: subs,
+            remoteManager: manager, actuationLog: ActuationLog(path: logPath))
+
+        let response = await call(r, "remote.create", #"{"provider": "fake", "paramsJSON": "{}"}"#)
+        #expect(response.success == false)
+
+        let written = try String(contentsOfFile: logPath, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { line in
+                try #require(
+                    try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+            }
+        #expect(written.count == 2)
+        #expect(written.first?["kind"] as? String == "spawn")
+        #expect(written.first?["method"] as? String == "remote.create")
+        let outcome = try #require(written.last)
+        #expect(outcome["kind"] as? String == "outcome")
+        #expect(outcome["confirms"] as? String == written.first?["id"] as? String)
+        #expect(outcome["result"] as? String == "transport-failed")
     }
 
     @Test func logDecodesRawBytes() async throws {

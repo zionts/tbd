@@ -27,6 +27,7 @@ public final class TBDDatabase: Sendable {
     public let terminalHistory: TerminalHistoryStore
     public let panelSurface: PanelSurfaceStore
     public let remoteSessions: RemoteSessionStore
+    public let watchDeskLeases: WatchDeskLeaseStore
 
     private static let logger = Logger(subsystem: "com.tbd.daemon", category: "migrations")
 
@@ -66,6 +67,7 @@ public final class TBDDatabase: Sendable {
         self.terminalHistory = TerminalHistoryStore(writer: pool, historyDir: terminalHistoryDir)
         self.panelSurface = PanelSurfaceStore(writer: pool)
         self.remoteSessions = RemoteSessionStore(writer: pool)
+        self.watchDeskLeases = WatchDeskLeaseStore(writer: pool)
 
         let migrator = Self.buildMigrator()
         if fileExisted {
@@ -105,6 +107,7 @@ public final class TBDDatabase: Sendable {
         self.terminalHistory = TerminalHistoryStore(writer: queue, historyDir: terminalHistoryDir)
         self.panelSurface = PanelSurfaceStore(writer: queue)
         self.remoteSessions = RemoteSessionStore(writer: queue)
+        self.watchDeskLeases = WatchDeskLeaseStore(writer: queue)
         try Self.buildMigrator().migrate(queue)
     }
 
@@ -271,6 +274,16 @@ public final class TBDDatabase: Sendable {
             // when the Conductor feature was deleted; the literal values are
             // preserved here so this historical migration still produces an
             // identical schema for the v24 cleanup step to act on.
+            //
+            // The hand-built `$HOME/tbd/conductors` below is a deliberate
+            // exception to "derive every TBD-owned path from TBDConstants"
+            // (CLAUDE.md, "Tests must not touch ~/tbd"), and must stay
+            // hand-built. It is a STRING WRITTEN INTO A ROW, not a filesystem
+            // access: nothing is created or read at that path, and v24 deletes
+            // the row again. Routing it through `TBDConstants` would make a
+            // frozen migration produce different bytes under `TBD_HOME`, which
+            // is exactly what "never modify an existing migration" forbids.
+            // Leave it alone.
             try db.execute(
                 sql: """
                 INSERT OR IGNORE INTO repo (id, path, displayName, defaultBranch, createdAt)
@@ -278,6 +291,7 @@ public final class TBDDatabase: Sendable {
                 """,
                 arguments: [
                     "00000000-0000-0000-0000-000000000001",
+                    // swiftlint:disable:next no_home_relative_store_path - frozen migration; see comment above
                     FileManager.default.homeDirectoryForCurrentUser
                         .appendingPathComponent("tbd")
                         .appendingPathComponent("conductors").path,
@@ -1165,6 +1179,43 @@ public final class TBDDatabase: Sendable {
         migrator.registerMigration("v67_worktree_foreign_head") { db in
             try db.addColumnIfMissing(
                 table: "worktree", column: "foreign_head",
+                type: .boolean, defaults: false)
+        }
+
+        migrator.registerMigration("v68_watch_desk_judge_lease") { db in
+            try db.addColumnIfMissing(
+                table: "terminal", column: "watch_desk_role", type: .text,
+                defaults: DatabaseValue.null)
+            try db.createTableIfNotExists("watch_desk_judge_lease") { t in
+                t.primaryKey("worktree_id", .text).notNull()
+                    .references("worktree", onDelete: .cascade)
+                // Deliberately not an FK: a dead terminal row may be deleted,
+                // but its generation tombstone must survive so fencing tokens
+                // are never reused for this desk.
+                t.column("terminal_id", .text).notNull()
+                t.column("token", .text).notNull()
+                t.column("generation", .integer).notNull()
+                t.column("acquired_at", .datetime).notNull()
+                t.column("renewed_at", .datetime).notNull()
+                t.column("expires_at", .datetime).notNull()
+            }
+        }
+
+        // Soak flag for delivery acknowledgement (fleet-supervision design
+        // §12). Default false, following the `hibernate_input_veto_enabled`
+        // (v51) / `control_mode_enabled` precedent rather than the v39/v50
+        // cautionary one: the re-check acts on no user gesture and its retry
+        // types into a live session, so the whole path ships off and is opted
+        // into for its soak. Shipping OFF also means no forcing `UPDATE`
+        // migration is ever needed to flip the default later.
+        //
+        // The flag does not gate the dispatch envelope — attribution rides
+        // every text send to an agent regardless, verified or not (§12).
+        // Whether a target gets one at all is a property of the target: a shell
+        // would execute the tag, so it receives the text alone.
+        migrator.registerMigration("v69_config_delivery_verification") { db in
+            try db.addColumnIfMissing(
+                table: "config", column: "delivery_verification_enabled",
                 type: .boolean, defaults: false)
         }
 

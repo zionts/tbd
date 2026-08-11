@@ -11,6 +11,13 @@ public protocol DeskSessionManaging: Sendable {
     func nudgeDeskSession(worktreeID: UUID, act: Bool) async
     func postShiftWrapUp(worktreeID: UUID) async
     func closeDeskSession() async
+    func releaseJudgeLease(worktreeID: UUID) async
+    func maintainJudgeLease(worktreeID: UUID) async
+}
+
+public extension DeskSessionManaging {
+    func releaseJudgeLease(worktreeID: UUID) async {}
+    func maintainJudgeLease(worktreeID: UUID) async {}
 }
 
 /// Manages the persistent "Watch Desk" scratch space for daywatch/nightwatch operations.
@@ -26,6 +33,14 @@ public actor DeskSessionManager: DeskSessionManaging {
     /// immediately (matching RPCRouter+ScratchHandlers) instead of waiting for a poll.
     private let subscriptions: StateSubscriptionManager?
     private let skillDir: String
+    /// Date seam for the nudge-overlap guard — a compared timestamp, so per
+    /// `Tests/CLAUDE.md` this is the `now:` shape, not an injected `Clock`.
+    /// Without it the 10-minute window is unreachable in a test, which is why the
+    /// guard went so long with no observable beyond "doesn't throw".
+    private let now: @Sendable () -> Date
+    /// The daemon's actuation record. The desk's pastes bypass the RPC router,
+    /// so this rail writes its own rows.
+    private let actuationLog: ActuationLog
 
     // MARK: - State
 
@@ -65,6 +80,24 @@ public actor DeskSessionManager: DeskSessionManaging {
     /// M2: nudge-overlap guard. Phase B upgrade: claim-file (queue/claims) single-driver enforcement.
     private var lastNudgeTime: Date?
 
+    /// Mode carried by the last nudge that actually reached the session.
+    ///
+    /// The judge is told to read `JUDGE-INSTRUCTIONS.md` once rather than every
+    /// tick, so *someone* has to notice when the body it memorized stops matching
+    /// the body on disk. The desk is deliberately reused across daywatch ↔
+    /// nightwatch without respawning (see `ensureDeskSession`), and the two bodies
+    /// differ on exactly the thing that matters — whether an unattended
+    /// `gh pr merge` is authorized. `nil` means nothing has been nudged yet, which
+    /// is treated the same as changed: a judge with no reads is a judge that must read.
+    ///
+    /// Internal rather than private so tests can assert the transition; it is state
+    /// the manager needs regardless.
+    private(set) var lastNudgedMode: NightwatchMode?
+
+    /// Deduplicates the fail-closed notification for one conflicting owner
+    /// generation. A new generation is a new incident and notifies again.
+    private var notifiedContentionGeneration: Int64?
+
     // MARK: - Init
 
     public init(
@@ -72,13 +105,17 @@ public actor DeskSessionManager: DeskSessionManaging {
         lifecycle: WorktreeLifecycle,
         tmux: TmuxManager,
         skillDir: String,
-        subscriptions: StateSubscriptionManager? = nil
+        subscriptions: StateSubscriptionManager? = nil,
+        now: @escaping @Sendable () -> Date = { Date() },
+        actuationLog: ActuationLog
     ) {
         self.db = db
         self.lifecycle = lifecycle
         self.tmux = tmux
         self.subscriptions = subscriptions
         self.skillDir = skillDir
+        self.now = now
+        self.actuationLog = actuationLog
         self.deskWorktreeID = nil
     }
 
@@ -86,23 +123,33 @@ public actor DeskSessionManager: DeskSessionManaging {
 
     /// Idempotent: ensure a Watch Desk scratch space exists.
     /// Returns existing desk worktree if already created, otherwise creates one.
-    /// On recovery, respawns a Claude terminal if one doesn't exist (H1 fix: desk dead after off→on cycle).
+    /// On recovery, respawns the configured primary agent if it has no live pane
+    /// (H1 fix: desk dead after off→on cycle).
     /// - Parameter mode: The current nightwatch mode (daywatch or nightwatch)
     /// - Returns: The Worktree for the desk session
     public func ensureDeskSession(mode: NightwatchMode) async throws -> Worktree {
         await gateAcquire()
         defer { gateRelease() }
-        // Validate cached desk session: must be active AND have a live Claude terminal
+        let preferredKind = try await preferredAgentKind()
+
+        // Validate cached desk session: the row alone is not enough. Agent
+        // processes can exit before their terminal row is removed, so require a
+        // live pane owned by the currently configured primary agent.
         if let cachedID = deskWorktreeID,
            let existing = try await db.worktrees.get(id: cachedID),
            existing.status == .active {
-            // Check if it has a live Claude terminal
-            let terminals = try await db.terminals.list(worktreeID: existing.id)
-            if terminals.first(where: { $0.label == TerminalLabel.claudeCode }) != nil {
+            if try await liveAgentTerminal(
+                worktreeID: existing.id,
+                server: existing.tmuxServer,
+                kind: preferredKind
+            ) != nil {
                 // Fast path: cached desk is alive and valid.
                 // Mode switches (daywatch ↔ nightwatch) intentionally REUSE the existing desk and terminal.
-                // The desk is NOT respawned on mode switch because the per-tick judgePrompt (via nudgeDeskSession)
-                // carries the current mode/act flag each cycle. Initial frame is one-time; steady-state mode is driven per-tick.
+                // The desk is NOT respawned on mode switch because every tick re-derives the mode and
+                // rewrites JUDGE-INSTRUCTIONS.md to match. Since the judge is told to read that file once
+                // rather than per tick, reuse-without-respawn is exactly the case where a memorized copy
+                // can go stale — `nudgeDeskSession` compares against `lastNudgedMode` and flags the flip.
+                // Initial frame is one-time; steady-state mode is driven per-tick.
                 return existing
             }
         }
@@ -117,10 +164,14 @@ public actor DeskSessionManager: DeskSessionManaging {
         if let existing = activeWorktrees.first(where: { $0.displayName == NightwatchDeskPrompts.deskDisplayName && $0.isScratch }) {
             deskWorktreeID = existing.id
 
-            // Ensure the recovered desk has a live Claude terminal; respawn if missing
-            let terminals = try await db.terminals.list(worktreeID: existing.id)
-            if terminals.first(where: { $0.label == TerminalLabel.claudeCode }) == nil {
-                logger.info("Recovered Watch Desk \(existing.id, privacy: .public) but no Claude terminal; respawning")
+            // Ensure the recovered desk has a live configured agent; respawn if
+            // its row is missing OR its pane exited.
+            if try await liveAgentTerminal(
+                worktreeID: existing.id,
+                server: existing.tmuxServer,
+                kind: preferredKind
+            ) == nil {
+                logger.info("Recovered Watch Desk \(existing.id, privacy: .public) but no live \(preferredKind.rawValue, privacy: .public) terminal; respawning")
                 do {
                     _ = try await spawnDeskTerminal(worktree: existing, mode: mode)
                 } catch {
@@ -175,7 +226,7 @@ public actor DeskSessionManager: DeskSessionManaging {
             throw error
         }
 
-        // Spawn a Claude terminal configured for nightwatch operations
+        // Spawn the configured primary agent for nightwatch operations.
         do {
             _ = try await spawnDeskTerminal(worktree: wt, mode: mode)
         } catch {
@@ -194,6 +245,277 @@ public actor DeskSessionManager: DeskSessionManaging {
         return wt
     }
 
+    /// Resolve the Watch Desk's *live* configured agent terminal, newest first.
+    ///
+    /// `TerminalStore.list` orders by `createdAt` ascending, so the previous
+    /// `terminals.first(where:)` deterministically returned the OLDEST row —
+    /// not a race, a guarantee. Desk terminal rows outlive their
+    /// panes: a session that dies, or was killed out-of-band by an older
+    /// Nightwatch handoff that bypassed TBD's terminal-close path,
+    /// leaves its row behind forever. The oldest row is therefore the one *most* likely
+    /// to be dead, and every handoff inserted another corpse ahead of the live desk.
+    ///
+    /// Observed in production: one desk carried three `Claude Code` rows, the nudge aimed
+    /// at the first, and the judge prompt was discarded every fifteen minutes for hours
+    /// while ticks kept correctly reporting queued judgment.
+    ///
+    /// Two guards make that impossible. Prefer the NEWEST row, and confirm its tmux window
+    /// still exists before sending. The liveness check is not redundant belt-and-braces:
+    /// tmux recycles pane IDs per server — both dead rows in the incident above had been
+    /// assigned `%1` — so a stale row can start resolving to a *live pane owned by an
+    /// unrelated session*, which would then receive a pasted judge prompt plus Enter. That
+    /// is issue #384, and picking the newest row alone would not prevent it.
+    ///
+    /// Neither guard is sufficient on its own, and neither proves *ownership*.
+    /// `windowExists` proves a window id resolves to SOME window;
+    /// `paneCurrentCommand` proves an agent of the right kind is in the
+    /// foreground of SOME pane. A recycled pane id running a stranger's Claude
+    /// satisfies both. So each surviving candidate is asked who it is
+    /// (`paneSendTarget`) and dropped when it answers with a different terminal
+    /// — see `paneIdentityPermitsSend`.
+    ///
+    /// Hibernated/suspended rows are excluded even if their tmux window still
+    /// exists: their pane contains a shell, not an agent, and pasting a judge
+    /// prompt there would execute it as shell input.
+    ///
+    /// - Returns: The newest matching agent terminal whose tmux window is still alive, or nil.
+    private func liveAgentTerminals(
+        worktreeID: UUID,
+        server: String,
+        kind: TerminalKind
+    ) async throws -> [Terminal] {
+        let candidates = try await db.terminals.list(worktreeID: worktreeID)
+            .filter {
+                $0.suspendedAt == nil
+                    && $0.hibernatedAt == nil
+                    && terminal($0, matches: kind)
+            }
+            // Secondary key on id: Swift's sort is not stable, and two rows can share a
+            // createdAt, so without it the winner between same-instant rows is arbitrary.
+            .sorted { ($0.createdAt, $0.id.uuidString) > ($1.createdAt, $1.id.uuidString) }
+
+        var live: [Terminal] = []
+        for terminal in candidates {
+            guard await tmux.windowExists(server: server, windowID: terminal.tmuxWindowID) else {
+                logger.notice("""
+                    Skipping stale Watch Desk terminal \(terminal.id, privacy: .public): \
+                    window \(terminal.tmuxWindowID, privacy: .public) no longer exists
+                    """)
+                continue
+            }
+            guard await paneIdentityPermitsSend(server: server, terminal: terminal) else { continue }
+            if tmux.verifiesPaneCurrentCommand {
+                guard let command = try? await tmux.paneCurrentCommand(
+                    server: server,
+                    paneID: terminal.tmuxPaneID
+                ), Self.agentCommand(command, matches: kind) else {
+                    logger.notice("""
+                        Skipping stale Watch Desk terminal \(terminal.id, privacy: .public): \
+                        pane exists but no \(kind.rawValue, privacy: .public) process is running
+                        """)
+                    continue
+                }
+            }
+            live.append(terminal)
+        }
+        return live
+    }
+
+    /// Ask a candidate's pane who it belongs to, before it can become the target
+    /// of a paste nobody asked for.
+    ///
+    /// The same read-only consultation `handleTerminalSend` and
+    /// `LimitResumeActuator` run, on the same rule, and the rule is the whole
+    /// point: **refusal requires POSITIVE disagreement, never absence.** A pane
+    /// that answers with no identity — spawned before TBD stamped one, or by
+    /// something outside TBD — is treated exactly as it was before this check
+    /// existed, so no pre-stamp desk regresses into a silent night. Only a pane
+    /// that names a *different* terminal is dropped.
+    ///
+    /// This rail needs it more than the send path does. Both consumers of the
+    /// candidate list paste on a timer with no user gesture behind them, and
+    /// what they paste is a judge prompt: a stranger agent on a recycled pane id
+    /// would not merely receive a stray keystroke, it would read and act on
+    /// instructions addressed to another session, with permissions bypassed.
+    ///
+    /// Excluding rather than throwing is what makes the outcome safe by
+    /// default. A dropped candidate is simply not live, so the callers'
+    /// existing "no uniquely owned live terminal … skipping" path handles it,
+    /// and `leasedJudgeTerminal` gets *more* correct: a stranger can no longer
+    /// masquerade as the lease owner, nor pad the candidate count into a
+    /// spurious fail-closed contention report.
+    ///
+    /// - Returns: `true` when this pane may be sent to.
+    private func paneIdentityPermitsSend(server: String, terminal: Terminal) async -> Bool {
+        let target: PaneSendTarget
+        do {
+            target = try await tmux.paneSendTarget(server: server, paneID: terminal.tmuxPaneID)
+        } catch {
+            // The consultation could not be RUN at all (a wedged tmux tripping
+            // the subprocess timeout) — no answer about the pane either way.
+            // Dropped, matching how the `paneCurrentCommand` check below already
+            // treats the same wedged server: `try?` there turns a failed query
+            // into a skipped candidate. Pasting a judge prompt into a pane we
+            // could not look at is exactly what this check exists to stop, and
+            // the cost of being wrong is only a skipped tick.
+            logger.notice("""
+                Skipping Watch Desk terminal \(terminal.id, privacy: .public): could not verify \
+                pane \(terminal.tmuxPaneID, privacy: .public) belongs to it: \
+                \(String(describing: error), privacy: .public)
+                """)
+            return false
+        }
+
+        switch target {
+        case .missing:
+            logger.notice("""
+                Skipping stale Watch Desk terminal \(terminal.id, privacy: .public): \
+                pane \(terminal.tmuxPaneID, privacy: .public) no longer exists
+                """)
+            return false
+        case .dead:
+            logger.notice("""
+                Skipping stale Watch Desk terminal \(terminal.id, privacy: .public): \
+                pane \(terminal.tmuxPaneID, privacy: .public) is dead
+                """)
+            return false
+        case .live(let paneTerminalID):
+            guard let paneTerminalID else { return true }
+            guard paneTerminalID.caseInsensitiveCompare(terminal.id.uuidString) != .orderedSame
+            else { return true }
+            // Logged distinctly and loudly: to every caller this looks like an
+            // ordinary absence, and "no live terminal" is a sentence this rail
+            // prints for half a dozen benign reasons. A pane that has changed
+            // hands is not benign — it is the row's coordinate gone stale, and
+            // it stays stale until something respawns the window.
+            logger.warning("""
+                Skipping Watch Desk terminal \(terminal.id, privacy: .public): pane \
+                \(terminal.tmuxPaneID, privacy: .public) now belongs to terminal \
+                \(paneTerminalID, privacy: .public) — nothing will be pasted into it \
+                (tmux reuses pane ids, so this coordinate is stale)
+                """)
+            return false
+        }
+    }
+
+    private func liveAgentTerminal(
+        worktreeID: UUID,
+        server: String,
+        kind: TerminalKind
+    ) async throws -> Terminal? {
+        try await liveAgentTerminals(
+            worktreeID: worktreeID, server: server, kind: kind).first
+    }
+
+    private func liveJudgeCandidates(worktree: Worktree) async throws -> [Terminal] {
+        let claude = try await liveAgentTerminals(
+            worktreeID: worktree.id, server: worktree.tmuxServer, kind: .claude)
+        let codex = try await liveAgentTerminals(
+            worktreeID: worktree.id, server: worktree.tmuxServer, kind: .codex)
+        return (claude + codex).sorted {
+            ($0.createdAt, $0.id.uuidString) > ($1.createdAt, $1.id.uuidString)
+        }
+    }
+
+    /// Resolve the sole mutable judge. Existing valid ownership wins even when
+    /// observers are present. With no lease, multiple candidates are ambiguous
+    /// and fail closed rather than selecting by recency.
+    private func leasedJudgeTerminal(
+        worktree: Worktree
+    ) async throws -> (Terminal, WatchDeskLease, String)? {
+        var candidates = try await liveJudgeCandidates(worktree: worktree)
+        let now = now()
+
+        if let lease = try await db.watchDeskLeases.status(worktreeID: worktree.id),
+           lease.isValid(at: now) {
+            if let owner = candidates.first(where: { $0.id == lease.terminalID }) {
+                let renewed = try await db.watchDeskLeases.renew(
+                    worktreeID: worktree.id, terminalID: owner.id,
+                    token: lease.token, generation: lease.generation, now: now)
+                let credentialFile = try WatchDeskLeaseCredentialFile.ensure(WatchDeskLeaseCredential(
+                    worktreeID: renewed.worktreeID, terminalID: renewed.terminalID,
+                    token: renewed.token, generation: renewed.generation))
+                notifiedContentionGeneration = nil
+                return (owner, renewed, credentialFile)
+            }
+            logger.warning("Revoking Watch Desk judge lease generation \(lease.generation): owner pane is gone")
+            try await db.watchDeskLeases.revoke(worktreeID: worktree.id)
+            subscriptions?.broadcast(delta: .watchDeskRolesChanged(
+                WorktreeIDDelta(worktreeID: worktree.id)))
+            candidates = try await liveJudgeCandidates(worktree: worktree)
+        }
+
+        guard candidates.count <= 1 else {
+            // Generation 0 denotes pre-lease ambiguity. Once a real lease has
+            // existed, its persisted generation makes subsequent incidents distinct.
+            let generation = try await db.watchDeskLeases.status(worktreeID: worktree.id)?.generation ?? 0
+            if notifiedContentionGeneration != generation {
+                let candidatesList = candidates.map(\.id.uuidString).joined(separator: ", ")
+                let notification = try await db.notifications.create(
+                    worktreeID: worktree.id,
+                    type: .error,
+                    message: "Watch Desk has multiple live judge candidates (\(candidatesList)). Mutable Nightwatch actions are paused. Recover with `tbd nightwatch lease acquire --worktree \(worktree.id.uuidString) --terminal <chosen-terminal-id>`."
+                )
+                subscriptions?.broadcast(delta: .notificationReceived(NotificationDelta(
+                    notificationID: notification.id,
+                    worktreeID: notification.worktreeID,
+                    type: notification.type,
+                    message: notification.message,
+                    terminalID: notification.terminalID,
+                    activate: false
+                )))
+                notifiedContentionGeneration = generation
+            }
+            logger.error("Watch Desk judge contention: \(candidates.count) live agent candidates; no nudge sent")
+            return nil
+        }
+        guard let candidate = candidates.first else { return nil }
+        let lease = try await db.watchDeskLeases.acquire(
+            worktreeID: worktree.id, terminalID: candidate.id, now: now)
+        let credentialFile: String
+        do {
+            credentialFile = try WatchDeskLeaseCredentialFile.ensure(WatchDeskLeaseCredential(
+                worktreeID: lease.worktreeID, terminalID: lease.terminalID,
+                token: lease.token, generation: lease.generation))
+        } catch {
+            try? await db.watchDeskLeases.revoke(worktreeID: worktree.id)
+            throw error
+        }
+        subscriptions?.broadcast(delta: .watchDeskRolesChanged(
+            WorktreeIDDelta(worktreeID: worktree.id)))
+        notifiedContentionGeneration = nil
+        return (candidate, lease, credentialFile)
+    }
+
+    static func agentCommand(_ command: String, matches kind: TerminalKind) -> Bool {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch kind {
+        case .claude:
+            return ClaudeStateDetector.isClaudeProcess(trimmed)
+                || URL(fileURLWithPath: trimmed).lastPathComponent == "claude"
+        case .codex:
+            return URL(fileURLWithPath: trimmed).lastPathComponent == "codex"
+        case .shell:
+            return false
+        }
+    }
+
+    private func preferredAgentKind() async throws -> TerminalKind {
+        try await db.config.get().primaryAgentPreference.terminalKind
+    }
+
+    private func terminal(_ terminal: Terminal, matches kind: TerminalKind) -> Bool {
+        switch kind {
+        case .codex:
+            return terminal.isCodexTerminal
+        case .claude:
+            return !terminal.isCodexTerminal
+                && (terminal.kind == .claude || terminal.label == TerminalLabel.claudeCode)
+        case .shell:
+            return false
+        }
+    }
+
     /// Post a shift wrap-up prompt to the desk session and fire a completion notification.
     /// Called when daywatch/nightwatch mode is turned OFF to gracefully end the shift.
     /// Sends the wrap-up prompt via tmux (non-destructive), fires a notification, and leaves
@@ -204,30 +526,53 @@ public actor DeskSessionManager: DeskSessionManaging {
         defer { gateRelease() }
 
         do {
-            let terminals = try await db.terminals.list(worktreeID: worktreeID)
-            guard let claudeTerminal = terminals.first(where: { $0.label == TerminalLabel.claudeCode }) else {
-                logger.warning("No Claude terminal found in Watch Desk; skipping wrap-up prompt")
-                return
-            }
-
+            // Worktree first: resolving a live terminal needs the tmux server to query.
             guard let worktree = try await db.worktrees.get(id: worktreeID) else {
                 logger.warning("Watch Desk worktree not found: \(worktreeID, privacy: .public)")
                 return
             }
 
-            // Paste the wrap-up prompt text
-            try await tmux.pasteText(
-                server: worktree.tmuxServer,
-                paneID: claudeTerminal.tmuxPaneID,
-                bytes: Data(NightwatchDeskPrompts.wrapUpPrompt.utf8)
-            )
+            guard let (agentTerminal, _, _) = try await leasedJudgeTerminal(
+                worktree: worktree
+            ) else {
+                logger.warning("No uniquely owned live terminal in Watch Desk; skipping wrap-up prompt")
+                return
+            }
 
-            // Send Enter to submit
-            try await tmux.sendKey(
-                server: worktree.tmuxServer,
-                paneID: claudeTerminal.tmuxPaneID,
-                key: "Enter"
-            )
+            // Request row before the paste; the paste and the Enter are one
+            // send. Fail-closed: an unrecordable wrap-up is not posted — and
+            // says so, like every other refusal on this path.
+            let actuationID: String
+            do {
+                actuationID = try await recordDeskSend(
+                    worktreeID: worktreeID,
+                    terminalID: agentTerminal.id,
+                    message: NightwatchDeskPrompts.wrapUpPrompt)
+            } catch {
+                logger.warning("Skipping Watch Desk wrap-up prompt: \(error, privacy: .public)")
+                return
+            }
+
+            do {
+                // Paste the wrap-up prompt text
+                try await tmux.pasteText(
+                    server: worktree.tmuxServer,
+                    paneID: agentTerminal.tmuxPaneID,
+                    bytes: Data(NightwatchDeskPrompts.wrapUpPrompt.utf8)
+                )
+
+                // Send Enter to submit
+                try await tmux.sendKey(
+                    server: worktree.tmuxServer,
+                    paneID: agentTerminal.tmuxPaneID,
+                    key: "Enter"
+                )
+            } catch {
+                await actuationLog.appendOutcome(
+                    confirms: actuationID, result: .transportFailed, error: "\(error)")
+                throw error
+            }
+            await actuationLog.appendOutcome(confirms: actuationID, result: .dispatched)
 
             // Fire a completion notification
             _ = try await db.notifications.create(
@@ -257,7 +602,7 @@ public actor DeskSessionManager: DeskSessionManaging {
         defer { gateRelease() }
         // M2: Skip nudge if previous nudge was < 10 min ago (prevent overlapping judge runs)
         if let last = lastNudgeTime {
-            let elapsed = Date().timeIntervalSince(last)
+            let elapsed = now().timeIntervalSince(last)
             if elapsed < 10 * 60 {
                 logger.debug("Skipping nudge: last nudge was \(Int(elapsed))s ago (< 10 min)")
                 return
@@ -265,41 +610,132 @@ public actor DeskSessionManager: DeskSessionManaging {
         }
 
         let mode: NightwatchMode = act ? .nightwatch : .daywatch
-        let prompt = NightwatchDeskPrompts.judgePrompt(mode: mode, skillDir: skillDir)
 
         do {
-            let terminals = try await db.terminals.list(worktreeID: worktreeID)
-            guard let claudeTerminal = terminals.first(where: { $0.label == TerminalLabel.claudeCode }) else {
-                logger.warning("No Claude terminal found in Watch Desk; skipping nudge")
-                return
-            }
-
+            // Worktree first: resolving a live terminal needs the tmux server to query.
             guard let worktree = try await db.worktrees.get(id: worktreeID) else {
                 logger.warning("Watch Desk worktree not found: \(worktreeID, privacy: .public)")
                 return
             }
 
-            // Paste the prompt text (matches handleTerminalSend pattern for reliability)
-            try await tmux.pasteText(
-                server: worktree.tmuxServer,
-                paneID: claudeTerminal.tmuxPaneID,
-                bytes: Data(prompt.utf8)
-            )
+            var preferredKind = try await preferredAgentKind()
+            var judge = try await leasedJudgeTerminal(worktree: worktree)
+            if judge == nil,
+               try await liveJudgeCandidates(worktree: worktree).isEmpty {
+                // A terminal row can survive a process/pane exit. Recover in the
+                // nudge path itself so one failed launch does not turn into a
+                // silent all-night outage waiting for a mode toggle or daemon
+                // restart. spawnPrimaryTerminals uses the same configured
+                // primary-agent preference and production launch path as normal
+                // worktrees.
+                logger.notice("No live \(preferredKind.rawValue, privacy: .public) Watch Desk terminal; retrying spawn before nudge")
+                do {
+                    try await spawnDeskTerminal(worktree: worktree, mode: mode)
+                    // Re-read in case the preference changed while spawning.
+                    preferredKind = try await preferredAgentKind()
+                    judge = try await leasedJudgeTerminal(worktree: worktree)
+                } catch {
+                    logger.warning("Failed to recover Watch Desk terminal before nudge: \(error.localizedDescription, privacy: .public)")
+                }
+            }
 
-            // Send Enter to submit
-            try await tmux.sendKey(
-                server: worktree.tmuxServer,
-                paneID: claudeTerminal.tmuxPaneID,
-                key: "Enter"
-            )
+            guard let (agentTerminal, lease, credentialFile) = judge else {
+                // Deliberately does NOT stamp lastNudgeTime: a nudge that never
+                // reached a pane must not start the 10-minute overlap cooldown,
+                // or one dead desk would suppress the next recovery attempt.
+                logger.warning("No live \(preferredKind.rawValue, privacy: .public) terminal in Watch Desk after retry; skipping nudge")
+                return
+            }
 
-            // Record nudge time for overlap guard
-            lastNudgeTime = Date()
+            // The ~5 KB instructions go to a file; only the one-line pointer goes
+            // into the session. Rewritten every tick rather than once at spawn
+            // because it is mode-specific and a local write costs nothing — that
+            // also makes the file self-healing across daemon restarts, mode
+            // switches, and a desk whose directory was cleaned out under it.
+            //
+            // Fallback, deliberately: if the write fails there is no file to point
+            // at, so we paste the full prompt exactly as before. A judge holding
+            // stale instructions is a bad night; a judge holding a pointer to
+            // nothing is a silent one.
+            let prompt: String
+            if let instructionsPath = writeJudgeInstructions(
+                deskPath: worktree.path, mode: mode, lease: lease,
+                credentialFile: credentialFile) {
+                // A mode flip rewrites the file under a judge that was told to read
+                // it once. Nothing on the judge's side can see that happen, so the
+                // daemon — the only party that knows both the old and new mode —
+                // has to say so. First nudge (nil) counts as changed: a judge that
+                // has read nothing must read.
+                prompt = NightwatchDeskPrompts.judgeNudge(
+                    mode: mode,
+                    instructionsPath: instructionsPath,
+                    instructionsChanged: lastNudgedMode != mode
+                )
+            } else {
+                logger.warning("Could not write judge instructions to \(worktree.path, privacy: .public); falling back to the inline prompt")
+                prompt = NightwatchDeskPrompts.judgePrompt(mode: mode, skillDir: skillDir)
+            }
+
+            // Request row before the paste; the paste and the Enter are one
+            // send. Fail-closed: an unrecordable nudge is not sent, and
+            // `lastNudgeTime` below is left alone so the next tick retries.
+            let actuationID: String
+            do {
+                actuationID = try await recordDeskSend(
+                    worktreeID: worktreeID,
+                    terminalID: agentTerminal.id,
+                    message: prompt)
+            } catch {
+                logger.warning("Skipping Watch Desk nudge: \(error, privacy: .public)")
+                return
+            }
+
+            do {
+                // Paste the prompt text (matches handleTerminalSend pattern for reliability)
+                try await tmux.pasteText(
+                    server: worktree.tmuxServer,
+                    paneID: agentTerminal.tmuxPaneID,
+                    bytes: Data(prompt.utf8)
+                )
+
+                // Send Enter to submit
+                try await tmux.sendKey(
+                    server: worktree.tmuxServer,
+                    paneID: agentTerminal.tmuxPaneID,
+                    key: "Enter"
+                )
+            } catch {
+                await actuationLog.appendOutcome(
+                    confirms: actuationID, result: .transportFailed, error: "\(error)")
+                throw error
+            }
+            await actuationLog.appendOutcome(confirms: actuationID, result: .dispatched)
+
+            // Record nudge time for overlap guard. `lastNudgedMode` is set only
+            // here, after the paste actually went out — a nudge that failed to
+            // reach the session must not count as "the judge has seen this mode",
+            // or the next tick would tell it nothing changed when everything did.
+            lastNudgeTime = now()
+            lastNudgedMode = mode
 
             logger.debug("Nudged Watch Desk session: act=\(act, privacy: .public)")
         } catch {
             logger.error("Failed to nudge desk session: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    /// One request row for a desk paste, carrying the payload verbatim.
+    /// Returns the minted id; throws when the record is unwritable even after
+    /// the writer's reopen-retry, in which case the caller must not paste.
+    private func recordDeskSend(
+        worktreeID: UUID, terminalID: UUID, message: String
+    ) async throws -> String {
+        var row = ActuationRow(
+            actor: .daemon(rail: ActuationRail.nightwatchDesk), kind: .send)
+        row.target = .local(worktree: worktreeID, terminal: terminalID)
+        row.message = message
+        row.submit = true
+        return try await actuationLog.appendRequest(row)
     }
 
     /// Gracefully close the desk session (archive it).
@@ -320,11 +756,32 @@ public actor DeskSessionManager: DeskSessionManaging {
                 return
             }
 
-            // Kill tmux windows
             let terminals = try await db.terminals.list(worktreeID: wt.id)
+
+            // This rail kills the desk's windows itself rather than through a
+            // lifecycle an RPC handler already rowed, so it writes its own —
+            // one dispose naming the desk worktree, the shape `worktree.archive`
+            // uses, because the per-terminal kills below are how this one intent
+            // is carried out. Fail-closed like the wrap-up and the nudge: an
+            // unrecordable close does not happen, and `deskWorktreeID` is left
+            // set (this returns before the reset at the end) so the next close
+            // still knows which desk to tear down.
+            var row = ActuationRow(
+                actor: .daemon(rail: ActuationRail.nightwatchDesk), kind: .dispose)
+            row.target = ActuationTarget(worktree: wt.id.uuidString)
+            let actuationID: String
+            do {
+                actuationID = try await actuationLog.appendRequest(row)
+            } catch {
+                logger.warning("Skipping Watch Desk close: \(error, privacy: .public)")
+                return
+            }
+
+            // Kill tmux windows
             for t in terminals {
                 try? await tmux.killWindow(server: wt.tmuxServer, windowID: t.tmuxWindowID)
             }
+            await actuationLog.appendOutcome(confirms: actuationID, result: .dispatched)
 
             // Delete terminal rows
             try await db.terminals.deleteForWorktree(worktreeID: wt.id)
@@ -344,9 +801,83 @@ public actor DeskSessionManager: DeskSessionManaging {
         deskWorktreeID = nil
     }
 
+    public func releaseJudgeLease(worktreeID: UUID) async {
+        do {
+            guard let lease = try await db.watchDeskLeases.status(worktreeID: worktreeID) else { return }
+            try await db.watchDeskLeases.release(
+                worktreeID: worktreeID, terminalID: lease.terminalID,
+                token: lease.token, generation: lease.generation)
+            WatchDeskLeaseCredentialFile.remove(terminalID: lease.terminalID)
+            notifiedContentionGeneration = nil
+            subscriptions?.broadcast(delta: .watchDeskRolesChanged(
+                WorktreeIDDelta(worktreeID: worktreeID)))
+            logger.info("Released Watch Desk judge lease generation \(lease.generation)")
+        } catch {
+            logger.error("Failed to release Watch Desk judge lease: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Fifteen-minute scheduler heartbeat. It renews/reconciles ownership
+    /// without sending a model prompt, so the lease cannot expire behind the
+    /// ten-minute nudge overlap guard during an otherwise quiet shift.
+    public func maintainJudgeLease(worktreeID: UUID) async {
+        await gateAcquire()
+        defer { gateRelease() }
+        do {
+            guard let worktree = try await db.worktrees.get(id: worktreeID) else { return }
+            _ = try await leasedJudgeTerminal(worktree: worktree)
+        } catch {
+            logger.error("Failed to maintain Watch Desk judge lease: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     // MARK: - Private Helpers
 
-    /// Spawn a Claude terminal in the desk worktree using lifecycle.spawnPrimaryTerminals.
+    /// Write the mode-specific judge instructions into the desk worktree.
+    ///
+    /// Returns the absolute path on success, `nil` on any failure — callers treat
+    /// `nil` as "fall back to the inline prompt" rather than proceeding with a
+    /// pointer to a file that may not exist. Deliberately non-throwing: a desk
+    /// that cannot write a file must still get nudged.
+    private func writeJudgeInstructions(
+        deskPath: String, mode: NightwatchMode, lease: WatchDeskLease? = nil,
+        credentialFile: String? = nil
+    ) -> String? {
+        let url = URL(fileURLWithPath: deskPath)
+            .appendingPathComponent(NightwatchDeskPrompts.judgeInstructionsFileName)
+        var body = NightwatchDeskPrompts.judgePrompt(mode: mode, skillDir: skillDir)
+        if let lease, let credentialFile {
+            body += """
+
+
+            ## Exclusive judge lease (mandatory)
+
+            You are the sole mutable judge only while this lease validates:
+            - worktree: `\(lease.worktreeID.uuidString)`
+            - terminal: `\(lease.terminalID.uuidString)`
+            - generation: `\(lease.generation)`
+            - capability file: `\(credentialFile)`
+
+            Immediately before every merge/enqueue, infrastructure apply, archive,
+            wake/nudge, or worker spawn, renew the lease. Renewal also validates
+            the exact terminal, token, generation, and unexpired authority:
+
+            `tbd nightwatch lease renew --credential-file \(credentialFile)`
+
+            If renewal fails, stop mutating. Read-only inspection and reporting remain allowed.
+            """
+        }
+        do {
+            try body.write(to: url, atomically: true, encoding: .utf8)
+            return url.path
+        } catch {
+            logger.warning("Failed to write judge instructions: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
+    /// Spawn the configured primary agent in the desk worktree using
+    /// lifecycle.spawnPrimaryTerminals.
     /// This reuses the production spawn path which handles trust seeding, overlay injection, etc.
     /// Note: Model selection (daywatch=Sonnet, nightwatch=Opus) requires per-profile configuration.
     /// The resolved profile's model is what gets used; mode affects behavior (conservative vs. free-acting),
@@ -355,14 +886,61 @@ public actor DeskSessionManager: DeskSessionManaging {
         // Get initial prompt for mode (includes absolute skillDir paths and field learnings)
         let initialPrompt = NightwatchDeskPrompts.initialPrompt(mode: mode, skillDir: skillDir)
 
+        // A new session has read nothing, so nothing it could have memorized is
+        // still valid. `lastNudgedMode` is keyed on the MODE, not on which session
+        // is running, so without this reset a crash-respawn with the mode
+        // unchanged computes `lastNudgedMode != mode` == false and tells a
+        // brand-new judge "you already read the instructions — don't re-read".
+        // It hasn't. It doesn't. (Caught in review of PR #551.)
+        //
+        // `lastNudgeTime` goes with it for the same reason: a rate-limit window
+        // opened by a session that no longer exists should not silence the first
+        // tick of its replacement. Both are per-session facts that were living on
+        // the actor, and this is the one chokepoint both spawn paths — fresh
+        // create and crash recovery — pass through.
+        //
+        // Reset unconditionally, before the spawn can throw: over-signalling
+        // costs one extra file Read, under-signalling costs a judge running an
+        // unattended shift on instructions it never opened.
+        lastNudgedMode = nil
+        lastNudgeTime = nil
+
+        // Lay the instructions down before the session exists, so a judge that
+        // reads them on its own initiative — before its first tick ever fires —
+        // finds them there. Best-effort: the nudge path rewrites this every tick
+        // and falls back to the inline prompt if it can't.
+        writeJudgeInstructions(deskPath: worktree.path, mode: mode).map { path in
+            logger.debug("Wrote judge instructions to \(path, privacy: .public)")
+        }
+
+        // The rail spawns an agent session here with nobody having asked, so it
+        // writes its own row — one naming the desk worktree and no terminal, the
+        // shape `worktree.revive` uses, because the terminals are minted inside
+        // `spawnPrimaryTerminals`. This is the one chokepoint all three spawn
+        // paths pass through (fresh create, recovery, pre-nudge respawn), so a
+        // row here counts each spawn exactly once. Fail-closed: the throw
+        // reaches the same callers that already treat a failed spawn as
+        // best-effort, so an unrecordable spawn simply does not happen.
+        var row = ActuationRow(
+            actor: .daemon(rail: ActuationRail.nightwatchDesk), kind: .spawn)
+        row.target = ActuationTarget(worktree: worktree.id.uuidString)
+        let actuationID = try await actuationLog.appendRequest(row)
+
         // Use production spawn path which handles trust, overlay, and all lifecycle concerns
-        _ = try await lifecycle.spawnPrimaryTerminals(
-            worktree: worktree,
-            repo: nil,
-            skipClaude: false,
-            initialPrompt: initialPrompt,
-            preSessionTerminalID: nil
-        )
+        do {
+            _ = try await lifecycle.spawnPrimaryTerminals(
+                worktree: worktree,
+                repo: nil,
+                skipClaude: false,
+                initialPrompt: initialPrompt,
+                preSessionTerminalID: nil
+            )
+        } catch {
+            await actuationLog.appendOutcome(
+                confirms: actuationID, result: .transportFailed, error: "\(error)")
+            throw error
+        }
+        await actuationLog.appendOutcome(confirms: actuationID, result: .dispatched)
         // Model follows the profile spawnPrimaryTerminals resolves internally —
         // resolving here too would just double the keychain-backed lookup.
         logger.info("Spawned desk terminal in \(worktree.id, privacy: .public)")

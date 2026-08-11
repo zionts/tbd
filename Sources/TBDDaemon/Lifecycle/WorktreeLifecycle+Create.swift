@@ -43,12 +43,12 @@ extension WorktreeLifecycle {
     ///
     /// This is the legacy all-in-one method. Prefer `beginCreateWorktree` +
     /// `completeCreateWorktree` for non-blocking creation.
-    public func createWorktree(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, skipClaude: Bool = false, initialPrompt: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, siblingOfWorktreeID: UUID? = nil, callerWorktreeID: UUID? = nil, suppressAutoParent: Bool = false, useExistingBranch: Bool = false, prNumber: Int? = nil, checkoutPRHead: Bool = false, claudeSettingsOverlay: String? = nil) async throws -> Worktree {
+    public func createWorktree(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, skipClaude: Bool = false, initialPrompt: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, siblingOfWorktreeID: UUID? = nil, callerWorktreeID: UUID? = nil, suppressAutoParent: Bool = false, useExistingBranch: Bool = false, prNumber: Int? = nil, checkoutPRHead: Bool = false, primaryAgentPreference: PrimaryAgentPreference? = nil, claudeSettingsOverlay: String? = nil) async throws -> Worktree {
         let pending = try await beginCreateWorktree(repoID: repoID, folder: folder, branch: branch, displayName: displayName, skipClaude: skipClaude, parentWorktreeID: parentWorktreeID, siblingOfWorktreeID: siblingOfWorktreeID, callerWorktreeID: callerWorktreeID, suppressAutoParent: suppressAutoParent, useExistingBranch: useExistingBranch, prNumber: prNumber)
         // Pass the original branch ref (may include `origin/` prefix) through
         // so phase 2 can dispatch to the correct git command.
         let existingBranchRef = useExistingBranch ? branch : nil
-        let completion = try await completeCreateWorktree(worktreeID: pending.id, skipClaude: skipClaude, initialPrompt: initialPrompt, userSpecifiedFolder: folder != nil, userSpecifiedBranch: branch != nil, cols: cols, rows: rows, existingBranchRef: existingBranchRef, checkoutPRHead: checkoutPRHead, claudeSettingsOverlay: claudeSettingsOverlay)
+        let completion = try await completeCreateWorktree(worktreeID: pending.id, skipClaude: skipClaude, initialPrompt: initialPrompt, userSpecifiedFolder: folder != nil, userSpecifiedBranch: branch != nil, cols: cols, rows: rows, existingBranchRef: existingBranchRef, checkoutPRHead: checkoutPRHead, primaryAgentPreference: primaryAgentPreference, claudeSettingsOverlay: claudeSettingsOverlay)
         // Legacy synchronous contract: the returned worktree is fully set up.
         // Await phase 3 inline when a preSession hook gated the primary spawn.
         if case .preSessionPending(let phase3) = completion {
@@ -222,7 +222,7 @@ extension WorktreeLifecycle {
     /// Set `retryGeneratedNameOnCollision` to false when callers have already
     /// rendered or persisted the pending row's generated identity.
     @discardableResult
-    public func completeCreateWorktree(worktreeID: UUID, skipClaude: Bool = false, initialPrompt: String? = nil, userSpecifiedFolder: Bool = false, userSpecifiedBranch: Bool = false, cols: Int? = nil, rows: Int? = nil, existingBranchRef: String? = nil, checkoutPRHead: Bool = false, overrideProfileID: UUID? = nil, modelOverride: String? = nil, claudeSettingsOverlay: String? = nil, carryover: ConversationCarryover? = nil, retryGeneratedNameOnCollision: Bool = true) async throws -> WorktreeCreateCompletion {
+    public func completeCreateWorktree(worktreeID: UUID, skipClaude: Bool = false, initialPrompt: String? = nil, userSpecifiedFolder: Bool = false, userSpecifiedBranch: Bool = false, cols: Int? = nil, rows: Int? = nil, existingBranchRef: String? = nil, checkoutPRHead: Bool = false, overrideProfileID: UUID? = nil, modelOverride: String? = nil, primaryAgentPreference: PrimaryAgentPreference? = nil, claudeSettingsOverlay: String? = nil, carryover: ConversationCarryover? = nil, retryGeneratedNameOnCollision: Bool = true) async throws -> WorktreeCreateCompletion {
         guard let worktree = try await db.worktrees.get(id: worktreeID) else {
             throw WorktreeLifecycleError.worktreeNotFound(worktreeID)
         }
@@ -234,6 +234,24 @@ extension WorktreeLifecycle {
         do {
             let clock = ContinuousClock()
             let phaseStart = clock.now
+            let creationConfig = try await db.config.get()
+            let creationPrimaryKind: TerminalKind = carryover == nil
+                ? resolvePrimaryTerminalKind(
+                    skipClaude: skipClaude,
+                    archivedClaudeSessions: nil,
+                    configuredPreference:
+                        primaryAgentPreference ?? creationConfig.primaryAgentPreference
+                )
+                : .claude
+            // Preflight the full Codex launch before creating a directory,
+            // checking out a worktree, or starting a pre-session pane. Passing
+            // the prepared values through phase 3 also prevents a second,
+            // post-mutation resolution attempt after a long-running hook.
+            let preparedCodexLaunch = creationPrimaryKind == .codex
+                ? try CodexLaunchPreparation.prepare(
+                    executableResolver: codexExecutableResolver,
+                    homeEnsurer: codexHomeEnsurer)
+                : nil
 
             // 1. Create parent directory
             let createDirStart = clock.now
@@ -379,8 +397,10 @@ extension WorktreeLifecycle {
                         completionAction: .markActive,
                         overrideProfileID: overrideProfileID,
                         modelOverride: modelOverride,
+                        primaryAgentPreference: primaryAgentPreference,
                         claudeSettingsOverlay: claudeSettingsOverlay,
-                        carryover: carryover
+                        carryover: carryover,
+                        preparedCodexLaunch: preparedCodexLaunch
                     )
                     // Fresh creates get an initial note tab, appended after the
                     // primary spawn set the tab order. Create path only — a
@@ -407,8 +427,10 @@ extension WorktreeLifecycle {
                 preSessionTerminalID: nil,
                 overrideProfileID: overrideProfileID,
                 modelOverride: modelOverride,
+                primaryAgentPreference: primaryAgentPreference,
                 claudeSettingsOverlay: claudeSettingsOverlay,
-                carryover: carryover
+                carryover: carryover,
+                preparedCodexLaunch: preparedCodexLaunch
             )
             let terminalSpawnElapsedMs = terminalSpawnStart.duration(to: clock.now) / .milliseconds(1)
             timingLogger.debug("terminal-spawn \(worktreeID.uuidString, privacy: .public) \(Int(terminalSpawnElapsedMs))ms")
@@ -478,6 +500,45 @@ extension WorktreeLifecycle {
         let baseBranches = ["origin/\(defaultBranch)", defaultBranch]
 
         var lastError: Error? = nil
+
+        // A branch the caller NAMED that already exists locally gets checked
+        // out, not re-created. `git worktree add -b <branch>` is fatal when the
+        // ref exists ("a branch named 'x' already exists"), and every attempt
+        // below would hit it — both base branches, then both again after the
+        // folder-rename retry, which keeps a user-specified branch. Four
+        // failures, one cause.
+        //
+        // This is the ordinary case, not an edge case: spawning a session onto
+        // an existing PR means the branch is already there.
+        //
+        // Gated on `userSpecifiedBranch` deliberately. An auto-generated
+        // `tbd/<name>` that collides means the NAME collided — the right answer
+        // there is a fresh name (the retry below), not silently adopting
+        // whatever branch happens to hold that name.
+        //
+        // A failed existence probe falls through to the old path rather than
+        // failing creation: not knowing is not the same as knowing it's absent.
+        let branchExistsLocally = (try? await git.localBranchExists(repoPath: repoPath, name: branch)) ?? false
+        if userSpecifiedBranch && branchExistsLocally {
+            do {
+                try await git.worktreeAddExisting(
+                    repoPath: repoPath,
+                    worktreePath: worktreePath,
+                    branch: branch
+                )
+                return (name: name, branch: branch, path: worktreePath)
+            } catch {
+                try? FileManager.default.removeItem(atPath: worktreePath)
+                // No rename retry here: the branch is the caller's and is kept
+                // across retries, so a second attempt fails identically. Git's
+                // stderr is the useful part — for the common follow-on failure
+                // it reads "'x' is already used by worktree at <path>", which
+                // names the directory holding it.
+                throw WorktreeLifecycleError.createFailed(
+                    "could not check out existing branch '\(branch)'\(formatErrorForMessage(error))"
+                )
+            }
+        }
 
         for baseBranch in baseBranches {
             do {
@@ -599,8 +660,10 @@ extension WorktreeLifecycle {
         preSessionTerminalID: UUID?,
         overrideProfileID: UUID? = nil,
         modelOverride: String? = nil,
+        primaryAgentPreference: PrimaryAgentPreference? = nil,
         claudeSettingsOverlay: String? = nil,
-        carryover: ConversationCarryover? = nil
+        carryover: ConversationCarryover? = nil,
+        preparedCodexLaunch: CodexLaunchPreparation? = nil
     ) async throws -> [(id: UUID, label: String)] {
         let worktreeID = worktree.id
         let tmuxServer = worktree.tmuxServer
@@ -611,10 +674,25 @@ extension WorktreeLifecycle {
             ? resolvePrimaryTerminalKind(
                 skipClaude: skipClaude,
                 archivedClaudeSessions: archivedClaudeSessions,
-                configuredPreference: config.primaryAgentPreference
+                configuredPreference: primaryAgentPreference ?? config.primaryAgentPreference
             )
             : .claude
         let archivedSessions = archivedClaudeSessions ?? []
+        // Resolve Codex before `ensureServer` creates tmux state. `new-window`
+        // can succeed even when its child shell cannot find a bare `codex`
+        // command, which would leave a terminal row whose pane already exited.
+        let codexLaunch: CodexLaunchPreparation?
+        if primaryTerminalKind == .codex {
+            if let preparedCodexLaunch {
+                codexLaunch = preparedCodexLaunch
+            } else {
+                codexLaunch = try CodexLaunchPreparation.prepare(
+                    executableResolver: codexExecutableResolver,
+                    homeEnsurer: codexHomeEnsurer)
+            }
+        } else {
+            codexLaunch = nil
+        }
         // Resolve a usable size: prefer caller's value, otherwise fall back to
         // TmuxManager's defaults. tmux's own 80x24 default would let Claude
         // render into hard-wrapped scrollback that can never be reflowed when
@@ -678,12 +756,17 @@ extension WorktreeLifecycle {
             primaryProfileID = nil
             primaryLabel = TerminalLabel.shell
         case .codex:
-            let codexHome = try CodexHomeManager().ensureProfilePlugin()
-            primaryCommand = CodexSpawnCommandBuilder.build(initialPrompt: initialPrompt)
+            guard let codexLaunch else {
+                preconditionFailure(
+                    "Codex launch must be prepared before the Codex spawn branch")
+            }
+            primaryCommand = CodexSpawnCommandBuilder.build(
+                initialPrompt: initialPrompt,
+                executablePath: codexLaunch.executablePath)
             primaryEnv = [
                 "TBD_WORKTREE_ID": worktreeID.uuidString,
                 "TBD_TERMINAL_ID": plannedTerminalID1.uuidString,
-                "CODEX_HOME": codexHome.path,
+                "CODEX_HOME": codexLaunch.codexHome.path,
             ]
             // omz-update suppression rides `-e` (process env before .zshrc)
             // so the update prompt can't block the codex command; FORCED over
@@ -709,7 +792,7 @@ extension WorktreeLifecycle {
                     repo: repo, worktree: worktree, isResume: false,
                     scratchInstructions: config.scratchInstructions,
                     scratchRenamePrompt: config.scratchRenamePrompt)
-            let profileConfigDir = ClaudeProfileConfigDirManager.resolveConfigDir(for: resolvedProfile)
+            let profileConfigDir = configDirManager.resolveConfigDir(for: resolvedProfile)
             // Pre-accept Claude Code's folder-trust dialog. TBD just created
             // this worktree from a repo the operator registered, so the trust
             // answer is known by construction — and the dialog blocks before
@@ -925,7 +1008,7 @@ extension WorktreeLifecycle {
             for sessionID in additionalArchivedClaudeSessions {
                 let plannedID = UUID()
                 createdTerminalIDs.append(plannedID)
-                let restoreProfileConfigDir = ClaudeProfileConfigDirManager.resolveConfigDir(for: resolvedProfile)
+                let restoreProfileConfigDir = configDirManager.resolveConfigDir(for: resolvedProfile)
                 // Pre-accept the folder-trust dialog so restoring an extra
                 // archived session onto a fresh profile dir doesn't re-prompt.
                 await ClaudeTrustSeeder.ensureTrusted(

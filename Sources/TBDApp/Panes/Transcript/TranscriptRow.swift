@@ -85,6 +85,8 @@ struct TranscriptRow: View {
         case .toolCall(let id, let name, let inputJSON, let inputTruncatedTo, let result, let ts):
             toolCard(id: id, name: name, inputJSON: inputJSON,
                      inputTruncatedTo: inputTruncatedTo, result: result, timestamp: ts)
+        case .activityGroupSummary(let summary):
+            ActivityGroupSummaryRow(summary: summary)
         case .subagentSummary:
             // Subagent summaries are no longer surfaced in the transcript; the
             // enum case is retained for Codable/source compatibility but is
@@ -116,6 +118,56 @@ struct TranscriptRow: View {
         default:
             GenericToolCard(id: id, name: name, inputJSON: inputJSON, inputTruncatedTo: inputTruncatedTo, result: result, timestamp: timestamp, terminalID: terminalID)
         }
+    }
+}
+
+/// SwiftUI fallback for activity-group summaries. The table renderer uses its
+/// native activity cell, but overlays and visual harnesses still need a faithful
+/// view with the same disclosure semantics.
+struct ActivityGroupSummaryRow: View {
+    let summary: ActivityGroupSummary
+    @Environment(\.toggleTranscriptActivityGroup) private var toggleGroup
+
+    var body: some View {
+        Button {
+            toggleGroup?(summary.id, !summary.isExpanded)
+        } label: {
+            // No leading icon: the persistent disclosure chevron already marks
+            // this as a group, so the phrase starts at the row's leading padding
+            // (matching the native cell, which collapses its icon column).
+            HStack(spacing: 7) {
+                // The single shared phrase — the native cell renders this exact
+                // string, so the two renderers cannot drift.
+                Text(summary.activityPhrase)
+                    .font(.system(.subheadline, design: .rounded, weight: .medium))
+                    // Matches the native cell's `.secondary` segment style
+                    // (`secondaryLabelColor`): the summary is chrome and must
+                    // recede from the assistant prose around it.
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                // Nil — and so nothing rendered — unless the group failed or is
+                // waiting on the user; a running group says so in the phrase's
+                // tense. Matches the native cell's badge logic.
+                if let status = summary.statusLabel {
+                    Text(status)
+                        .font(.caption2)
+                        .foregroundStyle(summary.errorCount > 0 ? Color.red : Color.secondary)
+                }
+                Image(systemName: summary.isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(Color(nsColor: .windowBackgroundColor).opacity(0.38))
+            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            "\(summary.isExpanded ? "Collapse" : "Expand") \(summary.activityPhrase)"
+                + (summary.statusLabel.map { ", \($0)" } ?? "")
+        )
     }
 }
 

@@ -54,12 +54,17 @@ final class ActivityRowCellView: NSTableCellView {
     private var widthConstraint: NSLayoutConstraint!
     private var heightConstraint: NSLayoutConstraint!
     private var iconLeading: NSLayoutConstraint!
+    /// Both zeroed for an icon-less presentation, so the title lands exactly on
+    /// the row's leading inset instead of hanging off an empty icon column.
+    private var iconWidth: NSLayoutConstraint!
+    private var titleLeading: NSLayoutConstraint!
 
     // MARK: State
 
     private var onOpen: (() -> Void)?
     private var trackingArea: NSTrackingArea?
     private var currentStyle: ActivityRowPresentation.RowStyle = .chrome
+    private var accessoryAlwaysVisible = false
     /// Box fill alpha drives the hover-lift (0.4 → 0.65).
     private var hovering = false
 
@@ -122,6 +127,9 @@ final class ActivityRowCellView: NSTableCellView {
 
         let m = Metrics.self
         iconLeading = iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: m.insetLeading)
+        iconWidth = iconView.widthAnchor.constraint(equalToConstant: m.iconWidth)
+        titleLeading = titleField.leadingAnchor.constraint(
+            equalTo: iconView.trailingAnchor, constant: m.hStackSpacing)
 
         NSLayoutConstraint.activate([
             widthConstraint,
@@ -134,9 +142,9 @@ final class ActivityRowCellView: NSTableCellView {
 
             iconLeading,
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: m.iconWidth),
+            iconWidth,
 
-            titleField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: m.hStackSpacing),
+            titleLeading,
             titleField.centerYAnchor.constraint(equalTo: centerYAnchor),
 
             badgeStack.leadingAnchor.constraint(
@@ -171,6 +179,7 @@ final class ActivityRowCellView: NSTableCellView {
         onOpen: (() -> Void)?
     ) {
         currentStyle = presentation.style
+        accessoryAlwaysVisible = presentation.accessoryAlwaysVisible
         self.onOpen = onOpen
         hovering = false
 
@@ -179,15 +188,37 @@ final class ActivityRowCellView: NSTableCellView {
         if abs(widthConstraint.constant - w) > 0.5 { widthConstraint.constant = w }
         if abs(heightConstraint.constant - h) > 0.5 { heightConstraint.constant = h }
 
-        iconView.image = NSImage(systemSymbolName: presentation.iconSystemName, accessibilityDescription: nil)
+        if let icon = presentation.iconSystemName {
+            iconView.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
+            iconView.isHidden = false
+            iconWidth.constant = Metrics.iconWidth
+            titleLeading.constant = Metrics.hStackSpacing
+        } else {
+            // Collapse the icon column rather than leaving a hole: an empty
+            // 14pt gutter next to sibling rows that fill theirs reads as a
+            // failed image, so the title takes the leading inset itself.
+            iconView.image = nil
+            iconView.isHidden = true
+            iconWidth.constant = 0
+            titleLeading.constant = 0
+        }
 
         titleField.attributedStringValue = Self.attributedTitle(
             presentation.titleSegments, truncation: presentation.titleTruncation)
         titleField.lineBreakMode = presentation.titleTruncation
         titleField.cell?.lineBreakMode = presentation.titleTruncation
         titleField.toolTip = presentation.titleTooltip
+        setAccessibilityLabel(
+            presentation.accessibilityLabel
+                ?? presentation.titleSegments.map(\.text).joined(separator: " ")
+        )
+        setAccessibilityRole(onOpen == nil ? .group : .button)
 
         rebuildBadges(presentation.badges)
+        scopeView.image = NSImage(
+            systemSymbolName: presentation.accessorySystemName ?? "scope",
+            accessibilityDescription: nil
+        )
 
         switch presentation.style {
         case .chrome:
@@ -196,7 +227,7 @@ final class ActivityRowCellView: NSTableCellView {
             backgroundBox.fillColor = Self.boxColor(hovering: false)
             backgroundBox.isHidden = false
             scopeView.isHidden = false
-            scopeView.alphaValue = 0
+            scopeView.alphaValue = presentation.accessoryAlwaysVisible ? 0.75 : 0
             if let ts = presentation.timestamp {
                 timestampField.stringValue = ts.absoluteShort
                 timestampField.isHidden = false
@@ -327,7 +358,7 @@ final class ActivityRowCellView: NSTableCellView {
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.12
             ctx.allowsImplicitAnimation = true
-            scopeView.animator().alphaValue = value ? 0.8 : 0
+            scopeView.animator().alphaValue = value || accessoryAlwaysVisible ? 0.8 : 0
         }
         backgroundBox.fillColor = Self.boxColor(hovering: value)
     }
@@ -340,6 +371,12 @@ final class ActivityRowCellView: NSTableCellView {
             return
         }
         onOpen()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard currentStyle == .chrome, let onOpen else { return false }
+        onOpen()
+        return true
     }
 
     // MARK: Test backstop

@@ -246,7 +246,11 @@ actor DaemonClient {
     /// FileManager, etc.) are freed immediately — prevents accumulation across
     /// the 2-second polling cycle.
     private nonisolated func sendRaw(_ request: RPCRequest) throws -> RPCResponse {
-        try autoreleasepool {
+        // The app is the operator's hand: every request it makes is declared
+        // `{"kind":"app"}` at this one encode chokepoint rather than at each
+        // of the ~200 call sites.
+        let request = request.stamping(actor: .app)
+        return try autoreleasepool {
             let fd = try makeConnectedSocket()
             defer { close(fd) }
 
@@ -456,11 +460,18 @@ actor DaemonClient {
     /// When `useExistingBranch` is true, `branch` MUST be set to an existing
     /// ref name (local like `foo` or remote like `origin/foo`) — the daemon
     /// checks it out instead of creating a new `tbd/*` branch.
-    func createWorktree(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, useExistingBranch: Bool = false, profileID: UUID? = nil, model: String? = nil, prNumber: Int? = nil, checkoutPRHead: Bool? = nil) async throws -> Worktree {
+    func createWorktree(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, useExistingBranch: Bool = false, profileID: UUID? = nil, model: String? = nil, primaryAgentPreference: PrimaryAgentPreference? = nil, prNumber: Int? = nil, checkoutPRHead: Bool? = nil) async throws -> Worktree {
         return try await callAsync(
             method: RPCMethod.worktreeCreate,
-            params: WorktreeCreateParams(repoID: repoID, folder: folder, branch: branch, displayName: displayName, cols: cols, rows: rows, parentWorktreeID: parentWorktreeID, useExistingBranch: useExistingBranch, profileID: profileID, model: model, prNumber: prNumber, checkoutPRHead: checkoutPRHead),
+            params: WorktreeCreateParams(repoID: repoID, folder: folder, branch: branch, displayName: displayName, cols: cols, rows: rows, parentWorktreeID: parentWorktreeID, useExistingBranch: useExistingBranch, profileID: profileID, model: model, primaryAgentPreference: primaryAgentPreference, prNumber: prNumber, checkoutPRHead: checkoutPRHead),
             resultType: Worktree.self
+        )
+    }
+
+    func fetchCodexUsage() async throws -> CodexUsageResult {
+        try await callNoParamsAsync(
+            method: RPCMethod.codexUsageFetch,
+            resultType: CodexUsageResult.self
         )
     }
 
@@ -641,6 +652,16 @@ actor DaemonClient {
             params: TerminalCreateParams(worktreeID: worktreeID, cmd: cmd, type: type, resumeSessionID: resumeSessionID, overrideProfileID: overrideProfileID, loginSession: loginSession, cols: cols, rows: rows, colorFgBg: colorFgBg),
             resultType: Terminal.self
         )
+    }
+
+    /// Import one Claude terminal's native transcript into Codex and open the
+    /// returned thread as an ordinary Codex terminal.
+    func continueInCodex(terminalID: UUID) async throws
+        -> TerminalContinueInCodexResult {
+        try await callAsync(
+            method: RPCMethod.terminalContinueInCodex,
+            params: TerminalContinueInCodexParams(terminalID: terminalID),
+            resultType: TerminalContinueInCodexResult.self)
     }
 
     /// List terminals, optionally filtered by worktree.

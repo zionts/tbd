@@ -95,7 +95,28 @@ terminals verified DONE — every hand-composed "resume" wake would have been st
 
 ## The gate (never automate past this)
 
-A PR may only be enqueued when **claude-review = APPROVED on the current SHA + checks clean**. Human approval never substitutes. `gh pr merge` is NOT a safe-wedge — it always escalates. nightwatch's job is to get PRs *ready*; the human merges.
+A PR may only be enqueued when **claude-review = APPROVED on the current SHA + checks clean**. Human approval never substitutes for the bot verdict.
+
+**Merging (revised 2026-07-29 — this replaces the older "the human merges" rule).** The
+**nightwatch** judge MAY enqueue a **loop-perfect PR authored by `zionts`**, and only those.
+Daywatch does not merge: it runs while a human is around, so it *reports* a loop-perfect PR and
+stops. Loop-perfect means all three hold at once, re-read in the same tool call as the merge:
+
+- `mergeable_state` is `clean`
+- `claude-review` = APPROVED **on the current head SHA** (a verdict on an older SHA is not a verdict)
+- every required status context is green — currently **10** on `longeye-ai/monorepo`; the 11th,
+  `Merge Queue Result`, is reported from *inside* the queue and cannot be green beforehand
+
+**Never `--admin`.** Never anyone else's PR — not a teammate's, not a bot's. A judge never merges
+*toward* green: anything short of loop-perfect goes back to its owner, or to the human. Auto-approving
+a `gh pr merge` permission wedge is still forbidden (see `config/safe_wedges.txt`) — a merge is a
+deliberate act after the three checks above, never a rubber-stamped prompt.
+
+`main` sits behind a **merge queue**, so `gh pr merge <N>` *enqueues*; it does not merge. GitHub runs
+the queue's own checks and merges when they pass. The line
+`! The merge strategy for main is set by the merge queue` is a **warning, not a failure** — the
+enqueue succeeded. Do not retry it, do not bolt on `--squash`/`--merge` to "fix" it, and do not
+report it as a blocked merge.
 
 **Send-time verification — the wake.py rule applies to EVERY PR-state message, not just wakes.**
 Before dispatching any message that asserts PR state (a gate denial, a "checks failing" nudge, a
@@ -117,9 +138,13 @@ is an *archive question for the human*, not a harvest to fire. Report it and mov
 they are wrong; this rule wins.)
 
 **Hand off at the context ceiling — never push through it.** A judge session that runs past
-~200k tokens starts truncating its own shift. Do not "flag for respawn" and keep working, and
-do NOT use `tbd terminal close --all` — **that command does not exist** (there is no
-`tbd terminal close` subcommand at all; the only real close is killing the tmux window).
+~600k tokens starts truncating its own shift. (The ceiling was 200k until 2026-07-29; on a
+1000k Opus window that forced a relay roughly every two hours, so the desk spent its shift
+handing off instead of judging. `handoff.py --check` is the authority — don't eyeball it.)
+Do not "flag for respawn" and keep working, and
+do NOT use `tbd terminal close --all` — **that command does not exist**. The relay uses
+the supported single-terminal `tbd terminal close --terminal <id>`, which preserves
+Closed Terminals history and never touches independently spawned child work.
 The working relay is `scripts/handoff.py`:
 
 ```
@@ -154,23 +179,35 @@ tab; the old tab disappears when the successor closes it.
 
 ## Config (`config/`)
 - `priorities.txt` — must-keep-moving worktrees (flagged ★, reported first)
-- `safe_wedges.txt` — permission-wedge prefixes a future daemon may auto-approve (never `gh pr merge`)
+- `safe_wedges.txt` — permission-wedge prefixes a daemon may auto-approve (never `gh pr merge`: the
+  nightwatch judge merges deliberately, after the three gate checks — never by rubber-stamping a prompt)
 - `dont_touch.txt` — panes/names nightwatch must never nudge (human-driven, e.g. Adam's own session)
 
-## There is no babysitter daemon (retired 2026-07-25)
+## The babysitter daemon is machine-local — this skill does not ship one
 
-This section used to describe a "durable spine already on launchd": `scripts/daemon.py`
-auto-approving safe wedges, `scripts/watchdog.sh` restarting it, both "currently live as
-`~/.fleet/babysitter_daemon.py`". **None of it ever existed** — no scripts in this skill, no
-`~/.fleet/`, no launchd jobs, no plists, no log. Every tick dutifully reported
-`daemon: log-missing` as though a live service had crashed, and judge sessions burned five
-days escalating a *restart* for software with no install to restore.
+**This skill installs no daemon.** There is no `scripts/daemon.py` and no `scripts/watchdog.sh`
+in `NightwatchSkillContent.scripts`, so on a fresh install nothing auto-approves wedges and
+`tick.py`'s `daemon_health()` is a stub. `config/safe_wedges.txt` is the allowlist a daemon
+*would* consult, kept for that reason; without one, wedges route through judge ticks.
 
-The fleet ran fine without it. `tick.py`'s `daemon_health()` is now a stub, `config/safe_wedges.txt`
-is the allowlist a future daemon *would* use (kept for that reason), and wedges route through
-judge ticks. If you ever build one: it types into ~96 live panes, so it MUST use the composer
-ghost-guard in `_composer()` — before that guard existed the dispatch path would have fired dim
-suggestions and raw mouse escape sequences as if a human had typed them.
+**But "there is no babysitter daemon anywhere" is false, and a judge must not reason from it.**
+An operator can install one out-of-band, and on this fleet's box one is live: LaunchAgents
+`com.fleet-babysitter` (KeepAlive, running `~/.fleet/babysitter_daemon.py`) and
+`com.fleet-babysitter-watchdog` (StartInterval 300, kickstarting it when its log goes stale
+past 30 min of *awake* time). Both plists date to 2026-06-23. It auto-approves a narrow
+read-only wedge allowlist across live panes and appends everything else to an escalation file.
+A 2026-07-25 edit to this section asserted none of it had ever existed; that was wrong, and it
+propagated into the desk prompts as "nothing will restart you" — see the handoff rule above for
+what actually keeps a shift alive.
+
+Two things that daemon does **not** do, so don't wait on them: it does not restart the *desk
+session* (only `handoff.py --act` does that, and only because you ran it), and it never merges —
+`gh pr merge` is deliberately excluded from its allowlist, because a merge is a judged act, not a
+rubber-stamped prompt.
+
+If you build one: it types into ~96 live panes, so it MUST use the composer ghost-guard in
+`_composer()` — before that guard existed the dispatch path would have fired dim suggestions and
+raw mouse escape sequences as if a human had typed them.
 
 ## TBD integration
 - **Read:** `~/tbd/state.db` (worktrees/terminals/`tmuxServer` per pane — pane IDs collide across servers, always read the server, never hardcode)
@@ -227,7 +264,7 @@ Usage:
 Exit 0 always (a wake plan is informational); per-item status is in the output
 and queue/wake-plan.json.
 """
-import subprocess, os, re, json, time, sys
+import subprocess, os, re, json, time, sys, glob
 
 HOME = os.path.expanduser("~")
 DB = f"{HOME}/tbd/state.db"
@@ -237,7 +274,7 @@ QUEUE = f"{SKILL}/queue"
 STANDING_RULE = ("If the task is complete, SAY SO AND STOP — do not run /closeout. "
                  "A finished-looking worktree is an archive question for the human, "
                  "not a harvest to fire. Resume only if genuinely unfinished. "
-                 "Do NOT merge — the human merges.")
+                 "Do NOT merge your own PR — the nightwatch judge or the human does that.")
 
 
 def sh(args, t=20, cwd=None):
@@ -251,6 +288,35 @@ def sh(args, t=20, cwd=None):
 def gh(args, t=25, cwd=None):
     # gh transits the cache proxy via the shell function, not env — plain exec is direct.
     return sh(["gh", *args], t=t, cwd=cwd)
+
+
+def lease_credential_file(tid):
+    root = os.environ.get("TBD_HOME") or os.path.expanduser("~/tbd")
+    matches = glob.glob(os.path.join(
+        root, "runtime", "nightwatch-leases", f"{tid}-*.json"))
+    if len(matches) != 1:
+        sys.exit(f"refusing mutation: expected one capability file, found {len(matches)}")
+    return matches[0]
+
+
+def require_judge_lease():
+    """Renew exact desk authority immediately before one mutable wake."""
+    tid, wid = os.environ.get("TBD_TERMINAL_ID"), os.environ.get("TBD_WORKTREE_ID")
+    if not tid or not wid:
+        sys.exit("refusing wake: missing TBD terminal/worktree identity")
+    status, rc = sh(["tbd", "nightwatch", "lease", "status", "--worktree", wid])
+    try:
+        lease = (json.loads(status) or {}).get("lease") if rc == 0 else None
+    except Exception:
+        lease = None
+    if not lease or not lease.get("valid") or lease.get("terminalID") != tid:
+        sys.exit("refusing wake: this terminal does not hold the valid judge lease")
+    credential = lease_credential_file(tid)
+    _, rc = sh([
+        "tbd", "nightwatch", "lease", "renew", "--credential-file", credential,
+    ])
+    if rc != 0:
+        sys.exit("refusing wake: judge lease renewal failed")
 
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -523,6 +589,7 @@ def main():
         print(f"  ▸ {it['name']} ({it['tid'][:8]}): {v['classification']} — "
               + ("; ".join(v["facts"])[:110] or "-"))
         if act:
+            require_judge_lease()
             # The wake text rides `tbd terminal wake --prompt` as an argv to
             # `claude --resume` — atomic with the respawn. NEVER `terminal
             # send`: send pastes into whatever the pane currently runs (a bare
@@ -721,34 +788,58 @@ def _composer(lines, raw_lines=None):
     return ""
 
 def daemon_health():
-    """Health of the babysitter daemon — which does not exist on this machine.
+    """Deliberately unwired: this skill ships no babysitter daemon.
 
-    Retired 2026-07-25 (Chang's call). There is no daemon.py, no watchdog, no
-    launchd job and no log: the "durable spine" SKILL.md described was never
-    built. For five days every tick reported `daemon: log-missing` as if a live
-    service had fallen over, and judge sessions kept escalating a restart for
-    software that had no install to restore. The fleet ran fine without it.
-    Kept as a stub returning absent=True so anything still reading
+    Retired as a live check 2026-07-25 (Chang's call), because it probed a
+    `scripts/daemon.py` this skill has never installed and reported
+    `daemon: log-missing` every tick as if a live service had fallen over —
+    judge sessions then escalated a *restart* for software with no install to
+    restore. The fleet ran fine without it.
+
+    The stub is NOT an assertion that no daemon exists anywhere. An operator may
+    run one out-of-band, and this fleet does (SKILL.md, "The babysitter daemon is
+    machine-local"). It stays unwired because a machine-local install is not this
+    skill's to health-check, and a shipped probe would go back to crying wolf on
+    every box that has none. Returns absent=True so anything reading
     tick-report.json["daemon"] gets a shape instead of a KeyError.
     """
-    return {"ok": True, "absent": True, "age_s": None, "reason": "no-daemon (retired 2026-07-25)"}
+    return {"ok": True, "absent": True, "age_s": None,
+            "reason": "not-checked (this skill ships no daemon; a machine-local one may exist)"}
+
+def codex_state(activity):
+    """Classify Codex from TBD's hook-backed machine state, never its TUI."""
+    return {
+        "working": ("WORKING", "Codex hook state: working"),
+        "waiting_for_user": ("DECISION", "Codex is waiting for user input"),
+        "idle": ("IDLE", "Codex hook state: idle"),
+        "unknown": ("IDLE", "Codex activity is not known yet"),
+    }.get(activity or "unknown", ("IDLE", f"Codex hook state: {activity}"))
 
 def fleet():
     rows = sh(["sqlite3","-separator","\t",DB,
-      "SELECT t.tmuxPaneID, w.displayName, w.tmuxServer, t.id, w.repoID "
-      "FROM worktree w JOIN terminal t ON t.worktreeID=w.id AND t.kind='claude' AND t.suspendedAt IS NULL "
+      "SELECT t.tmuxPaneID, w.displayName, w.tmuxServer, t.id, w.repoID, t.kind, "
+      "COALESCE(t.activityState,'unknown') "
+      "FROM worktree w JOIN terminal t ON t.worktreeID=w.id "
+      "AND t.kind IN ('claude','codex') AND t.suspendedAt IS NULL AND t.hibernatedAt IS NULL "
       "WHERE w.status='active' ORDER BY w.tmuxServer, w.displayName;"])
     out = []
     for l in rows.splitlines():
         p = l.split("\t")
-        if len(p) < 5: continue
-        pane, name, srv, tid, rid = p
-        # -e keeps the escapes: dimness is the only thing distinguishing a ghost
-        # suggestion from typed input, and it's gone by the time tmux strips ANSI.
-        cap_raw = sh(["tmux","-L",srv,"capture-pane","-p","-e","-t",pane])
-        cap = ANSI_RE.sub("", cap_raw)
-        state, note = classify(cap, cap_raw)
-        ctx_pct, is_1m, burn = burn_risk(cap)
+        if len(p) < 7: continue
+        pane, name, srv, tid, rid, kind, activity = p
+        if kind == "codex":
+            # Codex installs TBD hooks that publish activityState. Its rendered
+            # terminal is not Claude's UI and must not be interpreted with the
+            # grandfathered Claude-only screen classifier.
+            state, note = codex_state(activity)
+            ctx_pct, is_1m, burn = None, False, False
+        else:
+            # -e keeps the escapes: dimness is the only thing distinguishing a ghost
+            # suggestion from typed input, and it's gone by the time tmux strips ANSI.
+            cap_raw = sh(["tmux","-L",srv,"capture-pane","-p","-e","-t",pane])
+            cap = ANSI_RE.sub("", cap_raw)
+            state, note = classify(cap, cap_raw)
+            ctx_pct, is_1m, burn = burn_risk(cap)
         hook = POLICIES.get(rid, {})
         pol = hook.get("policy", {})
         # priorities/dont-touch are the UNION of global config + the repo's own hook
@@ -757,7 +848,8 @@ def fleet():
         protect = (any(d in pane or d.lower() in name.lower() for d in DONT_TOUCH)
                    or any(d.lower() in name.lower() for d in pol.get("dont_touch", [])))
         out.append({"pane": pane, "name": name, "server": srv, "tid": tid,
-                    "state": state, "note": note, "priority": prio, "protected": protect,
+                    "kind": kind, "state": state, "note": note,
+                    "priority": prio, "protected": protect,
                     "repo": hook.get("name"), "gate": pol.get("gate", {}).get("ready_when"),
                     "advance_skill": pol.get("advance_skill"), "deploy_skill": pol.get("deploy_skill"),
                     "ctx_pct": ctx_pct, "is_1m": is_1m, "burn_risk": burn})
@@ -840,7 +932,14 @@ def selftest():
     check("working outranks composer", classify(working, working)[0], "WORKING")
     check("empty pane", classify("", ""), ("EMPTY", ""))
 
-    print(f"selftest: {n}/{n} composer ghost-guard scenarios passed")
+    check("codex working comes from hook state",
+          codex_state("working"), ("WORKING", "Codex hook state: working"))
+    check("codex waiting is judgment, not scraped composer input",
+          codex_state("waiting_for_user"), ("DECISION", "Codex is waiting for user input"))
+    check("codex unknown fails quiet",
+          codex_state("unknown"), ("IDLE", "Codex activity is not known yet"))
+
+    print(f"selftest: {n}/{n} agent-state scenarios passed")
 
 
 def main():
@@ -1008,8 +1107,20 @@ import time
 
 QUEUE = pathlib.Path(__file__).resolve().parent.parent / "queue"
 LATEST = QUEUE / "HANDOFF-LATEST.md"
-DEFAULT_THRESHOLD = 200_000
+# 600k of a 1000k Opus window. Raised from 200k on 2026-07-29: at 200k a desk
+# session hit the ceiling roughly every two hours and spent the shift relaying
+# instead of judging, while the model it runs on had 800k of headroom left.
+# 600k still leaves ~400k of slack for the handoff write + the successor's boot.
+DEFAULT_THRESHOLD = 600_000
 SUCCESSOR_MODEL = "opus"
+
+
+def lease_credential_file(tid):
+    root = pathlib.Path(os.environ.get("TBD_HOME") or os.path.expanduser("~/tbd"))
+    matches = list((root / "runtime" / "nightwatch-leases").glob(f"{tid}-*.json"))
+    if len(matches) != 1:
+        sys.exit(f"refusing mutation: expected one capability file, found {len(matches)}")
+    return str(matches[0])
 
 
 def _run(cmd, **kw):
@@ -1101,10 +1212,28 @@ to you rather than getting truncated mid-shift.
 
 FIRST, before anything else:
 1. Read the handoff document: {doc_path}
-2. Close the predecessor — it is idle and waiting for you to do this:
+2. WAIT until the daemon-issued capability both exists AND renews. The file is
+   prepared before the database transfer, so existence alone is not authority;
+   this bounded loop covers that small commit race and also works if the
+   predecessor's follow-up message never arrives:
+     python3 - <<'PY'
+     import glob, os, subprocess, time
+     root = os.environ.get("TBD_HOME") or os.path.expanduser("~/tbd")
+     ok = False
+     for _ in range(60):
+         paths = glob.glob(os.path.join(root, "runtime", "nightwatch-leases", os.environ["TBD_TERMINAL_ID"] + "-*.json"))
+         if len(paths) == 1 and subprocess.call(["tbd", "nightwatch", "lease", "renew", "--credential-file", paths[0]]) == 0:
+             ok = True
+             break
+         time.sleep(1)
+     raise SystemExit(0 if ok else 2)
+     PY
+   Do not merge, apply, archive, wake/nudge, spawn, or close the predecessor
+   before that command passes.
+3. Close the predecessor — it is idle and waiting for you to do this:
      python3 "{pathlib.Path(__file__).resolve()}" --close-predecessor {pred_tid}
    (predecessor terminal {pred_tid}, tmux window {pred_window} on server {server})
-3. Confirm in your first message what you picked up and what you closed.
+4. Confirm in your first message what you picked up and what you closed.
 
 STANDING INSTRUCTION — this applies to YOU now, and to every session you spawn:
 When your own context passes {threshold:,} tokens, do not push through it. Run
@@ -1124,6 +1253,22 @@ def cmd_act(args):
     server = tmux_server()
     used = context_tokens(row.get("transcriptPath", ""))
     ts = int(time.time())
+
+    credential = lease_credential_file(tid)
+    lease_status = _run(["tbd", "nightwatch", "lease", "status", "--worktree", wid])
+    if lease_status.returncode != 0:
+        sys.exit(f"cannot verify judge lease before handoff: {lease_status.stderr.strip()}")
+    try:
+        current_lease = (json.loads(lease_status.stdout) or {}).get("lease") or {}
+    except json.JSONDecodeError:
+        sys.exit("cannot verify judge lease before handoff: unparseable status")
+    if not current_lease.get("valid") or current_lease.get("terminalID") != tid:
+        sys.exit("refusing handoff: this terminal does not hold the valid judge lease")
+    renewal = _run([
+        "tbd", "nightwatch", "lease", "renew", "--credential-file", credential,
+    ])
+    if renewal.returncode != 0:
+        sys.exit(f"refusing handoff: judge lease renewal failed: {renewal.stderr.strip()}")
 
     notes = pathlib.Path(args.notes_file).read_text() if args.notes_file else ""
     if not notes.strip():
@@ -1168,14 +1313,37 @@ Transcript: {row.get('transcriptPath')}
     except json.JSONDecodeError:
         new_id = spawn.stdout.strip() or "?"
 
+    transfer = _run([
+        "tbd", "nightwatch", "lease", "transfer",
+        "--credential-file", credential,
+        "--to-terminal", new_id,
+    ])
+    if transfer.returncode != 0:
+        sys.exit(f"lease transfer FAILED; predecessor remains authoritative and successor must stay read-only: {transfer.stderr.strip()}")
+    try:
+        transfer_result = json.loads(transfer.stdout)
+        successor_lease = transfer_result["lease"]
+        successor_credential = transfer_result["credentialFile"]
+    except json.JSONDecodeError:
+        sys.exit("lease transferred but response was unparseable; both sessions must stop mutating")
+
+    renew = f"tbd nightwatch lease renew --credential-file {successor_credential}"
+    delivery = _run([
+        "tbd", "terminal", "send", "--terminal", new_id, "--submit", "--text",
+        "Exclusive judge lease transferred to you. Before every mutable action run: " + renew,
+    ])
+    if delivery.returncode != 0:
+        print("warning: successor notification failed; its prewritten capability file remains recoverable", file=sys.stderr)
+
     print(f"handoff written: {doc}")
     print(f"successor spawned: {new_id} (model={SUCCESSOR_MODEL})")
+    print(f"judge lease transferred: generation {successor_lease['generation']}")
     print("go idle now — the successor closes this terminal once it has read the doc.")
     return 0
 
 
 def cmd_close(args):
-    """Close a predecessor terminal by killing its tmux window."""
+    """Close one predecessor through TBD so transcript/history are preserved."""
     target = args.close_predecessor
     r = _run(["tbd", "terminal", "list", os.environ.get("TBD_WORKTREE_ID", ""), "--json"])
     # A FAILED lookup is not an absent terminal. Collapsing the two would report
@@ -1194,14 +1362,22 @@ def cmd_close(args):
     if target == os.environ.get("TBD_TERMINAL_ID"):
         sys.exit("refusing to close myself — pass the PREDECESSOR's terminal id")
 
-    window = row.get("tmuxWindowID")
-    server = tmux_server()
-    if not window or not server:
-        sys.exit(f"cannot resolve tmux window/server for {target}")
-    kill = _run(["tmux", "-L", server, "kill-window", "-t", window])
-    if kill.returncode != 0 and "can't find" not in (kill.stderr or ""):
-        sys.exit(f"kill-window failed: {kill.stderr.strip()}")
-    print(f"closed predecessor {target} (window {window} on {server})")
+    # Closing a terminal is a mutable desk action too. The successor must prove
+    # it owns the transferred capability before force-closing its predecessor.
+    self_tid = os.environ.get("TBD_TERMINAL_ID", "")
+    credential = lease_credential_file(self_tid)
+    renewal = _run([
+        "tbd", "nightwatch", "lease", "renew", "--credential-file", credential,
+    ])
+    if renewal.returncode != 0:
+        sys.exit("refusing to close predecessor: this terminal does not hold the judge lease")
+
+    close = _run([
+        "tbd", "terminal", "close", "--terminal", target, "--force", "--json",
+    ])
+    if close.returncode != 0:
+        sys.exit(f"terminal close failed: {close.stderr.strip()}")
+    print(f"closed predecessor {target} through TBD (history preserved)")
     return 0
 
 
@@ -1236,15 +1412,20 @@ def selftest():
 
     # context_tokens: the reported figure is input + BOTH cache buckets, and the
     # largest record in the tail wins (the tail holds smaller earlier turns).
+    # Derived from DEFAULT_THRESHOLD, never a literal: the 2026-07-29 raise to
+    # 600k silently turned a hardcoded 250_000 "over" fixture into an "under"
+    # one, so the selftest would have kept passing while asserting the opposite
+    # of its own label.
+    over_total = DEFAULT_THRESHOLD + 50_000
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
-        for total in (10_000, 250_000, 40_000):
+        for total in (10_000, over_total, 40_000):
             fh.write(json.dumps({"message": {"usage": {
                 "input_tokens": total - 30, "cache_creation_input_tokens": 20,
                 "cache_read_input_tokens": 10}}}) + "\n")
         fh.write("not json at all\n")          # tolerated, not fatal
         fh.write(json.dumps({"message": {}}) + "\n")   # no usage block
         path = fh.name
-    check("largest usage record wins", context_tokens(path), 250_000)
+    check("largest usage record wins", context_tokens(path), over_total)
     check("over ceiling exits 10", with_row({"transcriptPath": path}), 10)
 
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
@@ -1307,7 +1488,7 @@ Default is dry-run (prints the plan, touches nothing). `--prs` also gates open P
 (makes gh calls — skip during a GitHub-rate crunch). Dedupes + clears the queue on a
 successful --act drain.
 """
-import subprocess, os, json, time, sys
+import subprocess, os, json, time, sys, glob
 
 HOME = os.path.expanduser("~")
 DB = f"{HOME}/tbd/state.db"
@@ -1318,6 +1499,36 @@ REPO = "longeye-ai/monorepo"
 def sh(args, t=20):
     try: return subprocess.run(args, capture_output=True, text=True, timeout=t).stdout
     except Exception: return ""
+
+def lease_credential_file(tid):
+    root = os.environ.get("TBD_HOME") or os.path.expanduser("~/tbd")
+    matches = glob.glob(os.path.join(
+        root, "runtime", "nightwatch-leases", f"{tid}-*.json"))
+    if len(matches) != 1:
+        sys.exit(f"refusing mutation: expected one capability file, found {len(matches)}")
+    return matches[0]
+
+
+def require_judge_lease():
+    """Renew exact desk authority immediately before one mutable dispatch."""
+    tid, wid = os.environ.get("TBD_TERMINAL_ID"), os.environ.get("TBD_WORKTREE_ID")
+    if not tid or not wid:
+        sys.exit("refusing dispatch: missing TBD terminal/worktree identity")
+    try:
+        status = subprocess.run(
+            ["tbd", "nightwatch", "lease", "status", "--worktree", wid],
+            capture_output=True, text=True, timeout=20)
+        lease = (json.loads(status.stdout) or {}).get("lease") if status.returncode == 0 else None
+    except Exception:
+        lease = None
+    if not lease or not lease.get("valid") or lease.get("terminalID") != tid:
+        sys.exit("refusing dispatch: this terminal does not hold the valid judge lease")
+    credential = lease_credential_file(tid)
+    renewal = subprocess.run([
+        "tbd", "nightwatch", "lease", "renew", "--credential-file", credential,
+    ], capture_output=True, text=True, timeout=20)
+    if renewal.returncode != 0:
+        sys.exit("refusing dispatch: judge lease renewal failed")
 
 def gh(*a, t=20):
     for k in ("HTTPS_PROXY","HTTP_PROXY","https_proxy","http_proxy"): os.environ.pop(k, None)
@@ -1337,6 +1548,7 @@ def saturated(rep):
 def dispatch(tid, text, act):
     """Run the repo's bound skill in the owner's terminal (or describe it in dry-run)."""
     if not act or not tid: return False
+    require_judge_lease()
     sh(["tbd", "terminal", "send", "--terminal", tid, "--submit", "--text", text])
     return True
 
@@ -1352,7 +1564,8 @@ def main():
     by_branch = {}
     for l in sh(["sqlite3","-separator","\t",DB,
                  "SELECT w.branch,t.tmuxPaneID,t.id,r.displayName FROM worktree w "
-                 "JOIN terminal t ON t.worktreeID=w.id AND t.kind='claude' AND t.suspendedAt IS NULL "
+                 "JOIN terminal t ON t.worktreeID=w.id "
+                 "AND t.kind IN ('claude','codex') AND t.suspendedAt IS NULL AND t.hibernatedAt IS NULL "
                  "JOIN repo r ON w.repoID=r.id WHERE w.status='active';"]).splitlines():
         p = l.split("\t")
         if len(p) >= 4: by_branch[p[0]] = {"pane": p[1], "tid": p[2], "repo": p[3]}
@@ -1404,7 +1617,11 @@ def main():
             adv = a.get("advance_skill")
             ready = (verdict == "APPROVED" and mstate == "clean")
             if ready:
-                for_adam.append(f"READY — #{pr}: claude-APPROVED + clean. Human merge.")
+                # Reported, never merged here: this script has no head-SHA or
+                # required-context check, and the gate wants all three re-read in
+                # the same tool call as the enqueue. The judge does that itself.
+                for_adam.append(f"READY — #{pr}: claude-APPROVED + clean. Judge may enqueue "
+                                f"(`gh pr merge {pr}`) after re-reading head SHA + required contexts.")
             elif owner and adv and a.get("state") != "WORKING":
                 txt = f"nightwatch: PR #{pr} not yet claude-APPROVED ({verdict}). Run `/{adv}` to drive it to APPROVED on the current SHA. Do NOT merge."
                 if not sat and dispatch(owner["tid"], txt, act): acted += 1; tag = "DISPATCHED"
@@ -1420,6 +1637,7 @@ def main():
         for x in for_adam: f.write(f"- {x}\n")
     print(f"\nactions dispatched: {acted}   human items → queue/for-adam.md ({len(for_adam)})")
     if act and not sat:
+        require_judge_lease()
         open(qf, "w").close(); print("drained decisions.jsonl")
     else:
         print("(dry-run or saturated — queue left intact)")

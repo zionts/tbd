@@ -21,3 +21,8 @@ docs/plans/
 
 # Mock harness screenshot artifacts
 artifacts/
+
+rust/comrak-ffi/target/
+
+# Python bytecode (review-v2 scripts and any future Python tooling)
+__pycache__/

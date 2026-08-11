@@ -316,6 +316,23 @@ public enum HibernateReason: String, Codable, Sendable {
         self = HibernateReason(rawValue: raw) ?? .auto
     }
 }
+public enum WatchDeskRole: String, Codable, Sendable, Equatable {
+    case judge
+    case readOnlyCoordinator = "read_only_coordinator"
+
+    public init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        // A role introduced by a newer daemon must never acquire mutable
+        // semantics in an older app. Render it as read-only and keep decoding.
+        self = Self(rawValue: raw) ?? .readOnlyCoordinator
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
 public struct Terminal: Codable, Sendable, Identifiable, Equatable {
     public let id: UUID
     public var worktreeID: UUID
@@ -357,6 +374,9 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
     /// row). Drives the "⏳ resumes 1:01pm" tab badge. Optional for
     /// decode-compat with pre-v43 rows/JSON.
     public var pendingResumeAt: Date?
+    /// Explicit Watch Desk authority. Nil means an ordinary terminal.
+    /// The lease row, not this display marker, is authoritative for mutation.
+    public var watchDeskRole: WatchDeskRole?
 
     public init(id: UUID = UUID(), worktreeID: UUID, tmuxWindowID: String,
                 tmuxPaneID: String, label: String? = nil, createdAt: Date = Date(),
@@ -369,7 +389,8 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
                 hibernatedAt: Date? = nil,
                 hibernateReason: HibernateReason? = nil,
                 keepWarm: Bool = false,
-                pendingResumeAt: Date? = nil) {
+                pendingResumeAt: Date? = nil,
+                watchDeskRole: WatchDeskRole? = nil) {
         self.id = id
         self.worktreeID = worktreeID
         self.tmuxWindowID = tmuxWindowID
@@ -388,13 +409,14 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
         self.hibernateReason = hibernateReason
         self.keepWarm = keepWarm
         self.pendingResumeAt = pendingResumeAt
+        self.watchDeskRole = watchDeskRole
     }
 
     enum CodingKeys: String, CodingKey {
         case id, worktreeID, tmuxWindowID, tmuxPaneID, label, createdAt
         case pinnedAt, claudeSessionID, suspendedAt, suspendedSnapshot, profileID, transcriptPath, kind
         case activityState
-        case hibernatedAt, hibernateReason, keepWarm, pendingResumeAt
+        case hibernatedAt, hibernateReason, keepWarm, pendingResumeAt, watchDeskRole
     }
 
     public init(from decoder: Decoder) throws {
@@ -417,6 +439,7 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
         hibernateReason = try c.decodeIfPresent(HibernateReason.self, forKey: .hibernateReason)
         keepWarm = try c.decodeIfPresent(Bool.self, forKey: .keepWarm) ?? false
         pendingResumeAt = try c.decodeIfPresent(Date.self, forKey: .pendingResumeAt)
+        watchDeskRole = try c.decodeIfPresent(WatchDeskRole.self, forKey: .watchDeskRole)
     }
 }
 
@@ -872,9 +895,34 @@ public struct Config: Codable, Sendable, Equatable {
     /// the daemon polls provider executables in the background and can stop
     /// remote sessions, so it is opt-in until it soaks.
     public var remoteBackendsEnabled: Bool
+    /// Soak flag for delivery acknowledgement — the machinery that establishes
+    /// whether a dispatched payload actually landed (fleet-supervision design
+    /// §12). Default OFF: the re-check acts on no user gesture and its single
+    /// retry types into a live session, so the whole path is opt-in.
+    ///
+    /// What it gates: arming the re-check, the evidence-bounded retry, and the
+    /// startup replay. While it is off, `terminal.send --verify` is *refused*
+    /// with the flag named and nothing is typed — a caller that asked for
+    /// evidence must never be answered with a silence that reads like
+    /// confirmation.
+    ///
+    /// What it deliberately does NOT gate: the dispatch envelope. Attribution
+    /// belongs on every text dispatch to an agent, verified or not, and a prefix
+    /// that comes and goes with a config column is worse than one that is always
+    /// there. (Whether a target receives the envelope at all is a property of
+    /// the target, not of this flag: shells do not.)
+    public var deliveryVerificationEnabled: Bool
 
     /// Default idle-timeout for auto-hibernation, in minutes.
     public static let defaultHibernateIdleMinutes = 30
+    /// Floor for `hibernateIdleMinutes` — a zero/negative value would make the
+    /// idle sweep hibernate everything on its next tick.
+    public static let minHibernateIdleMinutes = 1
+    /// Ceiling for `hibernateIdleMinutes` — 99 days. Enforced at every layer:
+    /// the Settings amount+unit control clamps input to it, `ConfigStore`
+    /// clamps on both write and read, and `HibernationCoordinator.sweep()`
+    /// floors the value it reads for the idle timer.
+    public static let maxHibernateIdleMinutes = 99 * 24 * 60
     /// Default grace period before the orphan-GC sweep reaps a directory.
     public static let defaultGCGraceSeconds = 3600
     /// Default retention window for reap snapshots.
@@ -903,7 +951,8 @@ public struct Config: Codable, Sendable, Equatable {
                 gcSnapshotRetentionDays: Int = Config.defaultGCSnapshotRetentionDays,
                 panelSurfaceEnabled: Bool = false,
                 agentPanelControlEnabled: Bool = false,
-                remoteBackendsEnabled: Bool = false) {
+                remoteBackendsEnabled: Bool = false,
+                deliveryVerificationEnabled: Bool = false) {
         self.defaultProfileID = defaultProfileID
         self.primaryAgentPreference = primaryAgentPreference
         self.envSettingOverrides = envSettingOverrides
@@ -928,6 +977,7 @@ public struct Config: Codable, Sendable, Equatable {
         self.panelSurfaceEnabled = panelSurfaceEnabled
         self.agentPanelControlEnabled = agentPanelControlEnabled
         self.remoteBackendsEnabled = remoteBackendsEnabled
+        self.deliveryVerificationEnabled = deliveryVerificationEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -977,6 +1027,10 @@ public struct Config: Codable, Sendable, Equatable {
             Bool.self, forKey: .agentPanelControlEnabled) ?? false
         remoteBackendsEnabled = try c.decodeIfPresent(
             Bool.self, forKey: .remoteBackendsEnabled) ?? false
+        // Absent (older daemon / older persisted JSON) defaults to OFF, matching
+        // the v69 column default — the soak has to be opted into.
+        deliveryVerificationEnabled = try c.decodeIfPresent(
+            Bool.self, forKey: .deliveryVerificationEnabled) ?? false
     }
 }
 
