@@ -435,6 +435,17 @@ struct TerminalPanelRepresentable: NSViewRepresentable {
         /// WINDOW, so resize RPCs need it.
         private var controlModeAttach:
             (worktreeID: UUID, paneID: String, windowID: String, routingKey: String, generation: UInt64?)?
+        /// Keystroke → first-echo timing (diagnostics only). Shared across all
+        /// panels so one log line summarizes the whole window rather than
+        /// emitting per-pane noise.
+        private static let echoLatency = EchoLatencyRecorder()
+        /// When the outstanding timeable keystroke left `send(source:data:)`.
+        /// nil = nothing in flight. Only the FIRST keystroke of a burst is
+        /// timed: fast typing would otherwise overwrite the stamp and report
+        /// the inter-keystroke gap instead of the echo interval. MainActor
+        /// isolation makes the unsynchronized access safe — `send` and
+        /// `dataReceived`'s handler both run there.
+        @MainActor private var pendingKeystrokeAt: ContinuousClock.Instant?
         /// Debounces control-mode `pane.resize` RPCs (M3.2). Cancel-and-replace
         /// so only the tail of a window-drag flurry reaches the daemon; cancelled
         /// in `cleanup()`.
@@ -988,7 +999,11 @@ struct TerminalPanelRepresentable: NSViewRepresentable {
                 await appState.controlModeReaders.registerReader(
                     routingKey: routingKey, fd: fd, generation: generation) { chunk in
                         let bytes = [UInt8](chunk)
-                        DispatchQueue.main.async {
+                        DispatchQueue.main.async { [weak self] in
+                            // Same echo-interval close as the grouped path, so
+                            // the measurement survives a control-mode flip
+                            // instead of silently reporting nothing.
+                            MainActor.assumeIsolated { self?.closeEchoInterval() }
                             weakTV.view?.feed(byteArray: bytes[...])
                         }
                     }
@@ -1246,9 +1261,23 @@ struct TerminalPanelRepresentable: NSViewRepresentable {
 
         func dataReceived(slice: ArraySlice<UInt8>) {
             DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.closeEchoInterval()
+                }
                 self?.groupedViewerDidReceiveOutput()
                 self?.terminalView?.feed(byteArray: slice)
             }
+        }
+
+        /// Close an outstanding keystroke → echo interval, if any. Called as
+        /// output arrives, BEFORE `feed`, so the sample measures time-to-bytes
+        /// rather than including SwiftTerm's own parse — the two are separable
+        /// and the transport question is the one being asked.
+        @MainActor
+        private func closeEchoInterval() {
+            guard let sentAt = pendingKeystrokeAt else { return }
+            pendingKeystrokeAt = nil
+            Self.echoLatency.record(ContinuousClock.now - sentAt)
         }
 
         func getWindowSize() -> winsize {
@@ -1272,6 +1301,17 @@ struct TerminalPanelRepresentable: NSViewRepresentable {
             // Interrupt detection (Ctrl-C / Esc) must keep working in every
             // path, so run it FIRST regardless of where the bytes go next.
             handleOutgoingInput(data)
+            // Stamp the echo-latency clock before the bytes leave, so the
+            // interval covers the whole round trip. `assumeIsolated` matches
+            // `getWindowSize` below: SwiftTerm calls its delegate from the
+            // view's key handling, which is main-thread.
+            if EchoLatencyKeystroke.isTimeable(data) {
+                MainActor.assumeIsolated {
+                    // Only the first keystroke of a burst is timed; a later one
+                    // must not overwrite an outstanding stamp.
+                    if pendingKeystrokeAt == nil { pendingKeystrokeAt = ContinuousClock.now }
+                }
+            }
             switch OutgoingInputRoute.decide(
                 controlModeAttached: controlModeAttach != nil, byteCount: data.count) {
             case .localPTY:
