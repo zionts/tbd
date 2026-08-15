@@ -51,6 +51,13 @@ final class FDSidecarClient: @unchecked Sendable {
         lock.unlock()
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         if fd < 0 { throw FDSidecarError.connectFailed(errno) }
+        // Per-socket companion to the process-wide `signal(SIGPIPE, SIG_IGN)`
+        // in `AppDelegate.applicationWillFinishLaunching`. Either alone
+        // prevents a peer-closed write from killing the app; both are cheap,
+        // and this one keeps the guarantee attached to the socket that needs
+        // it rather than depending on a distant startup side effect.
+        var noSigPipe: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let sunPathSize = MemoryLayout.size(ofValue: addr.sun_path)

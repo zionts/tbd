@@ -184,6 +184,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         lifecycleLogger.info("willFinishLaunching")
 
+        // A raw write to a peer-closed UNIX socket raises a process-KILLING
+        // SIGPIPE unless it is ignored, in which case the write returns EPIPE
+        // and the error surfaces normally. `TBDDaemon/main.swift` has ignored
+        // it since the R7-H1 hardening; the app is the OTHER END of that same
+        // sidecar socket (`FDSidecarClient` opens a bare
+        // `socket(AF_UNIX, SOCK_STREAM, 0)` with no `SO_NOSIGPIPE`) and was
+        // never hardened, so it simply died instead.
+        //
+        // Observed as: launching from the Dock against an already-running
+        // daemon killed the app ~2.5s in with
+        // `launchd: exited due to SIGPIPE | sent by TBDApp`, while
+        // `scripts/restart.sh` appeared fine only because it restarts the
+        // daemon at the same time, so the app never met a stale peer.
+        //
+        // Earliest possible placement: this must precede any socket write,
+        // and `AppState` (which connects to the daemon) is constructed as the
+        // App struct's `@StateObject`, which can run before
+        // `applicationDidFinishLaunching`.
+        signal(SIGPIPE, SIG_IGN)
+
         // FIX 1(a): disable AppKit's off-screen NSTableView row-height ESTIMATION
         // process-wide, at the EARLIEST launch point — before ANY NSTableView (the
         // worktree sidebar, the transcript table) is created. Registering it only
