@@ -1,3 +1,4 @@
+import ArgumentParser
 import Foundation
 import Testing
 
@@ -112,5 +113,15 @@ struct ConfigCommandsTests {
         let rendered = ConfigGet.render(config)
         #expect(rendered.contains("update-mode: check"))
         #expect(rendered.contains("auto-archive-on-merge: off"))
+    }
+
+    // MARK: - No transport-shaped switch
+
+    /// Hibernation takes one switch — `auto_hibernate_enabled` — for every
+    /// transport. A `tbd config holder-hibernation` leg would advertise a
+    /// second gate that no rail reads.
+    @Test func thereIsNoHolderHibernationSwitch() {
+        let names = ConfigCommand.configuration.subcommands.map { $0._commandName }
+        #expect(!names.contains("holder-hibernation"))
     }
 }

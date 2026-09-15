@@ -51,7 +51,7 @@ custom_rules:
     name: "No print() in Sources/"
     # included/excluded HERE take REGEX (not glob), matched against file path.
     included:
-      - "Sources/(TBDShared|TBDDaemon|TBDApp|TBDPeerHelper|TBDHolder)/.*\\.swift"
+      - "Sources/(TBDShared|TBDDaemon|TBDApp|TBDPeerHelper|TBDHolder|TBDModelProxy)/.*\\.swift"
     regex: '\b(?:Swift\.|Foundation\.)?print\s*\('
     match_kinds:
       - identifier
@@ -62,7 +62,7 @@ custom_rules:
     name: "No raw Task.sleep in Sources/"
     # included/excluded HERE take REGEX (not glob), matched against file path.
     included:
-      - "Sources/(TBDShared|TBDDaemon|TBDApp|TBDPeerHelper|TBDHolder)/.*\\.swift"
+      - "Sources/(TBDShared|TBDDaemon|TBDApp|TBDPeerHelper|TBDHolder|TBDModelProxy)/.*\\.swift"
     regex: 'Task\.sleep\s*\('
     match_kinds:
       - identifier
@@ -73,7 +73,7 @@ custom_rules:
     name: "No account-database home lookup in Sources/"
     # included/excluded HERE take REGEX (not glob), matched against file path.
     included:
-      - "Sources/(TBDShared|TBDDaemon|TBDApp|TBDPeerHelper|TBDHolder)/.*\\.swift"
+      - "Sources/(TBDShared|TBDDaemon|TBDApp|TBDPeerHelper|TBDHolder|TBDModelProxy)/.*\\.swift"
     # Every one of these resolves a home directory through the account database
     # and defeats `CFFIXED_USER_HOME` identically. The Swift-shaped ones —
     # `NSHomeDirectoryForUser(_:)` and `FileManager.homeDirectory(forUser:)` —
@@ -91,7 +91,7 @@ custom_rules:
     # custom rule cannot reach files outside it, and pulling all of Tests/ in
     # would drag every default rule onto test code — a separate change.
     included:
-      - "Sources/(TBDShared|TBDDaemon|TBDApp|TBDPeerHelper|TBDHolder)/.*\\.swift"
+      - "Sources/(TBDShared|TBDDaemon|TBDApp|TBDPeerHelper|TBDHolder|TBDModelProxy)/.*\\.swift"
       - "Tests/(TBDSharedTests|TBDAppTests)/.*\\.swift"
     # OPTIMIZED FOR THE PRIVACY RATIONALE, deliberately, and that decides both
     # knobs:
@@ -123,7 +123,7 @@ custom_rules:
     name: "No hand-built path into a TBD or agent store"
     # included/excluded HERE take REGEX (not glob), matched against file path.
     included:
-      - "Sources/(TBDShared|TBDDaemon|TBDApp|TBDPeerHelper|TBDHolder)/.*\\.swift"
+      - "Sources/(TBDShared|TBDDaemon|TBDApp|TBDPeerHelper|TBDHolder|TBDModelProxy)/.*\\.swift"
     excluded:
       # THE resolvers. `TBDConstants.configDir` and `claudeHostHome` are the
       # single resolution points every other call site is supposed to reach
@@ -172,7 +172,7 @@ custom_rules:
     # `Sources/TBDCLI` from the global list: that would drag every default rule
     # onto the CLI target, which is a separate change.
     included:
-      - "Sources/(TBDShared|TBDDaemon|TBDApp|IconBaker|TBDPeerHelper|TBDHolder)/.*\\.swift"
+      - "Sources/(TBDShared|TBDDaemon|TBDApp|IconBaker|TBDPeerHelper|TBDHolder|TBDModelProxy)/.*\\.swift"
     excluded:
       # `GitManager.swift` — its two error types take their conformance from
       # `Git/GitErrorLocalizedDescriptions.swift`, and the rule cannot see an
@@ -277,6 +277,13 @@ custom_rules:
       - "Sources/TBDApp/Panes/Transcript/TranscriptOverlayView\\.swift"
       # OverlayFileView is the body of a file frame in the overlay — outside the transcript list, real ScrollView is safe.
       - "Sources/TBDApp/Panes/Transcript/OverlayFileView\\.swift"
+      # CompletionOverlayView is the composer's completion menu, a fixed-height
+      # floating overlay above the composer — never hosted or measured as a
+      # transcript row card.
+      - "Sources/TBDApp/Panes/Transcript/Composer/CompletionOverlayView\\.swift"
+      # AttachmentStrip is the composer's thumbnail strip above the text field —
+      # also outside the transcript list's row-measurement path.
+      - "Sources/TBDApp/Panes/Transcript/Composer/AttachmentStrip\\.swift"
     regex: '\bScrollView\b'
     match_kinds:
       - identifier
@@ -401,6 +408,7 @@ custom_rules:
       - "Sources/TBDDaemon/Lifecycle/WorktreeLifecycle\\+Archive\\.swift"     # archive teardown; covered by worktree.archive / auto-archive-on-merge
       - "Sources/TBDDaemon/Lifecycle/WorktreeLifecycle\\+Forget\\.swift"      # forget teardown; covered by worktree.forget
       - "Sources/TBDDaemon/Lifecycle/WorktreeLifecycle\\+Create\\.swift"      # primary-terminal spawn; covered by worktree.create / scratch.create / revive
+      - "Sources/TBDDaemon/Lifecycle/WorktreeLifecycle\\+SpawnTerminal\\.swift" # the one spawn-and-record step every spawn path calls; covered by the caller's row: terminal.create / terminal.continueInCodex / worktree.create / scratch.create / revive
       - "Sources/TBDDaemon/Lifecycle/WorktreeLifecycle\\+PreSession\\.swift"  # hook-terminal spawn and close; covered by worktree.rerunPreSession / create
       - "Sources/TBDDaemon/Lifecycle/WorktreeLifecycle\\+Reconcile\\.swift"   # the reconcile rail; one row per act at its own entry point
       - "Sources/TBDDaemon/Nightwatch/DeskSessionManager\\.swift"             # the nightwatch-desk rail: its pastes, spawn and close

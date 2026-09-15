@@ -200,7 +200,7 @@ struct ActuationLogTests {
             == .refused(.notEligible))
         #expect(ActuationOutcome.classify(HibernateResult.notFound) == .refused(.notFound))
 
-        #expect(ActuationOutcome.classify(WakeResult.ok) == .dispatched)
+        #expect(ActuationOutcome.classify(WakeResult.ok(sessionIncarnationID: nil)) == .dispatched)
         #expect(ActuationOutcome.classify(WakeResult.respawnFailed(reason: "tmux")) == .transportFailed)
         #expect(ActuationOutcome.classify(WakeResult.notHibernated) == .refused(.noop))
         #expect(ActuationOutcome.classify(WakeResult.inFlight) == .refused(.inFlight))
@@ -371,6 +371,39 @@ struct ActuationLogTests {
         let written = try rows(at: path)
         #expect(written.count == 1)
         #expect(written.first?["message"] as? String == "second")
+    }
+
+    // MARK: - Vocabulary
+
+    /// The record's `modeSource` and a screen's `source` name the same fact, and
+    /// a supervisor correlates them by string comparison — reading
+    /// `screen.source` out of `tbd terminal output --json` and matching it
+    /// against the row its send produced. Two spellings would break exactly the
+    /// case worth correlating, `staleDaemon`: the one that says the composition
+    /// was a guess.
+    ///
+    /// Driven off `TerminalScreen.Source.allCases`, so a case added there
+    /// reddens this until it is added here too — which is also the mapping's
+    /// totality check.
+    @Test("every screen source keeps its wire spelling in the actuation record")
+    func modeSourceSpellingsMatchTheScreens() {
+        for source in TerminalScreen.Source.allCases {
+            let recorded = ActuationModeSource(source).rawValue
+            #expect(
+                recorded == source.rawValue,
+                "the record spells \(source) as '\(recorded)', a screen as '\(source.rawValue)'")
+        }
+    }
+
+    /// `unavailable` is the record's own case — nothing answered at all — so it
+    /// has no screen spelling to agree with and the loop above cannot see it.
+    /// Pinned separately so the vocabulary is covered whole.
+    @Test("unavailable is the record's own case and keeps its spelling")
+    func unavailableIsTheRecordsOwn() {
+        #expect(ActuationModeSource.unavailable.rawValue == "unavailable")
+        #expect(
+            ActuationModeSource.allCases.count == TerminalScreen.Source.allCases.count + 1,
+            "the record's vocabulary is the screen's plus exactly `unavailable`")
     }
 
     @Test("a file replaced by a different file between appends is followed, not written past")

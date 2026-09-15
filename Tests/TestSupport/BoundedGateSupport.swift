@@ -101,10 +101,20 @@ public final class GateExecutor: TaskExecutor, @unchecked Sendable {
 /// Starts a task that is expected to block on a `waitForGate`, on threads that
 /// are not Swift's cooperative pool.
 ///
-/// Use this for the ONE side that gets held. The other side — the work the
-/// test runs while the gate is closed, and the `signal()` that releases it —
-/// stays on the pool, which is the point: it needs a thread, and this call is
-/// what guarantees one is left.
+/// Ordinarily use this for the ONE side that gets held. The other side — the
+/// work the test runs while the gate is closed, and the `signal()` that
+/// releases it — stays on the pool, which is the point: it needs a thread,
+/// and this call is what guarantees one is left.
+///
+/// **That assumes the pool can be reached.** When a suite shares the test
+/// process with one that deliberately saturates the pool —
+/// `BoundedGateWaitTests`'s whole subject, which parks every cooperative
+/// thread for 120 s — a releasing side left on the pool may not run at all,
+/// and the hand-off that releases the gate needs `gateHoldingTask` too, not
+/// just the held side. `ModelProxySupervisorTests.swift`'s `runBlocking` is
+/// the sanctioned pattern for that case: both the held side and the
+/// `signal()`-equivalent hand-off run through `gateHoldingTask`, and its own
+/// doc comment explains why.
 ///
 /// **The preference stops at an unstructured task.** SE-0417 carries a task
 /// executor preference into child tasks (`async let`, task groups) and into
@@ -116,8 +126,14 @@ public final class GateExecutor: TaskExecutor, @unchecked Sendable {
 /// cooperative pool however its caller was started, so a gate released from
 /// there is subject to the pass's scheduling latency and must be bounded by
 /// ``TestDeadlines/saturatedPass`` rather than by a snappier number. It is not
-/// pinning a thread, and no call-site change can move it; only the bound is
-/// yours to get right. `BoundedGateWaitTests` pins the rule.
+/// pinning a thread, and no call-site change can move it. What can move it is
+/// the callee taking the executor itself: `ShutdownLatch(executor:)` exists
+/// for tests that hold a latch of their own, and `ServerShutdownLatchTests`
+/// builds one on `GateExecutor.shared` so nothing it waits on touches the
+/// pool. A test that reaches a latch through a server's `stop()` has no such
+/// handle — the servers build their latches with the default — so there the
+/// bound is still the only thing yours to get right. `BoundedGateWaitTests`
+/// pins the rule.
 public func gateHoldingTask<Success: Sendable>(
     _ operation: @escaping @Sendable () async -> Success
 ) -> Task<Success, Never> {
@@ -235,7 +251,8 @@ public func waitFor(
 /// small fraction of the 30-minute step budget, so a wedge reports in minutes
 /// instead of consuming the job.
 ///
-/// It also stays inside `.clockDriven`'s `.timeLimit(.minutes(4))`, leaving
+/// It also stays inside the shared fast-pass suite limit,
+/// `.fastPassBounded` / `.clockDriven` (`.timeLimit(.minutes(4))`), leaving
 /// room for the rest of an ordinary test after one full gate timeout — the
 /// same invariant `Tests/CLAUDE.md` derives for `ciSafeDeadline` and
 /// `waitForSuspension`. Re-derive it together with those two when the test
@@ -262,14 +279,16 @@ public struct TestGateTimeout: Error, CustomStringConvertible {
     public var description: String {
         """
         test gate "\(gate)" was never signalled within \(after) — the releasing \
-        statement did not run in time. Two causes, and they need different \
+        statement did not run in time. Three causes, and they need different \
         fixes. (1) The holding side was started with a plain `Task` rather than \
         `gateHoldingTask`, so it blocked a cooperative-pool thread the release \
-        needed: move it. (2) The release itself runs on the pool and was merely \
-        starved — which an unstructured `Task` anywhere on its path guarantees, \
-        because SE-0417 does not carry an executor preference into `Task {}`, \
-        so `gateHoldingTask` at the call site does not cover work a callee \
-        hands to one: size the bound at `TestDeadlines.saturatedPass` instead. \
+        needed: move it. (2) The release runs on the pool beyond an unstructured \
+        `Task` in a callee the test constructs — SE-0417 does not carry an \
+        executor preference into `Task {}`, so `gateHoldingTask` at the call \
+        site does not reach it: inject the executor into the callee instead, as \
+        `ShutdownLatch(executor:)` allows. (3) The hop sits inside production \
+        code the test does not construct, so nothing can move it and it was \
+        merely starved: size the bound at `TestDeadlines.saturatedPass`. \
         See Tests/TestSupport/BoundedGateSupport.swift.
         """
     }

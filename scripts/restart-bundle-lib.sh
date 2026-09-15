@@ -38,9 +38,9 @@ BUILD_IDENTITY_PATHSPECS=(
 
 # Every product a running installation needs. scripts/restart.sh and
 # scripts/update.sh both build exactly this list, so a product added here
-# reaches both paths. TBDCLI, TBDHolder and TBDPeerHelper are each found by a
-# SIBLING lookup beside the daemon binary, and a sibling that was never built
-# fails in the field rather than in the build:
+# reaches both paths. TBDCLI, TBDHolder, TBDPeerHelper and TBDModelProxy are
+# each found by a SIBLING lookup beside the daemon binary, and a sibling that
+# was never built fails in the field rather than in the build:
 #
 #   TBDDaemon      launched in place from .build/<config>.
 #   TBDApp         hard-linked into the .app bundle by assemble_app_bundle.
@@ -58,6 +58,11 @@ BUILD_IDENTITY_PATHSPECS=(
 #   TBDPeerHelper  the shadow-peer helper for remote peer messaging
 #                  (ShadowPeerHelperProcessSpawner). Missing, a remote lane
 #                  fails to arm with executableMissing.
+#   TBDModelProxy  the loopback model proxy the daemon spawns once per TBD home
+#                  (ModelProxySupervisor). Missing, the daemon reports the
+#                  model-proxy capability unsupported: sessions spawn unproxied
+#                  and transcript streaming silently never starts, which is the
+#                  same never-built-helper failure the holder had.
 #
 # Every product here is all-or-nothing: a helper that fails to compile stops
 # the restart or update the same way a daemon that fails to compile does. That
@@ -65,15 +70,16 @@ BUILD_IDENTITY_PATHSPECS=(
 # and that graceful path is exactly how a never-built helper went unnoticed;
 # building it as a warning would put the same silent degradation one scroll
 # above the "Daemon ready" line. The holder and peer helper depend on
-# TBDShared and nothing else, and the CLI on TBDShared plus packages the
-# daemon also links, so a helper that fails while the daemon builds is a
-# broken tree, and a broken tree is what a restart should refuse.
+# TBDShared and nothing else, the model proxy on TBDShared plus SwiftNIO, and
+# the CLI on TBDShared plus packages the daemon also links, so a helper that
+# fails while the daemon builds is a broken tree, and a broken tree is what a
+# restart should refuse.
 #
 # scripts/restart-bundle-lib.test.sh checks that each name is an executable
 # target in Package.swift, so a rename or typo fails there and not on the next
 # restart.
 # shellcheck disable=SC2034 # consumed by the two scripts that source this file
-RUNTIME_PRODUCTS=(TBDDaemon TBDApp TBDCLI TBDHolder TBDPeerHelper)
+RUNTIME_PRODUCTS=(TBDDaemon TBDApp TBDCLI TBDHolder TBDPeerHelper TBDModelProxy)
 
 # MARK: - Build identity
 
@@ -173,7 +179,7 @@ assemble_app_bundle() {
     local launch_path="${3-}"
     local bundle_dir bundle_macos bundle_plist source_plist
     local app_exec_path bundle_resources source_icon bundle_icon
-    local source_resource_bundle bundle_resource_bundle sidecar
+    local source_resource_bundle bundle_resource_bundle resource_bundle_name sidecar
 
     if [ -z "$repo_root" ] || [ -z "$build_dir" ]; then
         echo "error: assemble_app_bundle needs a repo root and a build dir" >&2
@@ -213,18 +219,52 @@ assemble_app_bundle() {
         cp "$source_icon" "$bundle_icon" || return 1
     fi
 
-    # The resource bundle with localized strings and assets. SPM produces it in
-    # .build/arm64-apple-macosx/<config>; it must be inside the .app or app
-    # launch fails with "could not load resource bundle". $build_dir is a
-    # symlink to that directory, so reach the bundle through it rather than
+    # Every SwiftPM resource bundle next to the built products goes into the
+    # .app. SPM produces them in .build/arm64-apple-macosx/<config>; $build_dir
+    # is a symlink to that directory, so reach them through it rather than
     # composing a path with ../arm64-apple-macosx/<config>.
-    source_resource_bundle="$build_dir/TBD_TBDApp.bundle"
-    bundle_resource_bundle="$bundle_resources/TBD_TBDApp.bundle"
-    if [ -d "$source_resource_bundle" ]; then
+    #
+    # TBD_TBDApp.bundle (localized strings and assets) has always been required
+    # — without it app launch fails outright with "could not load resource
+    # bundle". The dependencies' bundles matter for a subtler reason, and the
+    # failure they produce is silent rather than loud: a SwiftPM library's
+    # `Bundle.module` accessor falls back to the absolute
+    # `.build/.../<Pkg>_<Target>.bundle` path baked in at compile time, which
+    # happens to resolve on the machine that built the binary — so a missing
+    # bundle looks fine here and breaks anywhere else. Code that probes for its
+    # bundle by name instead (SwiftTerm's Metal renderer does, deliberately,
+    # because the generated accessor `fatalError`s) looks only at `Bundle.main`
+    # — its `resourceURL` and its `bundleURL` — and finds nothing when the
+    # bundle is staged nowhere. The app binary is hard-linked INTO the bundle,
+    # so `Bundle.main` is TBD.app, and `SwiftTerm_SwiftTerm.bundle`, which
+    # carries `Shaders.metal`, was not there. The result was `setUseMetal(true)`
+    # throwing `shaderSourceMissing` and the terminal quietly staying on
+    # CoreGraphics: a GPU renderer that reports itself unavailable on a machine
+    # with a GPU.
+    #
+    # Copying all of them is both shorter than naming two and the right
+    # invariant: an .app must carry every resource bundle its executable may
+    # look up at runtime. They are small, and a stale one is worse than a
+    # redundant one, so the staged set is cleared first and rebuilt from what
+    # the build actually produced — otherwise a dependency that is dropped or
+    # renamed leaves its bundle in the .app forever, and the next person
+    # debugging a resource lookup finds two plausible candidates.
+    rm -rf "$bundle_resources"/*.bundle
+    for source_resource_bundle in "$build_dir"/*.bundle; do
+        [ -d "$source_resource_bundle" ] || continue
+        resource_bundle_name="$(basename "$source_resource_bundle")"
+        # Test-target resource bundles are fixtures, not app resources. They can
+        # be large and they ship nothing the app reads, so keep them out.
+        case "$resource_bundle_name" in
+            *Tests.bundle) continue ;;
+        esac
+        bundle_resource_bundle="$bundle_resources/$resource_bundle_name"
         rm -rf "$bundle_resource_bundle"
         cp -R "$source_resource_bundle" "$bundle_resource_bundle" || return 1
-    else
-        echo "warning: TBD_TBDApp.bundle not found at $source_resource_bundle" >&2
+    done
+    # The app's own bundle is the one whose absence is fatal, so it keeps a check.
+    if [ ! -d "$bundle_resources/TBD_TBDApp.bundle" ]; then
+        echo "warning: TBD_TBDApp.bundle not found at $build_dir/TBD_TBDApp.bundle" >&2
     fi
 
     # Stash the source worktree path inside the bundle so the running app can

@@ -582,6 +582,18 @@ public enum HibernateReason: String, Codable, Sendable {
     /// Parked because the worktree's PR merged — system-initiated, so it
     /// auto-wakes on focus like `.auto`.
     case merged
+    /// Claude's own process left — reported by its `SessionEnd` hook, for the
+    /// reasons that mean the process is going away rather than starting a new
+    /// session inside the same process.
+    ///
+    /// Deliberately the SAME state as a deliberate park: process gone, terminal
+    /// alive, session id known. One state means one wake path and one UI; see
+    /// `docs/specs/2026-09-05-transcript-composer-design.md`, landing in
+    /// PR #821, where "A separate exited state beside hibernation" is a
+    /// rejected alternative.
+    /// It behaves like `.auto` for wake-on-focus, which is what the
+    /// lenient decoder above already gives an older app binary reading this value.
+    case exited
 
     // Custom lenient decoder: the SYNTHESIZED `Decodable` throws
     // `DecodingError.dataCorrupted` on any raw value this build doesn't know.
@@ -724,6 +736,25 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
     public var holderPID: Int32?
     /// PID of the job the holder `forkpty()`d. Nil for tmux rows.
     public var childPID: Int32?
+    /// When the job named by `childPID` was started, for the identity checks
+    /// that guard against pid reuse.
+    ///
+    /// Nil means this row has never been through a park/wake cycle, so its
+    /// `createdAt` is still the moment its child was born and remains the right
+    /// anchor — every reader spells that `holderChildStartedAt ?? createdAt`. A
+    /// woken session's child is younger than its row by however long the
+    /// session was parked, which is exactly the case `createdAt` alone cannot
+    /// describe. Cleared with the two pid columns when a row parks.
+    public var holderChildStartedAt: Date?
+    /// Absolute path of the model proxy's transcript stream file for this
+    /// session, or nil when the session was never routed through the proxy.
+    ///
+    /// Stamped at spawn and never changed afterwards: a session's base URL is
+    /// fixed in the environment it starts with, so a terminal either has a
+    /// stream file for its whole life or never gets one, and flipping the
+    /// flags later changes neither. A nil here means "register no stream" —
+    /// the app renders exactly what it renders today.
+    public var transcriptStreamPath: String?
 
     /// `activityState` as a fact — value, source, observed-at — or nil.
     ///
@@ -761,6 +792,13 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
             observedAt: awaitingInputObservedAt)
     }
 
+    /// Whether this row is parked because Claude's own process left, rather than
+    /// because TBD parked it. Both columns are required: `hibernatedAt` is what
+    /// makes it a park at all, and the reason is what says who ended it.
+    public var isExitStamped: Bool {
+        hibernatedAt != nil && hibernateReason == .exited
+    }
+
     public init(id: UUID = UUID(), worktreeID: UUID, tmuxWindowID: String,
                 tmuxPaneID: String, label: String? = nil, createdAt: Date = Date(),
                 pinnedAt: Date? = nil, claudeSessionID: String? = nil,
@@ -787,7 +825,9 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
                 awaitingInputObservedAt: Date? = nil,
                 transport: TerminalTransport = .tmux,
                 holderPID: Int32? = nil,
-                childPID: Int32? = nil) {
+                childPID: Int32? = nil,
+                holderChildStartedAt: Date? = nil,
+                transcriptStreamPath: String? = nil) {
         self.id = id
         self.worktreeID = worktreeID
         self.tmuxWindowID = tmuxWindowID
@@ -821,6 +861,8 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
         self.transport = transport
         self.holderPID = holderPID
         self.childPID = childPID
+        self.holderChildStartedAt = holderChildStartedAt
+        self.transcriptStreamPath = transcriptStreamPath
     }
 
     enum CodingKeys: String, CodingKey {
@@ -832,7 +874,8 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
         case hibernatedAt, hibernateReason, keepWarm, pendingResumeAt, watchDeskRole
         case activityStateSource, activityStateObservedAt, activityStateOrderObservedAt
         case awaitingInputReason, awaitingInputObservedAt
-        case transport, holderPID, childPID
+        case transport, holderPID, childPID, holderChildStartedAt
+        case transcriptStreamPath
     }
 
     public init(from decoder: Decoder) throws {
@@ -886,6 +929,8 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
             .flatMap(TerminalTransport.init(rawValue:)) ?? .tmux
         holderPID = try c.decodeIfPresent(Int32.self, forKey: .holderPID)
         childPID = try c.decodeIfPresent(Int32.self, forKey: .childPID)
+        holderChildStartedAt = try c.decodeIfPresent(Date.self, forKey: .holderChildStartedAt)
+        transcriptStreamPath = try c.decodeIfPresent(String.self, forKey: .transcriptStreamPath)
     }
 }
 
@@ -948,25 +993,27 @@ public extension Terminal {
     ///     hand; hibernating would eat it).
     /// Manual "Hibernate now" bypasses the keep-warm and idle checks but keeps
     /// the running/permission rails (see `isManuallyHibernatable`).
-    var isAutoHibernationEligible: Bool {
-        isManuallyHibernatable && !keepWarm
+    ///
+    /// Transport does not enter into it: a holder-backed row is as eligible as
+    /// a tmux-backed one, because both have a park mechanic and a wake path —
+    /// see `isManuallyHibernatable`, which this defers the rails to.
+    func isAutoHibernationEligible() -> Bool {
+        isManuallyHibernatable() && !keepWarm
     }
 
     /// Whether a MANUAL "Hibernate now" may act on this terminal. Same rails as
     /// auto except keep-warm and idle-time don't apply — the user asked
     /// explicitly. Still refuses to hibernate an in-flight turn or a raised
     /// permission hand.
-    var isManuallyHibernatable: Bool {
-        // Parking is a tmux mechanic end to end: it `respawn-window`s the pane
-        // to a bare shell and wake respawns `claude --resume` back into that
-        // same pane. A holder row has no pane — its `tmuxWindowID`/`tmuxPaneID`
-        // are empty strings by construction — so every step would address the
-        // empty coordinate, which tmux answers for by reporting the window
-        // gone. The row would flip to parked while the holder and its child
-        // kept running, unreclaimed. Until parking learns the holder transport,
-        // refuse: an ineligible session is recoverable, a row that lies about a
-        // live process is not.
-        guard transport != .holder else { return false }
+    ///
+    ///
+    /// The rails are the same on every transport. Park and wake on the holder
+    /// transport do not go through tmux at all — the park writes `/exit` to the
+    /// holder's pty, confirms the child is gone, and clears the row's pids, and
+    /// the wake spawns a fresh holder running `claude --resume`. A holder row's
+    /// `tmuxWindowID`/`tmuxPaneID` are empty strings by construction and
+    /// neither path reads them.
+    func isManuallyHibernatable() -> Bool {
         guard isClaudeResumable else { return false }
         guard hibernatedAt == nil, suspendedAt == nil else { return false }
         switch activityState {
@@ -1486,54 +1533,21 @@ public struct Config: Codable, Sendable, Equatable {
     /// NULL means "never chose" and follows the shipped default wherever it
     /// goes; `0`/`1` is an explicit gesture and is honored forever.
     public var gcOrphanProcessesEnabled: Bool
-    /// Gate for the orphan-GC phase that unlinks holder rendezvous files whose
-    /// holder is gone — the socket, and its sibling lock and log
-    /// (`docs/specs/2026-08-30-pty-holder-session-transport-design.md`,
-    /// "Reconciliation"). Read on top of `gcEnabled`: both must be on for the
-    /// phase to run. It ships OFF because it is a brand-new background sweep
-    /// that unlinks files, and the holder transport it reclaims after is itself
-    /// still soaking behind `ptyHolderEnabled`.
+    /// Gate for the orphan-GC phase that reclaims hang-stack diagnostic files
+    /// under `~/Library/Logs/TBD/hang-stacks/`
+    /// (`docs/specs/2026-08-29-hang-stack-reclaimer-design.md`). Read on top of
+    /// `gcEnabled`: both must be on for the phase to run. It ships OFF because
+    /// it deletes persisted state from a background sweep, which is the house
+    /// default-off rule; the app mirrors the same resolved value into
+    /// `HangStackWriter`'s write-side cap, so one flag governs both halves.
     ///
-    /// **Resolved, not stored**, like `gcProfileDirsEnabled`: the backing
+    /// **Resolved, not stored**, like `gcOrphanProcessesEnabled`: the backing
     /// column carries no SQL default and stays NULL until somebody touches the
     /// toggle, so this property is
-    /// `gc_holder_rendezvous_enabled ?? Config.gcHolderRendezvousEnabledDefault`.
-    /// NULL means "never chose" and follows the shipped default wherever it
-    /// goes; `0`/`1` is an explicit gesture and is honored forever.
-    public var gcHolderRendezvousEnabled: Bool
-    /// Gate for the orphan-GC phase that **kills** a pty holder this
-    /// installation owns which no session row claims — the holder-versus-
-    /// database half of
-    /// `docs/specs/2026-08-30-pty-holder-session-transport-design.md`,
-    /// "Reconciliation". Read on top of `gcEnabled`: both must be on.
-    ///
-    /// **Deliberately not `gcHolderRendezvousEnabled`.** That flag unlinks
-    /// files; this one signals processes. They are independent opt-ins because
-    /// somebody enabling file cleanup must not silently acquire a process
-    /// killer, and because what this phase misjudges cannot be restored.
-    /// Gate for the `AgentReaper` leg that kills the surviving child of a dead
-    /// holder (`docs/specs/2026-08-30-pty-holder-session-transport-design.md`,
-    /// "Reconciliation"). The existing sweep enumerates children of tmux server
-    /// pids and structurally cannot see a job re-parented to launchd, so this
-    /// leg sweeps by each holder session's recorded child pid instead.
-    ///
-    /// It ships OFF because it is a background sweep that kills processes
-    /// without a user gesture — the exact shape CLAUDE.md requires to soak
-    /// behind its own switch — and because the transport it backstops is itself
-    /// still behind `ptyHolderEnabled`, so a machine that has never spawned a
-    /// holder has no row for this leg to be right or wrong about.
-    ///
-    /// **Resolved, not stored**, like `gcHolderRendezvousEnabled`: the backing
-    /// column carries no SQL default and stays NULL until somebody touches the
-    /// toggle, so this property is
-    /// `gc_rowless_holders_enabled ?? Config.gcRowlessHoldersEnabledDefault`.
-    /// NULL means "never chose" and follows the shipped default wherever it
-    /// goes; `0`/`1` is an explicit gesture and is honored forever.
-    public var gcRowlessHoldersEnabled: Bool
-    /// `reap_holder_children_enabled ?? Config.reapHolderChildrenEnabledDefault`.
-    /// NULL means "never chose" and follows the shipped default wherever it
-    /// goes; `0`/`1` is an explicit gesture and is honored forever.
-    public var reapHolderChildrenEnabled: Bool
+    /// `gc_hang_stacks_enabled ?? Config.gcHangStacksEnabledDefault`. NULL
+    /// means "never chose" and follows the shipped default wherever it goes;
+    /// `0`/`1` is an explicit gesture and is honored forever.
+    public var gcHangStacksEnabled: Bool
     /// The single opt-in for `remote.delete` — destroying a provider-hosted
     /// agent session outright
     /// (`docs/specs/2026-09-02-remote-session-delete-and-transcript-exchange-design.md`,
@@ -1546,7 +1560,7 @@ public struct Config: Codable, Sendable, Equatable {
     /// add records rather than removing them, so the provider's declared
     /// capabilities are their whole gate and this flag says nothing about them.
     ///
-    /// **Resolved, not stored**, like `reapHolderChildrenEnabled`: the backing
+    /// **Resolved, not stored**, like `gcOrphanProcessesEnabled`: the backing
     /// column carries no SQL default and stays NULL until somebody touches the
     /// toggle, so this property is
     /// `remote_delete_enabled ?? Config.remoteDeleteEnabledDefault`. NULL means
@@ -1565,33 +1579,33 @@ public struct Config: Codable, Sendable, Equatable {
     /// `retain`, `import` or `recall` — so a machine with no such provider has
     /// nothing here for this leg to be right or wrong about.
     ///
-    /// **Resolved, not stored**, like `gcHolderRendezvousEnabled`: the backing
+    /// **Resolved, not stored**, like `gcProfileDirsEnabled`: the backing
     /// column carries no SQL default and stays NULL until somebody touches the
     /// toggle, so this property is
     /// `gc_retained_transcripts_enabled ?? Config.gcRetainedTranscriptsEnabledDefault`.
     /// NULL means "never chose" and follows the shipped default wherever it
     /// goes; `0`/`1` is an explicit gesture and is honored forever.
     public var gcRetainedTranscriptsEnabled: Bool
-    /// Gate for the reconcile arm that judges holder-backed session rows — the
-    /// inventory half of
-    /// `docs/specs/2026-08-30-pty-holder-session-transport-design.md`,
-    /// "Reconciliation": the holder is gone and the session row is still there.
+    /// The single opt-in for the live transcript's message composer
+    /// (`docs/specs/2026-09-05-transcript-composer-design.md`, "Flag"): the
+    /// composer UI, the `terminal.completions` probe, attachment writes under
+    /// `~/tbd/attachments/`, and the OrphanGC leg that reclaims them.
     ///
-    /// **Deliberately its own opt-in, not `ptyHolderEnabled`.** That gate must
-    /// be ON for any holder row to exist, so it cannot express the soak
-    /// protocol its two siblings were given one for — transport on, one
-    /// destructive reclaimer on at a time. And it is deliberately neither
-    /// `gcHolderRendezvousEnabled` (which unlinks files) nor
-    /// `reapHolderChildrenEnabled` (which signals processes): this arm deletes
-    /// terminal and tab rows, in a background sweep, with no user gesture.
+    /// It ships OFF because the composer types into a live agent session and
+    /// writes files that outlive the request that made them. One flag rather
+    /// than four: a composer with completions off, or with attachments off,
+    /// would be a broken feature rather than a smaller one.
     ///
-    /// **Resolved, not stored**, like `gcHolderRendezvousEnabled`: the backing
+    /// A **config column** rather than an app default, because the GC leg lives
+    /// in the daemon and cannot read the app's `UserDefaults`.
+    ///
+    /// **Resolved, not stored**, like `gcProfileDirsEnabled`: the backing
     /// column carries no SQL default and stays NULL until somebody touches the
     /// toggle, so this property is
-    /// `holder_row_reconcile_enabled ?? Config.holderRowReconcileEnabledDefault`.
+    /// `transcript_composer_enabled ?? Config.transcriptComposerEnabledDefault`.
     /// NULL means "never chose" and follows the shipped default wherever it
     /// goes; `0`/`1` is an explicit gesture and is honored forever.
-    public var holderRowReconcileEnabled: Bool
+    public var transcriptComposerEnabled: Bool
     /// The single opt-in for remote peer messaging
     /// (`docs/specs/2026-08-29-remote-peer-messaging-design.md`, "Flag and
     /// rollout"): publishing a shadow peer for each remote session and carrying
@@ -1643,6 +1657,59 @@ public struct Config: Codable, Sendable, Equatable {
     /// follows the shipped default wherever it goes; a stored name is an
     /// explicit gesture and is honored forever.
     public var updateMode: UpdateMode
+    /// Whether new pty-holder sessions are routed through the TBD model proxy
+    /// (`docs/specs/2026-09-05-transcript-streaming-model-proxy-design.md`,
+    /// "Flags and migrations"): a loopback process the daemon owns, named by
+    /// the session's `ANTHROPIC_BASE_URL`, which forwards the Messages API and
+    /// tees each conversation stream's text into a per-session file.
+    ///
+    /// It ships OFF because it puts a second process in the path of every API
+    /// call a routed session makes, and that process outlives the daemon.
+    ///
+    /// It is a switch of its own rather than half of one: the proxy is useful
+    /// without the transcript's provisional row, so `transcriptStreamingEnabled`
+    /// is a second flag. The two are coupled only in the direction that keeps
+    /// them coherent — turning streaming on turns this on, turning this off
+    /// turns streaming off — and the coupling lives in the `ConfigStore`
+    /// setters, not here.
+    ///
+    /// The gate covers *spawning* only, like `ptyHolderEnabled`: a session's
+    /// base URL is read once at start, so flipping this never reroutes a
+    /// running session.
+    ///
+    /// **Resolved, not stored**, like `transcriptComposerEnabled`: the backing
+    /// column carries no SQL default and stays NULL until somebody touches the
+    /// toggle, so this property is
+    /// `model_proxy_enabled ?? Config.modelProxyDefault`. NULL means "never
+    /// chose" and follows the shipped default wherever it goes; `0`/`1` is an
+    /// explicit gesture and is honored forever.
+    public var modelProxyEnabled: Bool
+    /// Whether the transcript renders a provisional assistant row that grows
+    /// with the model proxy's stream file and is retired when the JSONL line
+    /// for that message lands.
+    ///
+    /// It ships OFF, and it is meaningful only with `modelProxyEnabled`: the
+    /// stream file it reads is written by the proxy. Read
+    /// `transcriptStreamingEffective` rather than this property — a
+    /// hand-edited row with streaming on and the proxy off records two
+    /// choices, and streams nothing.
+    ///
+    /// **Resolved, not stored**, same shape as `modelProxyEnabled`:
+    /// `transcript_streaming_enabled ?? Config.transcriptStreamingDefault`.
+    public var transcriptStreamingEnabled: Bool
+    /// The loopback port this TBD home's model proxy binds, or nil if none has
+    /// been minted.
+    ///
+    /// **Identity, not a preference**, which is why it has no shipped default,
+    /// for the same reason as `holderOwnerToken`: nil genuinely means "not yet
+    /// minted", and any literal the code could fall back to would be a port
+    /// some unrelated process may already hold. The kernel picks the first one
+    /// — the proxy binds port zero and reports what it got — and
+    /// `ConfigStore.ensureModelProxyPort(minting:)` persists it with the
+    /// conditional UPDATE that keeps two daemons starting at once from minting
+    /// two. `setModelProxyPort(_:)` overwrites it, which is what the
+    /// address-in-use re-mint needs.
+    public var modelProxyPort: Int?
     /// Machine-wide remote create-param defaults, keyed by the **provider's
     /// own** `create_params` field names — the fall-through level beneath
     /// `Repo.remoteCreateDefaults`. TBD stores and replays these values
@@ -1701,6 +1768,11 @@ public struct Config: Codable, Sendable, Equatable {
     /// change to this constant — no forcing `UPDATE` migration, and an explicit
     /// opt-out is left alone.
     public static let gcOrphanProcessesEnabledDefault = false
+    /// The shipped default for `gcHangStacksEnabled`, and the single place it
+    /// lives. The hang-stack reclaimer ships off; graduating it is a change to
+    /// this constant — no forcing `UPDATE` migration, and an explicit opt-out
+    /// is left alone.
+    public static let gcHangStacksEnabledDefault = false
     /// The shipped default for `remotePeerMessagingEnabled`, and the single
     /// place it lives. The peer bridge ships off; graduation — after a soak in
     /// which no ghost record outlives its daemon — is a change to this
@@ -1713,24 +1785,6 @@ public struct Config: Codable, Sendable, Equatable {
     /// change to this constant, with no forcing `UPDATE` migration and every
     /// explicit opt-out left alone.
     public static let ptyHolderDefault = false
-    /// The shipped default for `gcHolderRendezvousEnabled`, and the single place
-    /// it lives. The rendezvous sweep ships off; graduation — after a soak in
-    /// which it never unlinks a socket a live holder was using — is a change to
-    /// this constant, with no forcing `UPDATE` migration and every explicit
-    /// opt-out left alone.
-    public static let gcHolderRendezvousEnabledDefault = false
-    /// The shipped default for `gcRowlessHoldersEnabled`, and the single place
-    /// it lives. The row-less holder sweep ships off; graduation — after a soak
-    /// in which it never kills a holder that turned out to be somebody's live
-    /// session — is a change to this constant, with no forcing `UPDATE`
-    /// migration and every explicit opt-out left alone.
-    public static let gcRowlessHoldersEnabledDefault = false
-    /// The shipped default for `reapHolderChildrenEnabled`, and the single
-    /// place it lives. The holder leg ships off; graduation — after a soak in
-    /// which it never signals a process that was not the recorded child of a
-    /// dead holder — is a change to this constant, with no forcing `UPDATE`
-    /// migration and every explicit opt-out left alone.
-    public static let reapHolderChildrenEnabledDefault = false
     /// The shipped default for `remoteDeleteEnabled`, and the single place it
     /// lives. Delete ships off; graduation — after a soak in which no delete
     /// destroyed a session its user had not confirmed, and every delete that
@@ -1744,12 +1798,13 @@ public struct Config: Codable, Sendable, Equatable {
     /// claim — is a change to this constant, with no forcing `UPDATE` migration
     /// and every explicit opt-out left alone.
     public static let gcRetainedTranscriptsEnabledDefault = false
-    /// The shipped default for `holderRowReconcileEnabled`, and the single
-    /// place it lives. The holder row sweep ships off; graduation — after a
-    /// soak in which it never deletes a row whose session turned out to be
-    /// reachable — is a change to this constant, with no forcing `UPDATE`
+    /// The shipped default for `transcriptComposerEnabled`, and the single place
+    /// it lives. The composer ships off; graduation — after a soak in which no
+    /// message reached a session that was not running, no probe left a process or
+    /// a directory behind, and the GC leg never reclaimed a live worktree's
+    /// attachments — is a change to this constant, with no forcing `UPDATE`
     /// migration and every explicit opt-out left alone.
-    public static let holderRowReconcileEnabledDefault = false
+    public static let transcriptComposerEnabledDefault = false
     /// The shipped default for `updateMode`, and the single place it lives.
     /// Updating ships off; graduation to `check` — after a soak in which the
     /// notice was accurate and the hourly `ls-remote` cost nothing anyone
@@ -1758,6 +1813,19 @@ public struct Config: Codable, Sendable, Equatable {
     /// chose is NULL and follows this constant, and every stored mode is an
     /// explicit choice that a default change leaves alone.
     public static let updateModeDefault: UpdateMode = .off
+    /// The shipped default for `modelProxyEnabled`, and the single place it
+    /// lives. The proxy ships off; graduation — after a soak in which no routed
+    /// session lost a turn to the proxy, and no proxy outlived the daemon that
+    /// spawned it without being adopted or reaped — is a change to this
+    /// constant, with no forcing `UPDATE` migration and every explicit opt-out
+    /// left alone.
+    public static let modelProxyDefault = false
+    /// The shipped default for `transcriptStreamingEnabled`, and the single
+    /// place it lives. Streaming ships off and graduates *after* the proxy: a
+    /// provisional row is worth nothing until the thing that feeds it is
+    /// trusted. Graduation is a change to this constant, with no forcing
+    /// `UPDATE` migration and every explicit opt-out left alone.
+    public static let transcriptStreamingDefault = false
 
     public init(defaultProfileID: UUID? = nil,
                 primaryAgentPreference: PrimaryAgentPreference = .defaultValue,
@@ -1790,16 +1858,17 @@ public struct Config: Codable, Sendable, Equatable {
                 gcProfileDirsEnabled: Bool = Config.gcProfileDirsEnabledDefault,
                 claudeCloudEnabled: Bool = Config.claudeCloudEnabledDefault,
                 gcOrphanProcessesEnabled: Bool = Config.gcOrphanProcessesEnabledDefault,
+                gcHangStacksEnabled: Bool = Config.gcHangStacksEnabledDefault,
                 remotePeerMessagingEnabled: Bool = Config.remotePeerMessagingDefault,
                 ptyHolderEnabled: Bool = Config.ptyHolderDefault,
-                gcHolderRendezvousEnabled: Bool = Config.gcHolderRendezvousEnabledDefault,
-                gcRowlessHoldersEnabled: Bool = Config.gcRowlessHoldersEnabledDefault,
-                reapHolderChildrenEnabled: Bool = Config.reapHolderChildrenEnabledDefault,
                 remoteDeleteEnabled: Bool = Config.remoteDeleteEnabledDefault,
                 gcRetainedTranscriptsEnabled: Bool =
                     Config.gcRetainedTranscriptsEnabledDefault,
-                holderRowReconcileEnabled: Bool = Config.holderRowReconcileEnabledDefault,
+                transcriptComposerEnabled: Bool = Config.transcriptComposerEnabledDefault,
                 updateMode: UpdateMode = Config.updateModeDefault,
+                modelProxyEnabled: Bool = Config.modelProxyDefault,
+                transcriptStreamingEnabled: Bool = Config.transcriptStreamingDefault,
+                modelProxyPort: Int? = nil,
                 remoteCreateDefaults: [String: String] = [:],
                 holderOwnerToken: String? = nil) {
         self.defaultProfileID = defaultProfileID
@@ -1833,15 +1902,16 @@ public struct Config: Codable, Sendable, Equatable {
         self.gcProfileDirsEnabled = gcProfileDirsEnabled
         self.claudeCloudEnabled = claudeCloudEnabled
         self.gcOrphanProcessesEnabled = gcOrphanProcessesEnabled
+        self.gcHangStacksEnabled = gcHangStacksEnabled
         self.remotePeerMessagingEnabled = remotePeerMessagingEnabled
         self.ptyHolderEnabled = ptyHolderEnabled
-        self.gcHolderRendezvousEnabled = gcHolderRendezvousEnabled
-        self.gcRowlessHoldersEnabled = gcRowlessHoldersEnabled
-        self.reapHolderChildrenEnabled = reapHolderChildrenEnabled
         self.remoteDeleteEnabled = remoteDeleteEnabled
         self.gcRetainedTranscriptsEnabled = gcRetainedTranscriptsEnabled
-        self.holderRowReconcileEnabled = holderRowReconcileEnabled
+        self.transcriptComposerEnabled = transcriptComposerEnabled
         self.updateMode = updateMode
+        self.modelProxyEnabled = modelProxyEnabled
+        self.transcriptStreamingEnabled = transcriptStreamingEnabled
+        self.modelProxyPort = modelProxyPort
         self.remoteCreateDefaults = remoteCreateDefaults
         self.holderOwnerToken = holderOwnerToken
     }
@@ -1921,6 +1991,11 @@ public struct Config: Codable, Sendable, Equatable {
         // default rather than hardcoding `false`.
         gcOrphanProcessesEnabled = try c.decodeIfPresent(
             Bool.self, forKey: .gcOrphanProcessesEnabled) ?? Config.gcOrphanProcessesEnabledDefault
+        // Same tri-state again: absent means the sender knew nothing about the
+        // flag, which is the NULL column's situation — follow the shipped
+        // default rather than hardcoding `false`.
+        gcHangStacksEnabled = try c.decodeIfPresent(
+            Bool.self, forKey: .gcHangStacksEnabled) ?? Config.gcHangStacksEnabledDefault
         // Same tri-state once more: absent means the sender knew nothing about
         // the flag, which is the NULL column's situation — follow the shipped
         // default rather than hardcoding `false`.
@@ -1931,22 +2006,6 @@ public struct Config: Codable, Sendable, Equatable {
         // rather than hardcoding `false`.
         ptyHolderEnabled = try c.decodeIfPresent(
             Bool.self, forKey: .ptyHolderEnabled) ?? Config.ptyHolderDefault
-        // And the last of them: absent means the sender knew nothing about the
-        // flag, which is the NULL column's situation — follow the shipped
-        // default rather than hardcoding `false`.
-        gcHolderRendezvousEnabled = try c.decodeIfPresent(
-            Bool.self, forKey: .gcHolderRendezvousEnabled)
-            ?? Config.gcHolderRendezvousEnabledDefault
-        // Same reading for the row-less holder sweep's gate: absent means the
-        // sender knew nothing about the flag, which is the NULL column's
-        // situation — follow the shipped default, never a hardcoded `false`.
-        gcRowlessHoldersEnabled = try c.decodeIfPresent(
-            Bool.self, forKey: .gcRowlessHoldersEnabled)
-            ?? Config.gcRowlessHoldersEnabledDefault
-        // Same shape again, for the `AgentReaper` holder leg.
-        reapHolderChildrenEnabled = try c.decodeIfPresent(
-            Bool.self, forKey: .reapHolderChildrenEnabled)
-            ?? Config.reapHolderChildrenEnabledDefault
         // And the same shape for the remote-delete gate: absent means the sender
         // knew nothing about the flag, which is the NULL column's situation —
         // follow the shipped default, never a hardcoded `false`.
@@ -1959,16 +2018,32 @@ public struct Config: Codable, Sendable, Equatable {
         gcRetainedTranscriptsEnabled = try c.decodeIfPresent(
             Bool.self, forKey: .gcRetainedTranscriptsEnabled)
             ?? Config.gcRetainedTranscriptsEnabledDefault
-        // And once more, for the holder row sweep's gate.
-        holderRowReconcileEnabled = try c.decodeIfPresent(
-            Bool.self, forKey: .holderRowReconcileEnabled)
-            ?? Config.holderRowReconcileEnabledDefault
+        // And once more, for the composer's gate: absent means the sender knew
+        // nothing about the flag, which is the NULL column's situation — follow
+        // the shipped default rather than hardcoding `false`.
+        transcriptComposerEnabled = try c.decodeIfPresent(
+            Bool.self, forKey: .transcriptComposerEnabled)
+            ?? Config.transcriptComposerEnabledDefault
         // Same shape for the update mode, with one addition: an unrecognised
         // NAME from a newer daemon (a fourth mode) is as unusable as an absent
         // key, so it resolves to the shipped default instead of failing the
         // whole decode and losing every other field.
         updateMode = (try? c.decode(UpdateMode.self, forKey: .updateMode))
             ?? Config.updateModeDefault
+        // And once more, for the model proxy's gate and the provisional row's:
+        // absent means the sender knew nothing about the flag, which is the
+        // NULL column's situation — follow the shipped default, never a
+        // hardcoded `false`.
+        modelProxyEnabled = try c.decodeIfPresent(
+            Bool.self, forKey: .modelProxyEnabled)
+            ?? Config.modelProxyDefault
+        transcriptStreamingEnabled = try c.decodeIfPresent(
+            Bool.self, forKey: .transcriptStreamingEnabled)
+            ?? Config.transcriptStreamingDefault
+        // Absent means the sender knew nothing about the port — the same state
+        // as an unminted column. Like `holderOwnerToken` there is no shipped
+        // default to fall through to; see the property's note.
+        modelProxyPort = try c.decodeIfPresent(Int.self, forKey: .modelProxyPort)
         // Absent means the sender knew nothing about global create defaults —
         // the same state as an empty map: no opinion at this level, so every
         // field falls through to its provider-declared `default`.
@@ -1982,6 +2057,19 @@ public struct Config: Codable, Sendable, Equatable {
 }
 
 public extension Config {
+    /// Whether transcript streaming is actually on: the conjunction of the two
+    /// flags, and the only form any caller should act on.
+    ///
+    /// Streaming reads a file the proxy writes, so streaming without the proxy
+    /// is not a state that can do anything. The setters keep the pair coherent
+    /// for anyone using the toggles, but a hand-edited row — or a row written
+    /// by a build that had only one of the flags — can still hold streaming on
+    /// with the proxy off, and that row must stream nothing rather than tail a
+    /// file nobody is writing.
+    var transcriptStreamingEffective: Bool {
+        modelProxyEnabled && transcriptStreamingEnabled
+    }
+
     /// Which auto-resume gate governs a `scheduled_resumes` row: the
     /// transient-API-error gate for `ScheduledResume.apiErrorLimitType` rows,
     /// or the hard usage-limit gate for everything else (session/debug/weekly).

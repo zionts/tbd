@@ -806,6 +806,31 @@ final class AppState {
     /// Tab-close ownership keyed by terminal UUID for views that belong to a
     /// visible tab, used to resolve the currently focused closable tab.
     @ObservationIgnored var terminalTabCloseContexts: [UUID: TabCloseContext] = [:]
+    /// Per-terminal composer drafts. `@ObservationIgnored` because each
+    /// `ComposerDraft` is itself `@Observable` — an observable registry would
+    /// republish every composer in the app whenever any one of them appeared.
+    @ObservationIgnored var composerDrafts: [UUID: ComposerDraft] = [:]
+    /// Weak composer text views keyed by terminal, so Cmd+/ can move focus into
+    /// one. `@ObservationIgnored` for the same reason `terminalFocusTargets` is:
+    /// focus is not state anything renders from.
+    @ObservationIgnored var composerFocusTargets: [UUID: ComposerFocusTarget] = [:]
+    /// Weak transcript tables keyed by terminal, so Escape in the composer can
+    /// hand focus back to what the person was reading.
+    @ObservationIgnored var transcriptFocusTargets: [UUID: ComposerFocusTarget] = [:]
+    /// Suspended callers waiting for one spawn's `SessionStart`, keyed by
+    /// terminal. `@ObservationIgnored` for the same reason as the two above:
+    /// nothing renders from it.
+    @ObservationIgnored var sessionStartWaiters: [UUID: [SessionStartWaiter]] = [:]
+    /// The most recent incarnation each terminal's `SessionStart` reported,
+    /// latched by `noteSessionStart` independent of whether anyone was waiting
+    /// at the time. Closes the gap between `wakeTerminalForComposer` minting an
+    /// incarnation and the caller registering an `awaitSessionStart` waiter for
+    /// it: a `SessionStart` that lands in that window would otherwise reach
+    /// `noteSessionStart` with no waiter to release and be dropped on the
+    /// floor, stalling the send to its timeout. `awaitSessionStart` checks this
+    /// latch before registering, so a already-arrived start is a same-frame
+    /// `true` rather than a wait.
+    @ObservationIgnored var lastStartedIncarnation: [UUID: UUID] = [:]
     /// Visual screenshots taken at suspend-click time, shown while daemon works.
     /// Keyed by terminal UUID. Cleared when suspend completes.
     var suspendingSnapshots: [UUID: NSImage] = [:]
@@ -1378,6 +1403,18 @@ final class AppState {
     /// Published so the Settings control-mode toggle re-renders after
     /// `setControlModeEnabled` refreshes it.
     var daemonCapabilities: DaemonCapabilitiesResult?
+    /// Whether the daemon reports transcript streaming as effective — the
+    /// conjunction of `transcript_streaming_enabled` and `model_proxy_enabled`,
+    /// already resolved daemon-side, so the app never re-derives the pair.
+    ///
+    /// False until capabilities have been fetched, which is the conservative
+    /// reading and the same one `transcriptComposerEnabled` takes: a pane that
+    /// registers no stream file renders exactly what it renders today, while a
+    /// provisional row that appeared and then vanished on the first capability
+    /// fetch would be worse than one that appeared a moment late.
+    var transcriptStreamingEnabled: Bool {
+        daemonCapabilities?.transcriptStreamingEnabled ?? false
+    }
     /// How `loadModelProfiles()` fetches its config-bearing response.
     /// Injectable because `DaemonClient` is concrete, matching the other
     /// settings seams below.
@@ -1438,6 +1475,61 @@ final class AppState {
     /// injectable for the same reason as `controlModeSetter`.
     @ObservationIgnored lazy var ptyHolderFlagSetter: @MainActor (Bool) async throws -> Void =
         { [daemonClient] enabled in try await daemonClient.setPtyHolderEnabled(enabled: enabled) }
+    /// How `wakeTerminalOutcome` reaches the daemon — injectable for the same
+    /// reason as `controlModeSetter`, so the wake's prompt plumbing and its
+    /// failure branches are testable without a running daemon.
+    @ObservationIgnored
+    lazy var terminalWakeSender:
+        @MainActor (UUID, Int?, Int?, Bool, String?) async throws -> Void =
+        { [daemonClient] terminalID, cols, rows, fallback, prompt in
+            try await daemonClient.terminalWake(
+                terminalID: terminalID, cols: cols, rows: rows,
+                fallbackToDefaultProfile: fallback, prompt: prompt)
+        }
+    /// How the composer's wake reaches the daemon — the result-returning sibling
+    /// of `terminalWakeSender`, injectable for the same reason, so the wake's
+    /// three replies are statable in a test without a running daemon.
+    @ObservationIgnored
+    lazy var composerWakeSender:
+        @MainActor (UUID, Int?, Int?, String) async throws -> TerminalWakeResult =
+        { [daemonClient] terminalID, cols, rows, prompt in
+            try await daemonClient.terminalWakeReporting(
+                terminalID: terminalID, cols: cols, rows: rows, prompt: prompt)
+        }
+    /// How the composer's completion inventory is fetched — injectable for the
+    /// same reason as `composerWakeSender`, so a mounted composer can open its
+    /// menu with real rows in a test, with no daemon on the other end of the
+    /// socket.
+    @ObservationIgnored
+    lazy var composerCompletionsFetcher:
+        @MainActor (UUID) async throws -> TerminalCompletionsResult =
+        { [daemonClient] terminalID in
+            try await daemonClient.terminalCompletions(terminalID: terminalID)
+        }
+    /// How `setTranscriptComposerEnabled` persists the composer gate —
+    /// injectable for the same reason as `controlModeSetter`.
+    @ObservationIgnored
+    lazy var transcriptComposerFlagSetter: @MainActor (Bool) async throws -> Void =
+        { [daemonClient] enabled in
+            try await daemonClient.setTranscriptComposerEnabled(enabled: enabled)
+        }
+    /// How `setModelProxyEnabled` persists the model-proxy gate — injectable
+    /// for the same reason as `controlModeSetter`.
+    @ObservationIgnored
+    lazy var modelProxyFlagSetter: @MainActor (Bool) async throws -> Void =
+        { [daemonClient] enabled in
+            try await daemonClient.setModelProxyEnabled(enabled: enabled)
+        }
+    /// How `setTranscriptStreamingEnabled` persists the streaming gate —
+    /// injectable for the same reason as `controlModeSetter`. Separate from
+    /// `modelProxyFlagSetter` even though the two flags are coupled: the
+    /// coupling is the daemon's, and an app that wrote both would be guessing
+    /// at a rule it does not own.
+    @ObservationIgnored
+    lazy var transcriptStreamingFlagSetter: @MainActor (Bool) async throws -> Void =
+        { [daemonClient] enabled in
+            try await daemonClient.setTranscriptStreamingEnabled(enabled: enabled)
+        }
     /// How `setClaudeCloudEnabled` persists the Claude cloud gate — injectable
     /// for the same reason as `controlModeSetter`, so the Settings toggle's
     /// success and failure branches are testable without a real daemon.
@@ -2260,6 +2352,7 @@ final class AppState {
                 await self?.loadModelProfiles()
                 await self?.loadHibernationConfig()
                 await self?.loadSupervisionConfig()
+                await self?.loadHangStackRetentionConfig()
                 // The daemon reuses this delta for config changes including
                 // the control-mode toggle (handleConfigSetControlMode), so
                 // refresh capabilities too — a toggle from ANOTHER client
@@ -2268,6 +2361,10 @@ final class AppState {
                 await self?.refreshDaemonCapabilities()
             }
         case .terminalSessionUpdated(let d):
+            // Ahead of the row update, and outside it: `applyTerminalSessionDelta`
+            // returns early for a terminal this app has not cached, and a wake's
+            // hold must release whether or not the row happens to be in the map.
+            noteSessionStart(terminalID: d.terminalID, incarnationID: d.sessionIncarnationID)
             applyTerminalSessionDelta(d)
         case .terminalCreated(let d):
             applyTerminalCreatedDelta(d)
@@ -2917,6 +3014,7 @@ final class AppState {
             await loadModelProfiles()
             await loadHibernationConfig()
             await loadSupervisionConfig()
+            await loadHangStackRetentionConfig()
             await refreshRemote()
             startSubscription()
             await refreshPRStatuses()
@@ -3568,6 +3666,54 @@ final class AppState {
     /// for the two enforcement points. Settings UI toggle lives in the
     /// "Experimental" section of the General settings tab.
     static let terminalAutoResizeKey = "enableTerminalAutoResize"
+
+    /// UserDefaults key for the experimental Metal terminal renderer. When on,
+    /// every terminal surface calls `applyMetalRendererPreference(enabled:)` on
+    /// the view it has just built, swapping SwiftTerm's CoreGraphics draw path
+    /// for its GPU one. Off by default: replacing a load-bearing rendering path is
+    /// exactly the category that ships default-off and soaks first.
+    ///
+    /// App-side `UserDefaults` rather than a daemon `config` column because the
+    /// behavior is entirely app-side rendering with no daemon participation —
+    /// the same placement as `enableTranscriptKey`, and on the same store as it:
+    /// the Settings toggle binds `@AppStorage`, which always targets
+    /// `UserDefaults.standard`, so every reader must land on `.standard` too or
+    /// the writer and the readers drift apart and the toggle stops doing
+    /// anything. Reads go through `metalTerminalRendererEnabled(defaults:)` —
+    /// never `bool(forKey:)` — so "nobody has chosen" stays distinguishable
+    /// from an explicit `false`.
+    static let useMetalTerminalRendererKey = "useMetalTerminalRenderer"
+
+    /// The one default for `useMetalTerminalRendererKey`, for the reason
+    /// spelled out on `enableTranscriptDefault`. Off until the A/B against a
+    /// standalone emulator says otherwise; graduation is a one-line change
+    /// here, which reaches everyone who never touched the toggle while
+    /// preserving every deliberate opt-out.
+    static let useMetalTerminalRendererDefault = false
+
+    /// Whether newly created terminal views should request SwiftTerm's Metal
+    /// renderer. Three-state read: an unset key takes the shipped default, and
+    /// an explicit `false` survives a change to that constant.
+    ///
+    /// Only `makeNSView` consults this, so flipping the toggle applies to
+    /// terminals opened afterwards — the Settings copy says so, and an app
+    /// restart is the way to move every already-open terminal at once.
+    static func metalTerminalRendererEnabled(defaults: UserDefaults = .standard) -> Bool {
+        metalTerminalRendererEnabled(stored: defaults.object(forKey: useMetalTerminalRendererKey) as? Bool)
+    }
+
+    /// The three-state decision on its own, with the shipped default injected.
+    ///
+    /// Split out so a test can prove the property that makes graduation safe:
+    /// `nil` — nobody chose — follows `shippedDefault`, while an explicit
+    /// `false` holds against a `shippedDefault` of `true`. Reading through
+    /// `bool(forKey:)` instead would collapse those two into one.
+    static func metalTerminalRendererEnabled(
+        stored: Bool?,
+        shippedDefault: Bool = useMetalTerminalRendererDefault
+    ) -> Bool {
+        stored ?? shippedDefault
+    }
 
     /// UserDefaults key for showing the sidebar's Scratch section (repo-less
     /// scratch spaces). Default on.

@@ -1196,9 +1196,10 @@ extension WorktreeLifecycle {
     ///     from the daemon; the holder path reads the same daemon environment,
     ///     passed in explicitly so tests are not at the mercy of `$SHELL`.
     ///
-    /// The job inherits `environment` as its base for the same reason: a tmux
-    /// pane inherits the server's environment, and the server inherited the
-    /// daemon's.
+    /// The job's base is the daemon environment minus the identity of whatever
+    /// launched the daemon, the same scrub the tmux server's own spawn gets —
+    /// see `SpawnBaseEnvironment` for why a job that inherits it is not the
+    /// same job the tmux path starts.
     static func holderLaunch(
         shellCommand: String,
         env: [String: String],
@@ -1214,7 +1215,8 @@ extension WorktreeLifecycle {
             executable: argv[0],
             arguments: Array(argv.dropFirst()),
             workingDirectory: workingDirectory,
-            environment: environment.merging(sensitiveEnv) { _, sensitive in sensitive },
+            environment: SpawnBaseEnvironment.inheriting(environment)
+                .merging(sensitiveEnv) { _, sensitive in sensitive },
             // Clamped into `UInt16` the same way the pty's `winsize` is: a
             // caller-supplied size that could not fit would otherwise wrap to a
             // one-column terminal rather than fail.
@@ -1339,38 +1341,28 @@ extension WorktreeLifecycle {
         let resolvedCols = cols ?? TmuxManager.defaultCols
         let resolvedRows = rows ?? TmuxManager.defaultRows
 
-        // The transport gate. Off is today's behavior, exactly; on puts the
-        // PRIMARY terminal on a holder. It is read once, here, and the decision
-        // is then carried in the row: flipping the flag must never migrate a
-        // running session, because the transport is a property of a live pty
-        // that already exists, not of a preference.
-        //
-        // Both halves of "can this create put a session on a holder" are asked
-        // here, and they are different questions. Mock mode has no registry at
-        // all; a daemon whose `TBDHolder` binary is missing has one that cannot
-        // spawn — it is still built, because adoption reaches an already-running
-        // holder through its socket and must keep working across an upgrade that
-        // moved the binary. Gating on the registry's mere presence would take
-        // the holder path with nothing able to start a holder, and the
-        // `holderExecutableUnavailable` that `spawn` then throws has nothing
-        // catching it: the whole worktree create would fail. Either way the
-        // fallback is tmux, because a worktree that will not open is a worse
-        // answer than one that opens on the old transport.
-        let holderRegistry = self.holderRegistry
-        let useHolderTransport = config.ptyHolderEnabled && holderRegistry?.canSpawn == true
+        // The transport gate, read once here and then carried in the row: the
+        // same decision every other spawn path makes, through the same
+        // function, so the flag cannot mean one thing for a primary terminal
+        // and another for an extra one. See `TerminalSpawnTransport.decide`.
+        let transport = TerminalSpawnTransport.decide(config: config, registry: holderRegistry)
 
-        // The tmux server is ensured LAZILY on the holder path, and eagerly —
-        // in exactly the place it always was — on the tmux path.
+        // The tmux server is ensured for the tmux transport and not at all for
+        // the holder one.
         //
         // That asymmetry is the point of the transport. A holder-backed session
-        // needs no tmux server at all, and calling `ensureServer` anyway would
+        // needs no tmux server, and calling `ensureServer` anyway would
         // resurrect the very resource this design exists to remove: a server
-        // process, its socket, and a window nobody reads. But the setup-hook
-        // terminal below is still tmux for Milestone A, so the holder path can
-        // still end up needing one — and when it does, it must get the same
-        // server, the same control-mode wiring, and the same untracked-initial-
-        // window cleanup the tmux path gets. Hence one memoized ensure rather
-        // than two spellings that could drift.
+        // process, its socket, and a window nobody reads. Every tab this
+        // function opens — the primary, the setup-hook tab, the archived-
+        // session restores — is born onto the transport the gate chose, so on
+        // the holder path nothing below asks for a server.
+        //
+        // The ensure stays memoized because the tmux path reaches it from more
+        // than one place: eagerly here, and again from the restore loop, which
+        // must get the same server, the same control-mode wiring and the same
+        // untracked-initial-window cleanup rather than a second spelling that
+        // could drift.
         var initialWindowID: String?
         var tmuxServerEnsured = false
         func ensureTmuxServerOnce() async throws {
@@ -1386,7 +1378,7 @@ extension WorktreeLifecycle {
             )
             await controlMode?.enableIfGated(serverName: tmuxServer)
         }
-        if !useHolderTransport {
+        if !transport.isHolder {
             try await ensureTmuxServerOnce()
         }
 
@@ -1432,6 +1424,22 @@ extension WorktreeLifecycle {
         let primarySessionID: String?
         let primaryProfileID: UUID?
         let primaryLabel: String
+        // What the model proxy did with this spawn: the stream file to stamp on
+        // the row below, and the route to undo if the row never gets written.
+        //
+        // Filled in by the `.claude` branch alone, which is the only agent the
+        // model proxy speaks for: a shell has no upstream, and Codex does not
+        // talk to the Messages API, so neither may be handed an
+        // `ANTHROPIC_BASE_URL`. The gate is structural rather than a field
+        // check — the other branches never call `attach` at all.
+        //
+        // **Optional, and there is no empty `Outcome` to use instead.** An
+        // attachment that stood for "never attempted" would have to carry an
+        // empty environment, and `attachment.sensitiveEnv` would then compile at
+        // a shell or Codex spawn site and launch it with no env overrides, no
+        // `DISABLE_AUTO_UPDATE`, and no auth env at all — silently. `nil` makes
+        // that read a compile error instead.
+        var primaryAttachment: ModelProxyRouteAttachment.Outcome? = nil
         switch primaryTerminalKind {
         case .shell:
             primaryCommand = defaultShell
@@ -1480,7 +1488,7 @@ extension WorktreeLifecycle {
                     repo: repo, worktree: worktree, isResume: false,
                     scratchInstructions: config.scratchInstructions,
                     scratchRenamePrompt: config.scratchRenamePrompt)
-            let profileConfigDir = configDirManager.resolveConfigDir(for: resolvedProfile)
+            let profileConfigDir = await configDirManager.resolveConfigDir(for: resolvedProfile)
             // Pre-accept Claude Code's folder-trust dialog. TBD just created
             // this worktree from a repo the operator registered, so the trust
             // answer is known by construction — and the dialog blocks before
@@ -1509,6 +1517,57 @@ extension WorktreeLifecycle {
                     storedTranscriptPath: nil
                 )
             }
+            // Hoisted out of the `build` call because the model proxy must read
+            // the SAME resolved file the spawn runs with: whether it sets
+            // `env.ANTHROPIC_BASE_URL` decides whether a route can be honored at
+            // all. Resolving it a second time would rewrite the per-session
+            // overlay and could answer about a different file.
+            let primaryOverlayPath = ClaudeHookOverlay.resolveOverlayPath(
+                fallbackModels: resolvedProfile?.fallbackModels,
+                sessionKey: plannedTerminalID1.uuidString,
+                // Repo fragment is file-backed config, read fresh at
+                // spawn time — applies on every spawn path, resume included.
+                repoSettingsJSON: ClaudeHookOverlay.repoSettingsFragment(repoID: repo?.id),
+                // Per-spawn fragment applies to FRESH primary spawns only;
+                // an archived-session resume must not reapply it. Hooks
+                // overlay still resolves for resumes — only
+                // extraSettingsJSON goes nil.
+                extraSettingsJSON: isResume ? nil : claudeSettingsOverlay,
+                // Desk sessions only — see the parameter's doc comment.
+                watchDeskRole: watchDeskRole,
+                worktreePath: worktreePath,
+                // The same config dir this spawn runs with, so the tee
+                // delegates to the user-scope statusline THIS session reads.
+                profileConfigDir: profileConfigDir
+            )
+            // **The routing decision, and it happens BEFORE the command is
+            // composed.** `ClaudeSpawnCommandBuilder.build` re-exports every
+            // profile routing key inline into the command string it returns,
+            // and those exports run *after* the process environment is applied
+            // — so a profile carrying its own `ANTHROPIC_BASE_URL` would
+            // clobber the route's, and the session would talk straight to the
+            // profile endpoint while the row recorded a stream file that never
+            // fills. Deciding here means a routed spawn can be built with
+            // `profileBaseURL: nil`, and the profile's URL survives only as the
+            // route's upstream.
+            //
+            // Only the holder transport is routed (spec: pty-holder only), so
+            // the registry is the gate. A refusal returns this environment
+            // unchanged; nothing below can fail because of it. The gate and the
+            // call are one function because the wake path makes exactly the
+            // same five-step decision.
+            let attachment = await ModelProxyRouteAttachment.attachIfRoutable(
+                terminalID: plannedTerminalID1,
+                isHolderSpawn: transport.isHolder,
+                config: config,
+                profileKind: resolvedProfile?.kind,
+                profileBaseURL: resolvedProfile?.baseURL,
+                envOverrides: mergedEnvOverrides,
+                // The SAME resolved overlay the spawn runs with, read above.
+                overlayPath: primaryOverlayPath,
+                holderEnvironment: holderRegistry?.environment,
+                supervisor: modelProxySupervisor)
+            primaryAttachment = attachment
             let spawn = ClaudeSpawnCommandBuilder.build(
                 resumeID: isResume ? sessionUUID : nil,
                 forkSession: carryover != nil,
@@ -1522,7 +1581,14 @@ extension WorktreeLifecycle {
                 initialPrompt: isResume ? nil : effectivePrompt,
                 profileSecret: resolvedProfile?.secret,
                 profileKind: resolvedProfile?.kind,
-                profileBaseURL: resolvedProfile?.baseURL,
+                // The route's own URL on a routed spawn, the profile's
+                // otherwise. The builder inlines an
+                // `export ANTHROPIC_BASE_URL=…` that runs after the shell's rc
+                // files, which is how this endpoint survives a `.zshrc` that
+                // sets one of its own — a defence the profile's URL has always
+                // had and the route needs just as much.
+                profileBaseURL: attachment.builderBaseURL(
+                    profile: resolvedProfile?.baseURL),
                 // Per-spawn model override (picker model buttons) wins over
                 // the profile default for this initial spawn only.
                 profileModel: modelOverride ?? resolvedProfile?.model,
@@ -1531,24 +1597,7 @@ extension WorktreeLifecycle {
                 profileConfigDir: profileConfigDir,
                 cmd: nil,
                 shellFallback: defaultShell,
-                settingsOverlayPath: ClaudeHookOverlay.resolveOverlayPath(
-                    fallbackModels: resolvedProfile?.fallbackModels,
-                    sessionKey: plannedTerminalID1.uuidString,
-                    // Repo fragment is file-backed config, read fresh at
-                    // spawn time — applies on every spawn path, resume included.
-                    repoSettingsJSON: ClaudeHookOverlay.repoSettingsFragment(repoID: repo?.id),
-                    // Per-spawn fragment applies to FRESH primary spawns only;
-                    // an archived-session resume must not reapply it. Hooks
-                    // overlay still resolves for resumes — only
-                    // extraSettingsJSON goes nil.
-                    extraSettingsJSON: isResume ? nil : claudeSettingsOverlay,
-                    // Desk sessions only — see the parameter's doc comment.
-                    watchDeskRole: watchDeskRole,
-                    worktreePath: worktreePath,
-                    // The same config dir this spawn runs with, so the tee
-                    // delegates to the user-scope statusline THIS session reads.
-                    profileConfigDir: profileConfigDir
-                ),
+                settingsOverlayPath: primaryOverlayPath,
                 pluginDirPath: PluginDirWriter.pluginDirPath,
                 envSettingOverrides: claudeEnvOverrides,
                 sessionName: worktree.displayName
@@ -1558,93 +1607,54 @@ extension WorktreeLifecycle {
                 "TBD_WORKTREE_ID": worktreeID.uuidString,
                 "TBD_TERMINAL_ID": plannedTerminalID1.uuidString,
             ]
-            // Layer the builder's auth/routing env ON TOP of free-form overrides
-            // so auth/routing stays final and free-form vars can't clobber it.
-            primarySensitiveEnv = mergedEnvOverrides.merging(spawn.sensitiveEnv) { _, builder in builder }
+            // Layer the builder's auth/routing env ON TOP of free-form
+            // overrides so auth/routing stays final and free-form vars can't
+            // clobber it. Through the attachment's own method, because the wake
+            // path makes the same merge and the order is silent when it is
+            // wrong.
+            primarySensitiveEnv = attachment.launchEnvironment(
+                mergingBuilder: spawn.sensitiveEnv)
             primaryProfileID = resolvedProfile?.profileID
             primaryLabel = TerminalLabel.claudeCode
         }
         // The two transports diverge for exactly this one spawn, and converge
-        // again on the row below. Everything that decided WHAT to run —
+        // again on the row. Everything that decided WHAT to run —
         // `primaryCommand`, `primaryEnv`, `primarySensitiveEnv`, the size — is
         // shared verbatim, because the env precedence behind it (global < repo
         // < profile, with the spawn builder's auth env merged on top) is subtle
         // and already correct; a second derivation is a second thing to get
-        // wrong.
-        let window1: (windowID: String, paneID: String)
-        let holderHandle: HolderHandle?
-        if useHolderTransport, let holderRegistry {
-            holderHandle = try await holderRegistry.spawn(
-                terminalID: plannedTerminalID1,
-                launch: Self.holderLaunch(
-                    shellCommand: primaryCommand,
-                    env: primaryEnv,
-                    sensitiveEnv: primarySensitiveEnv,
-                    workingDirectory: worktreePath,
-                    cols: resolvedCols,
-                    rows: resolvedRows,
-                    environment: holderRegistry.environment))
-            // A holder session has no tmux coordinate. The columns are NOT NULL
-            // from the v1 schema, so they take the empty string — and nothing
-            // may read them back: a holder row is discriminated by `transport`
-            // alone. See `WorktreeLifecycle+Reconcile`'s exemption.
-            window1 = (windowID: "", paneID: "")
-        } else {
-            holderHandle = nil
-            window1 = try await tmux.createWindow(
-                server: tmuxServer,
-                session: "main",
-                cwd: worktreePath,
-                shellCommand: primaryCommand,
-                env: primaryEnv,
-                sensitiveEnv: primarySensitiveEnv,
-                cols: resolvedCols,
-                rows: resolvedRows
-            )
-        }
-        let primaryTransport: TerminalTransport = holderHandle == nil ? .tmux : .holder
-        do {
-            _ = try await db.terminals.create(
-                id: plannedTerminalID1,
-                worktreeID: worktreeID,
-                tmuxWindowID: window1.windowID,
-                tmuxPaneID: window1.paneID,
-                label: primaryLabel,
-                claudeSessionID: primarySessionID,
-                profileID: primaryProfileID,
-                kind: primaryTerminalKind,
-                // Same value the overlay above was built from, written to the
-                // row so the fact outlives this call. A desk woken from
-                // hibernation reuses this row, and the wake site has nothing
-                // else to read.
-                watchDeskRole: watchDeskRole,
-                transport: primaryTransport,
-                holderPID: holderHandle?.holderPID,
-                childPID: holderHandle?.childPID
-            )
-        } catch {
-            // Best-effort creation-time cleanup on both transports: a resource
-            // that exists with no row naming it is one nothing will ever find
-            // again. On the holder path that means `forget` (the holder closes
-            // the pty master and winds down) and then killing the job by pid,
-            // because holder death is deliberately not child death.
-            if let holderHandle {
-                await holderRegistry?.abandon(
-                    terminalID: plannedTerminalID1, handle: holderHandle)
-            } else {
-                try? await tmux.killWindow(server: tmuxServer, windowID: window1.windowID)
-            }
-            throw error
-        }
+        // wrong. The divergence itself lives in `spawnTerminal`, which every
+        // spawn path calls.
+        let primaryTerminal = try await spawnTerminal(
+            id: plannedTerminalID1,
+            worktreeID: worktreeID,
+            tmuxServer: tmuxServer,
+            workingDirectory: worktreePath,
+            command: primaryCommand,
+            env: primaryEnv,
+            sensitiveEnv: primarySensitiveEnv,
+            cols: resolvedCols,
+            rows: resolvedRows,
+            label: primaryLabel,
+            claudeSessionID: primarySessionID,
+            profileID: primaryProfileID,
+            kind: primaryTerminalKind,
+            // Same value the overlay above was built from, written to the row
+            // so the fact outlives this call. A desk woken from hibernation
+            // reuses this row, and the wake site has nothing else to read.
+            watchDeskRole: watchDeskRole,
+            transport: transport,
+            attachment: primaryAttachment,
+            modelProxySupervisor: modelProxySupervisor)
         // Recapture reads a tmux pane's screen, so it has nothing to read on a
         // holder session — `paneID` is empty there by construction. Scheduling
         // it anyway would poll a coordinate that can never resolve.
-        if carryover != nil, primaryTransport == .tmux {
+        if carryover != nil, primaryTerminal.transport == .tmux {
             let recapture = sessionRecaptureFactory?(db, tmux)
                 ?? SessionRecaptureScheduler(db: db, tmux: tmux)
             recapture.schedule(
                 terminalID: plannedTerminalID1,
-                paneID: window1.paneID,
+                paneID: primaryTerminal.tmuxPaneID,
                 server: tmuxServer,
                 expectedIncarnationID: nil
             )
@@ -1673,21 +1683,20 @@ extension WorktreeLifecycle {
                 TBDConstants.hookPath(repoID: $0, eventName: HookEvent.setup.rawValue)
             }
         )
-        // The setup terminal stays on tmux for Milestone A, whatever the
-        // primary's transport. It is a hook runner, not an agent surface, and
-        // moving it would mean a second holder per worktree before anything has
-        // soaked one.
+        // The setup tab is born onto the same transport as the primary, through
+        // the same gate and the same spawn.
         //
-        // The cost is that on the holder path it is the ONLY thing that wants a
-        // tmux server. So it is spawned there only when the repo actually has a
-        // setup hook: without one this tab is a bare shell, and starting a tmux
-        // server, a session and a window for a bare shell is exactly the cost
-        // the transport exists to remove. On the tmux path the server exists
+        // On the holder it is spawned only when the repo actually has a setup
+        // hook: without one this tab is a bare shell, and a second holder
+        // process for a bare shell nobody asked for is exactly the cost the
+        // transport exists to remove. On the tmux path the server exists
         // regardless and the tab is created unconditionally, as it always has
         // been — the flag must not change what the flag-off path does.
-        let wantsSetupTerminal = repo != nil && (!useHolderTransport || setupHookPath != nil)
+        let wantsSetupTerminal = repo != nil && (!transport.isHolder || setupHookPath != nil)
         if let repo, wantsSetupTerminal {
-            try await ensureTmuxServerOnce()
+            if !transport.isHolder {
+                try await ensureTmuxServerOnce()
+            }
             let plannedTerminalID2 = UUID()
             createdTerminalIDs.append(plannedTerminalID2)
             let setupCommand: String
@@ -1726,49 +1735,53 @@ extension WorktreeLifecycle {
                 "TBD_REPO_PATH": repo.path,
                 "TBD_BRANCH": worktree.branch,
             ]
-            let window2 = try await tmux.createWindow(
-                server: tmuxServer,
-                session: "main",
-                cwd: worktreePath,
-                shellCommand: setupCommand,
+            let setupTerminal = try await spawnTerminal(
+                id: plannedTerminalID2,
+                worktreeID: worktreeID,
+                tmuxServer: tmuxServer,
+                workingDirectory: worktreePath,
+                command: setupCommand,
                 env: setupEnv,
                 sensitiveEnv: setupSensitiveEnv,
                 cols: resolvedCols,
-                rows: resolvedRows
-            )
-            do {
-                _ = try await db.terminals.create(
-                    id: plannedTerminalID2,
-                    worktreeID: worktreeID,
-                    tmuxWindowID: window2.windowID,
-                    tmuxPaneID: window2.paneID,
-                    label: TerminalLabel.setup,
-                    kind: .shell
-                )
-            } catch {
-                try? await tmux.killWindow(server: tmuxServer, windowID: window2.windowID)
-                throw error
-            }
+                rows: resolvedRows,
+                label: TerminalLabel.setup,
+                claudeSessionID: nil,
+                profileID: nil,
+                kind: .shell,
+                transport: transport,
+                attachment: nil,
+                modelProxySupervisor: modelProxySupervisor)
             createdTerminals.append((id: plannedTerminalID2, label: TerminalLabel.setup))
             if let setupMarkerPath, let setupHookPath {
-                // The auto-close wrapper lets the pane EXIT on hook success,
-                // and tmux destroys the window the instant it does — before
-                // the watcher's teardown can capture the scrollback for
+                // `remain-on-exit` is a tmux property and only tmux needs it:
+                // the auto-close wrapper lets the pane EXIT on hook success and
+                // tmux destroys the window the instant it does, before the
+                // watcher's teardown can capture the scrollback for
                 // closed-terminal history. Keep the dead pane around; the
-                // teardown's killWindow removes it after capturing.
+                // teardown's killWindow removes it after capturing. On the
+                // holder that teardown captures nothing at all (see
+                // `closeHookTerminal`), so nothing there needs a dead job kept.
                 // Best-effort: a failure only costs the captured history.
-                do {
-                    try await tmux.setRemainOnExit(server: tmuxServer, windowID: window2.windowID)
-                } catch {
-                    logger.warning("setup auto-close: remain-on-exit failed for window \(window2.windowID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                if !transport.isHolder {
+                    do {
+                        try await tmux.setRemainOnExit(
+                            server: tmuxServer, windowID: setupTerminal.tmuxWindowID)
+                    } catch {
+                        logger.warning("setup auto-close: remain-on-exit failed for window \(setupTerminal.tmuxWindowID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                    }
                 }
                 setupAutoCloseSpawn = PreSessionSpawn(
                     terminalID: plannedTerminalID2,
                     tmuxServer: tmuxServer,
-                    windowID: window2.windowID,
-                    paneID: window2.paneID,
+                    windowID: setupTerminal.tmuxWindowID,
+                    paneID: setupTerminal.tmuxPaneID,
                     markerPath: setupMarkerPath,
-                    hookPath: setupHookPath
+                    hookPath: setupHookPath,
+                    transport: setupTerminal.transport,
+                    holderPID: setupTerminal.holderPID,
+                    childPID: setupTerminal.childPID,
+                    childStartedAt: setupTerminal.holderChildStartedAt
                 )
             }
         }
@@ -1790,7 +1803,7 @@ extension WorktreeLifecycle {
             for sessionID in additionalArchivedClaudeSessions {
                 let plannedID = UUID()
                 createdTerminalIDs.append(plannedID)
-                let restoreProfileConfigDir = configDirManager.resolveConfigDir(for: resolvedProfile)
+                let restoreProfileConfigDir = await configDirManager.resolveConfigDir(for: resolvedProfile)
                 // Pre-accept the folder-trust dialog so restoring an extra
                 // archived session onto a fresh profile dir doesn't re-prompt.
                 await ClaudeTrustSeeder.ensureTrusted(
@@ -1834,38 +1847,38 @@ extension WorktreeLifecycle {
                     "TBD_WORKTREE_ID": worktreeID.uuidString,
                     "TBD_TERMINAL_ID": plannedID.uuidString,
                 ]
-                // Archived-session restores stay on tmux for Milestone A, for
-                // the same reason as the setup terminal: one holder per
-                // worktree is the shape being soaked. They therefore need the
-                // server, which the holder path has not started.
-                try await ensureTmuxServerOnce()
-                let window = try await tmux.createWindow(
-                    server: tmuxServer,
-                    session: "main",
-                    cwd: worktreePath,
-                    shellCommand: spawn.command,
+                // A restored archived session is born onto the same transport
+                // as the primary, through the same gate and the same spawn, so
+                // only the tmux one wants a server.
+                //
+                // It is NOT routed through the model proxy — and neither are
+                // revive-from-history tabs or fork-session tabs. A route has to
+                // be minted before the command is composed, because the command
+                // re-exports the profile's own routing keys over it, and these
+                // three sites do not compose their commands that way yet. That
+                // is a follow-up rather than a regression: a tmux spawn was
+                // never routed either, so nothing loses a route it used to have.
+                if !transport.isHolder {
+                    try await ensureTmuxServerOnce()
+                }
+                _ = try await spawnTerminal(
+                    id: plannedID,
+                    worktreeID: worktreeID,
+                    tmuxServer: tmuxServer,
+                    workingDirectory: worktreePath,
+                    command: spawn.command,
                     env: perTermEnv,
                     // Same free-form-under-auth layering as the primary terminal.
                     sensitiveEnv: mergedEnvOverrides.merging(spawn.sensitiveEnv) { _, builder in builder },
                     cols: resolvedCols,
-                    rows: resolvedRows
-                )
-                do {
-                    _ = try await db.terminals.create(
-                        id: plannedID,
-                        worktreeID: worktreeID,
-                        tmuxWindowID: window.windowID,
-                        tmuxPaneID: window.paneID,
-                        label: TerminalLabel.claudeCode,
-                        claudeSessionID: sessionID,
-                        profileID: resolvedProfile?.profileID,
-                        kind: .claude
-                    )
-                } catch {
-                    try? await tmux.killWindow(
-                        server: tmuxServer, windowID: window.windowID)
-                    throw error
-                }
+                    rows: resolvedRows,
+                    label: TerminalLabel.claudeCode,
+                    claudeSessionID: sessionID,
+                    profileID: resolvedProfile?.profileID,
+                    kind: .claude,
+                    transport: transport,
+                    attachment: nil,
+                    modelProxySupervisor: modelProxySupervisor)
                 createdTerminals.append((id: plannedID, label: TerminalLabel.claudeCode))
             }
         }

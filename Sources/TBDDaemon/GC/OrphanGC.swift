@@ -63,7 +63,17 @@ public actor OrphanGC {
     private let deletionQueueCollector: DeletionQueueCollector
     private let profileDirCollector: ProfileDirCollector
     private let holderRendezvousCollector: HolderRendezvousCollector
+    private let modelProxyFileCollector: ModelProxyFileCollector
+    private let attachmentsCollector: AttachmentsCollector
+    /// The attachments root both halves of the reconciler pair read — the hourly
+    /// sweep through `attachmentsCollector`, and `removedWorktreeCleanup`
+    /// directly. Cached at init from the injected seam, so ONE seam governs
+    /// both: re-resolving `TBDConstants.attachmentsDir` per call would let an
+    /// injected base steer the sweep while the event-driven half kept walking
+    /// the process-global one.
+    private let attachmentsBase: URL
     private let rowlessHolderCollector: RowlessHolderCollector
+    private let hangStackCollector: HangStackCollector
     /// Deletes the path-keyed Claude Code credentials item belonging to a
     /// quarantined profile dir. Injected so tests never reach the real login
     /// keychain, which `scripts/test.sh` cannot fence.
@@ -109,9 +119,12 @@ public actor OrphanGC {
         scratchpadBase: URL? = nil,
         now: (@Sendable () -> Date)? = nil,
         profileDirBase: URL? = nil,
+        hangStackBase: URL? = nil,
         credentialsKeychain: any ClaudeCredentialsKeychainDeleting = SecItemClaudeCredentialsKeychain(),
         signaller: any ProcessSignaller = ProductionProcessSignaller(),
-        holdersBase: URL? = nil
+        holdersBase: URL? = nil,
+        modelProxyBase: URL? = nil,
+        streamsBase: URL? = nil
     ) {
         var wrapped: (@Sendable () async -> [String]?)?
         if let lsofProvider {
@@ -120,8 +133,10 @@ public actor OrphanGC {
         self.init(
             db: db, git: git, broadcast: broadcast, liveCWDsProvider: wrapped,
             scratchpadBase: scratchpadBase, now: now,
-            profileDirBase: profileDirBase, credentialsKeychain: credentialsKeychain,
-            signaller: signaller, holdersBase: holdersBase
+            profileDirBase: profileDirBase, hangStackBase: hangStackBase,
+            credentialsKeychain: credentialsKeychain,
+            signaller: signaller, holdersBase: holdersBase,
+            modelProxyBase: modelProxyBase, streamsBase: streamsBase
         )
     }
 
@@ -139,6 +154,7 @@ public actor OrphanGC {
         now: (@Sendable () -> Date)? = nil,
         beforeInterruptedArchiveReap: (@Sendable () async -> Void)? = nil,
         profileDirBase: URL? = nil,
+        hangStackBase: URL? = nil,
         credentialsKeychain: any ClaudeCredentialsKeychainDeleting = SecItemClaudeCredentialsKeychain(),
         beforeProfileDirReap: (@Sendable () async -> Void)? = nil,
         processCWDsProvider: (@Sendable () async -> [Int32: String]?)? = nil,
@@ -148,6 +164,9 @@ public actor OrphanGC {
         orphanProcessPollInterval: Duration = .milliseconds(100),
         clock: any Clock<Duration> = ContinuousClock(),
         holdersBase: URL? = nil,
+        modelProxyBase: URL? = nil,
+        streamsBase: URL? = nil,
+        attachmentsBase: URL? = nil,
         holderListenerProbe: (@Sendable (String) async -> Bool)? = nil,
         rowlessHolderHandshake: (@Sendable (String) async -> RowlessHolderHandshake)? = nil,
         rowlessHolderReclaimer: (any RowlessHolderReclaiming)? = nil
@@ -159,6 +178,10 @@ public actor OrphanGC {
         // read from it rather than rebuilt here.
         let resolvedProfileDirBase = profileDirBase
             ?? ClaudeProfileConfigDirManager().baseDirectory
+        // `HangStackRetention` owns where the app writes hang stacks, so the
+        // collector's base is read from it rather than rebuilt here — that is
+        // what keeps the writer's cap and this sweep pointed at one directory.
+        let resolvedHangStackBase = hangStackBase ?? HangStackRetention.defaultBaseDirectory
         let snap = ReapSnapshot(git: git)
 
         self.db = db
@@ -181,11 +204,29 @@ public actor OrphanGC {
             base: resolvedHoldersBase,
             now: resolvedNow,
             isListening: holderListenerProbe ?? HolderRendezvousCollector.probeForListener)
+        // Both directories come from the injected seams or from
+        // `TBDConstants`, never from a literal join: the fence moves `TBD_HOME`
+        // and a hand-built path would sweep the developer's real one.
+        //
+        // Pointed at `routes/` rather than at the proxy directory, which is what
+        // keeps `proxy.lock`, `proxy.pid` and `proxy.log` structurally out of
+        // this leg's reach — see `ModelProxyFileCollector` for why an unheld
+        // lock is the wrong anchor for them.
+        self.modelProxyFileCollector = ModelProxyFileCollector(
+            routesDir: modelProxyBase.map { $0.appendingPathComponent("routes") }
+                ?? TBDConstants.modelProxyRoutesDir(),
+            streamsDir: streamsBase ?? TBDConstants.streamsDir(),
+            now: resolvedNow)
         self.rowlessHolderCollector = RowlessHolderCollector(
             base: resolvedHoldersBase,
             now: resolvedNow,
             handshake: rowlessHolderHandshake,
             reclaimer: rowlessHolderReclaimer)
+        let resolvedAttachmentsBase = attachmentsBase ?? TBDConstants.attachmentsDir
+        self.attachmentsBase = resolvedAttachmentsBase
+        self.attachmentsCollector = AttachmentsCollector(
+            base: resolvedAttachmentsBase, now: resolvedNow)
+        self.hangStackCollector = HangStackCollector(base: resolvedHangStackBase)
         self.processCWDsProvider = processCWDsProvider
         let resolvedSnapshotProvider: @Sendable () async -> [ProcessSnapshotEntry]? =
             processSnapshotProvider ?? { await OrphanProcessCollector.realProcessSnapshot() }
@@ -206,6 +247,12 @@ public actor OrphanGC {
     public func sweep(dryRun: Bool = false) async -> GCSweepResult {
         var planned: [String] = []
         var reaped = 0
+        // Counted separately from `reaped` on purpose: hang-stack files produce
+        // no `ReapRecord`, so they must NOT arm the `.reapRecordsChanged`
+        // broadcast below, which stays keyed to the record-producing phases.
+        // They are still added to the returned total so `tbd gc sweep` reports
+        // honestly.
+        var hangStacksReaped = 0
 
         guard let config = try? await db.config.get() else { return .init(planned: [], reaped: 0) }
         guard config.gcEnabled || dryRun else { return .init(planned: ["gc disabled"], reaped: 0) }
@@ -282,8 +329,7 @@ public actor OrphanGC {
         // Before the rendezvous file sweep, deliberately. A holder this phase
         // kills leaves a socket behind that nothing else will ever unlink, and
         // running the file sweep next means one pass reclaims both the process
-        // and its residue — for an installation that has opted into both, which
-        // is the only way either runs.
+        // and its residue.
         await reclaimRowlessHolders(
             config: config, dryRun: dryRun, planned: &planned, reaped: &reaped
         )
@@ -292,8 +338,20 @@ public actor OrphanGC {
             config: config, dryRun: dryRun, planned: &planned, reaped: &reaped
         )
 
+        await reclaimModelProxyFiles(
+            config: config, dryRun: dryRun, planned: &planned, reaped: &reaped
+        )
+
         await reclaimRetainedTranscripts(
             config: config, dryRun: dryRun, planned: &planned, reaped: &reaped
+        )
+
+        await reclaimAttachments(
+            config: config, dryRun: dryRun, planned: &planned, reaped: &reaped
+        )
+
+        await reclaimHangStacks(
+            config: config, dryRun: dryRun, planned: &planned, reaped: &hangStacksReaped
         )
 
         // Snapshot retention never runs in dryRun; the outer guard already
@@ -303,7 +361,61 @@ public actor OrphanGC {
         }
 
         if reaped > 0 { broadcast(.reapRecordsChanged) }
-        return .init(planned: planned, reaped: reaped)
+        return .init(planned: planned, reaped: reaped + hangStacksReaped)
+    }
+
+    /// Reclaims hang-stack diagnostic files under
+    /// `~/Library/Logs/TBD/hang-stacks/` that are past the retention policy —
+    /// older than `HangStackRetention.maxAge`, or outside the newest
+    /// `HangStackRetention.maxFiles`
+    /// (`docs/specs/2026-08-29-hang-stack-reclaimer-design.md`).
+    ///
+    /// Gated by `gcHangStacksEnabled` on top of `gcEnabled`, the same shape
+    /// `reclaimProfileDirs` uses and for the same reason: this phase deletes
+    /// persisted state from a background sweep, which the house rule puts
+    /// behind a default-off flag until it has soaked. `dryRun` bypasses the
+    /// flag exactly as `sweep` lets it bypass `gcEnabled` — someone deciding
+    /// whether to enable a default-off flag needs to see what enabling it would
+    /// reclaim first — and touches nothing either way.
+    ///
+    /// **Reports in aggregate, and persists no `ReapRecord`.** A hang stack is
+    /// not restorable and belongs to no repo, so a record would never surface
+    /// anywhere; and one row per file would write tens of thousands of rows
+    /// into `reap_records` on a first sweep — a new unbounded table to record
+    /// the end of an unbounded directory. For the same reason the plan gets one
+    /// line rather than one per file: 25,000 lines in an RPC response is not a
+    /// plan anyone reads.
+    private func reclaimHangStacks(
+        config: Config, dryRun: Bool, planned: inout [String], reaped: inout Int
+    ) async {
+        guard config.gcHangStacksEnabled || dryRun else { return }
+
+        let selected = hangStackCollector.candidates(
+            now: now(), graceSeconds: config.gcGraceSeconds)
+        guard !selected.isEmpty else { return }
+
+        let plannedBytes = selected.reduce(Int64(0)) { $0 + $1.sizeBytes }
+        // The COLLECTOR's base, never the one that was injected: it resolves
+        // its base at construction, so with a symlinked base the two spell
+        // different directories — and a plan line that names a directory the
+        // reap does not touch is the exact mismatch `resolvedDirectory` exists
+        // to kill.
+        planned.append("""
+        REAP hang-stacks \(hangStackCollector.base.path) files=\(selected.count) \
+        bytes=\(plannedBytes)
+        """)
+        // This phase's guard is `gcHangStacksEnabled || dryRun`, so every line
+        // below runs only with the flag actually on.
+        guard !dryRun else { return }
+
+        let result = hangStackCollector.reap(selected)
+        guard result.files > 0 else { return }
+        reaped += result.files
+        logger.info("""
+        gc: reaped \(result.files, privacy: .public) hang-stack file(s) \
+        (\(result.bytes, privacy: .public) bytes) from \
+        \(self.hangStackCollector.base.path, privacy: .public)
+        """)
     }
 
     /// Reclaims worktree directories that outlived their archive: entries
@@ -707,16 +819,15 @@ public actor OrphanGC {
     /// (`docs/specs/2026-08-30-pty-holder-session-transport-design.md`,
     /// "Reconciliation").
     ///
-    /// Gated by `gcHolderRendezvousEnabled` on top of `gcEnabled`, both because
-    /// every new background sweep that unlinks files soaks behind its own
-    /// switch and because the transport it reclaims after is itself still
-    /// behind `ptyHolderEnabled` — a machine that has never spawned a holder
-    /// has nothing here for this phase to be right or wrong about.
+    /// Runs under `gcEnabled`, the same keep-biased gate as the agent-worktree
+    /// loop: holder-ness is a transport property, not a separate opt-in, so a
+    /// machine that collects orphans collects these too. A machine that has
+    /// never spawned a holder has an empty `~/tbd/holders` and this phase
+    /// finds nothing to be right or wrong about.
     ///
-    /// `dryRun` bypasses the flag exactly as `sweep` lets it bypass `gcEnabled`:
-    /// planning is read-only, and someone deciding whether to enable a
-    /// default-off flag needs to see what enabling it would reclaim before
-    /// flipping it. A NON-dry run still requires the flag.
+    /// `dryRun` bypasses `gcEnabled` here exactly as `sweep` lets it: planning
+    /// is read-only, and someone deciding whether to enable GC needs to see
+    /// what enabling it would reclaim before flipping it.
     ///
     /// This phase deliberately reads no rows. It reclaims files whose *process*
     /// is gone, which the socket and the lock answer directly; the
@@ -726,7 +837,6 @@ public actor OrphanGC {
     private func reclaimHolderRendezvous(
         config: Config, dryRun: Bool, planned: inout [String], reaped: inout Int
     ) async {
-        guard config.gcHolderRendezvousEnabled || dryRun else { return }
         for candidate in holderRendezvousCollector.candidates() {
             switch await holderRendezvousCollector.decide(
                 candidate, graceSeconds: config.gcGraceSeconds
@@ -738,8 +848,8 @@ public actor OrphanGC {
                 """)
             case .reap:
                 planned.append("REAP holder-rendezvous \(candidate.socketPath)")
-                // This arm's guard is `gcHolderRendezvousEnabled || dryRun`, so
-                // every line below runs only with the flag actually on.
+                // The outer `gcEnabled || dryRun` guard means every line below
+                // runs only with gcEnabled == true.
                 guard !dryRun else { continue }
                 let removed = holderRendezvousCollector.reap(candidate)
                 if removed.isEmpty {
@@ -751,6 +861,76 @@ public actor OrphanGC {
                 // as things reclaimed. No `ReapRecord` is written — these files
                 // are unlinked, not quarantined, and there is nothing a
                 // `tbd gc restore` could put back.
+                reaped += 1
+            }
+        }
+    }
+
+    /// Reclaims model proxy route files and stream files whose sessions are
+    /// gone (spec, "Durable resources and their reconcilers").
+    ///
+    /// Under `gcEnabled` alone, with no flag of its own: the files are the
+    /// proxy's own output, nothing else can reclaim them, and unlike the holder
+    /// legs this one signals no process and reads no rendezvous — it unlinks a
+    /// route file whose terminal no longer exists and a stream file nothing will
+    /// ever tail again.
+    ///
+    /// The keep bias in `ModelProxyFileCollector` is what makes that safe, and
+    /// the cost it is sized against is the **route** file's, not the stream
+    /// file's: a stream reaped early loses one turn's provisional transcript
+    /// view, while a route reaped from under a live session 404s that session
+    /// from the proxy's next restart onward. See the collector's own note.
+    ///
+    /// Rows are read once, before any gate. A row that commits during the sweep
+    /// is therefore not in the set — which is exactly what the grace window
+    /// covers, since a file written by a spawn that recent is younger than
+    /// `gcGraceSeconds` and kept on age alone.
+    private func reclaimModelProxyFiles(
+        config: Config, dryRun: Bool, planned: inout [String], reaped: inout Int
+    ) async {
+        let candidates = modelProxyFileCollector.candidates()
+        guard !candidates.isEmpty else { return }
+
+        guard let terminals = try? await db.terminals.list() else {
+            logger.error("gc: session rows unreadable this sweep — skipping the model proxy file phase")
+            planned.append("KEEP rows-unreadable model-proxy-file phase")
+            return
+        }
+        // Holder rows only, because only a holder spawn is ever routed (spec:
+        // pty-holder transport only), and only rows Claude's process has not
+        // left: an exit-stamped row is a session whose stream nothing will
+        // resume, and keeping its files for it would keep them forever.
+        let live = Set(
+            terminals
+                .filter { $0.transport == .holder && $0.hibernateReason != .exited }
+                .map(\.id))
+
+        for candidate in candidates {
+            switch modelProxyFileCollector.decide(
+                candidate, graceSeconds: config.gcGraceSeconds, liveTerminalIDs: live
+            ) {
+            case .keep(let reason):
+                // `planned` is a return value, printed for the operator who
+                // asked for the sweep, and it names the file in full. The log
+                // line is a different audience — see `ModelProxyFileCandidate
+                // .loggablePath` — and this one is the sharpest case for it: a
+                // `live-terminal` or `grace` keep names, by construction, the
+                // route file of a session that is running right now.
+                planned.append("KEEP \(reason) \(candidate.path)")
+                logger.debug("""
+                gc: keep \(reason, privacy: .public) \(candidate.loggablePath, privacy: .public)
+                """)
+            case .reap:
+                planned.append("REAP model-proxy-file \(candidate.path)")
+                // The outer `gcEnabled || dryRun` guard means every line below
+                // runs only with gcEnabled == true.
+                guard !dryRun else { continue }
+                guard modelProxyFileCollector.reap(candidate) else {
+                    planned.append("KEEP unlink-failed \(candidate.path)")
+                    continue
+                }
+                // No `ReapRecord`: these files are unlinked, not quarantined,
+                // and there is nothing a `tbd gc restore` could put back.
                 reaped += 1
             }
         }
@@ -913,6 +1093,118 @@ public actor OrphanGC {
         }
     }
 
+    // MARK: - Composer attachments
+
+    /// Reclaims `~/tbd/attachments/<worktreeID>/` directories whose worktree is
+    /// gone — the named periodic reconciler for the composer's attachment files
+    /// (`docs/specs/2026-09-05-transcript-composer-design.md`, "Reclaim").
+    ///
+    /// Its event-driven sibling is `removedWorktreeCleanup`, which unlinks a
+    /// worktree's directory the moment the worktree is archived. That path is
+    /// best effort by construction — a crash between the archive's commit point
+    /// and the callback, or a worktree removed outside TBD, leaves a directory
+    /// nobody unlinked — and this is the standing guarantee behind it. That
+    /// division is the doctrine the whole codebase uses: creation against the
+    /// filesystem cannot be transactional, so the sweep is the mechanism and
+    /// create-time cleanup is the optimisation.
+    ///
+    /// Gated by `transcriptComposerEnabled` on top of `gcEnabled`, because the
+    /// feature that writes these files is itself behind that flag — a machine
+    /// that has never opened the composer has nothing here for this phase to be
+    /// right or wrong about. `dryRun` bypasses the flag exactly as `sweep` lets
+    /// it bypass `gcEnabled`: planning is read-only, and someone deciding whether
+    /// to enable a default-off flag needs to see what enabling it would reclaim.
+    /// A NON-dry run still requires the flag.
+    ///
+    /// **An unreadable worktree list skips the whole leg**, rather than reading
+    /// an empty list as "no worktree is live" and reaping every directory.
+    ///
+    /// The row read is unfiltered on purpose: an archived row is still a row, and
+    /// the archive path's own unlink is what handles its directory. Filtering to
+    /// `.active` here would let this leg reap out from under a worktree somebody
+    /// can still revive.
+    ///
+    /// A directory whose row still exists is never removed, but the files in it
+    /// age individually: a staged image is read at paste time, or at resume time
+    /// on the wake path, so one the floor has passed is spent and goes on its
+    /// own.
+    ///
+    /// No `ReapRecord` is written. The record type is keyed by the worktree a
+    /// reap removed and carries a restorability pointer; there is nothing a
+    /// `tbd gc restore` could put back here, because the image was staged for a
+    /// message in a worktree that no longer exists — or, for a per-file reap,
+    /// for one nobody sent in two weeks.
+    private func reclaimAttachments(
+        config: Config, dryRun: Bool, planned: inout [String], reaped: inout Int
+    ) async {
+        guard config.transcriptComposerEnabled || dryRun else { return }
+
+        let live: Set<UUID>
+        do {
+            live = Set(try await db.worktrees.list().map(\.id))
+        } catch {
+            logger.error("""
+            gc: worktree rows unreadable this sweep \
+            (\(error.localizedDescription, privacy: .public)) — skipping the attachments phase
+            """)
+            planned.append("KEEP rows-unreadable attachments")
+            return
+        }
+
+        for candidate in attachmentsCollector.candidates() {
+            switch attachmentsCollector.decide(
+                candidate, liveWorktreeIDs: live,
+                floorDays: AttachmentsCollector.defaultFloorDays
+            ) {
+            case .keep(let reason):
+                planned.append("KEEP \(reason) \(candidate.path)")
+                logger.debug("""
+                gc: keep \(reason, privacy: .public) \(candidate.path, privacy: .public)
+                """)
+            case .reap:
+                planned.append("REAP attachments \(candidate.path)")
+                // This leg's guard is `transcriptComposerEnabled || dryRun`, so
+                // every line below runs only with the flag actually on.
+                guard !dryRun else { continue }
+                guard attachmentsCollector.reap(candidate) else {
+                    planned.append("KEEP unlink-failed \(candidate.path)")
+                    logger.warning("""
+                    gc: could not unlink \(candidate.path, privacy: .public)
+                    """)
+                    continue
+                }
+                reaped += 1
+                logger.info("""
+                gc: reclaimed composer attachments \(candidate.path, privacy: .public)
+                """)
+            case .reapFiles(let stale, let kept):
+                // The directory belongs to a row that still exists, so it stays
+                // whatever happens to the files inside it — including when the
+                // last one goes and it is left empty.
+                planned.append("KEEP live-worktree \(candidate.path)")
+                for keptFile in kept {
+                    planned.append("KEEP \(keptFile.reason) \(keptFile.file.path)")
+                }
+                for file in stale {
+                    planned.append(
+                        "REAP attachments \(file.path) live-worktree-file-past-floor")
+                    guard !dryRun else { continue }
+                    guard attachmentsCollector.reap(file) else {
+                        planned.append("KEEP unlink-failed \(file.path)")
+                        logger.warning("""
+                        gc: could not unlink \(file.path, privacy: .public)
+                        """)
+                        continue
+                    }
+                    reaped += 1
+                    logger.info("""
+                    gc: reclaimed staged attachment \(file.path, privacy: .public)
+                    """)
+                }
+            }
+        }
+    }
+
     /// `(provider, key)` as one comparable value — the identity a receipt has,
     /// with a separator no path component can contain.
     private static func transcriptIdentity(_ row: RetainedTranscript) -> String {
@@ -973,14 +1265,12 @@ public actor OrphanGC {
     /// `docs/specs/2026-08-30-pty-holder-session-transport-design.md`,
     /// "Reconciliation". The child first, then the holder.
     ///
-    /// Gated by `gcRowlessHoldersEnabled` on top of `gcEnabled`, and **not** by
-    /// `gcHolderRendezvousEnabled`: that flag unlinks files, this one signals
-    /// processes, and enabling the first must never enable the second.
+    /// Runs under `gcEnabled`, the same keep-biased gate as the agent-worktree
+    /// loop: holder-ness is a transport property, not a separate opt-in.
     ///
-    /// `dryRun` bypasses the flag exactly as `sweep` lets it bypass `gcEnabled`:
-    /// planning is read-only, and somebody deciding whether to enable a
-    /// default-off process killer needs to see what enabling it would kill. A
-    /// NON-dry run still requires the flag.
+    /// `dryRun` bypasses `gcEnabled` here exactly as `sweep` lets it: planning
+    /// is read-only, and somebody deciding whether to enable a sweep that kills
+    /// processes needs to see what enabling it would kill.
     ///
     /// Two reads bound what this may do, and both fail toward keeping:
     ///
@@ -1001,7 +1291,6 @@ public actor OrphanGC {
     private func reclaimRowlessHolders(
         config: Config, dryRun: Bool, planned: inout [String], reaped: inout Int
     ) async {
-        guard config.gcRowlessHoldersEnabled || dryRun else { return }
         let candidates = rowlessHolderCollector.candidates()
         guard !candidates.isEmpty else { return }
 
@@ -1025,8 +1314,8 @@ public actor OrphanGC {
                 """)
             case .kill(let childPID, let holderPID):
                 planned.append("REAP rowless-holder \(candidate.socketPath)")
-                // This arm's guard is `gcRowlessHoldersEnabled || dryRun`, so
-                // every line below runs only with the flag actually on.
+                // The outer `gcEnabled || dryRun` guard means every line below
+                // runs only with gcEnabled == true.
                 guard !dryRun else { continue }
                 // The late gate. A row that committed during the handshake makes
                 // this holder somebody's live session after all.
@@ -1077,9 +1366,10 @@ public actor OrphanGC {
     /// (`docs/specs/2026-08-18-orphan-process-gc-design.md`).
     ///
     /// Gated by `gcOrphanProcessesEnabled` on top of `gcEnabled`, the same
-    /// shape `reclaimProfileDirs` uses and for the same reason: this is the
-    /// only GC phase that signals processes rather than moving bytes, and what
-    /// it misjudges cannot be restored. `dryRun` bypasses the flag exactly as
+    /// shape `reclaimProfileDirs` uses and for the same reason: this phase
+    /// signals processes rather than moving bytes, and what it misjudges
+    /// cannot be restored. (`reclaimRowlessHolders` signals too, but only
+    /// holders this installation verifiably owns, under `gcEnabled` alone.) `dryRun` bypasses the flag exactly as
     /// `sweep` lets it bypass `gcEnabled` — someone deciding whether to enable
     /// a default-off flag needs to see what enabling it would reclaim first —
     /// and touches nothing either way.
@@ -1420,37 +1710,82 @@ public actor OrphanGC {
         broadcast(.reapRecordsChanged)
     }
 
-    // MARK: - Event-driven scratchpad cleanup
+    // MARK: - Event-driven removed-worktree cleanup
 
-    /// Entry point for the archive hook (Task 8): a TBD worktree at `path`
-    /// was just removed, so its Claude Code scratchpad (if any) is cleaned up
-    /// immediately rather than waiting for the next sweep's reconciliation.
-    /// `repoPath` is the owning repo's root (the archive caller has `repo` in
-    /// scope), stamped onto the resulting record; pass `""` when unknown.
+    /// Event-driven reclaim for a worktree that has just been removed: its
+    /// Claude Code scratchpad, and its composer attachments.
     ///
-    /// Verifies the worktree directory is actually gone before doing
-    /// anything else. `completeArchiveWorktree` already fires this callback
-    /// only once it has confirmed the path is gone — queued out of its pool
-    /// slot on the success leg, or a verified `git.worktreeRemove` on the
-    /// fallback leg — so this is defense in depth against a future caller
-    /// that doesn't uphold that contract, not a workaround for a swallowed
-    /// failure: a failed removal must never orphan-classify (and delete) a
-    /// scratchpad that's still in active use.
+    /// Renamed from `scratchpadCleanup` when attachments joined it: the callback
+    /// covers two resources now, and a name that promised one would send the next
+    /// reader looking for a second callback that does not exist.
+    ///
+    /// `repoPath` is the owning repo's root (the archive caller has `repo` in
+    /// scope), stamped onto the resulting scratchpad record; pass `""` when
+    /// unknown.
+    ///
+    /// Verifies the worktree directory is actually gone before doing anything
+    /// else. `completeArchiveWorktree` already fires this callback only once it
+    /// has confirmed the path is gone — queued out of its pool slot on the
+    /// success leg, or a verified `git.worktreeRemove` on the fallback leg — so
+    /// this is defense in depth against a future caller that doesn't uphold that
+    /// contract, not a workaround for a swallowed failure: a failed removal must
+    /// never orphan-classify (and delete) resources that are still in active use.
     ///
     /// The `gcEnabled` master switch governs ALL GC deletion, including this
-    /// event-driven path — one toggle covers both collectors. A config read
+    /// event-driven path — one toggle covers every collector. A config read
     /// failure also skips (fail toward keeping).
-    public func scratchpadCleanup(forRemovedWorktreePath path: String, repoPath: String) async {
-        guard !FileManager.default.fileExists(atPath: path) else {
-            logger.debug("gc: scratchpad cleanup skipped for \(path, privacy: .public) — worktree dir still exists")
+    ///
+    /// **Best effort, by design.** A revived worktree does not get its images
+    /// back, and every path this misses — a crash between the rename and this
+    /// call, a worktree removed outside TBD — is covered by the hourly
+    /// attachments sweep. That division is the doctrine: creation against the
+    /// filesystem cannot be transactional, so the sweep is the standing
+    /// guarantee and this is the prompt best effort.
+    public func removedWorktreeCleanup(
+        worktreeID: UUID, worktreePath: String, repoPath: String
+    ) async {
+        guard !FileManager.default.fileExists(atPath: worktreePath) else {
+            logger.debug("""
+            gc: removed-worktree cleanup skipped for \(worktreePath, privacy: .public) \
+            — worktree dir still exists
+            """)
             return
         }
         guard let config = try? await db.config.get(), config.gcEnabled else {
-            logger.debug("gc: scratchpad cleanup skipped for \(path, privacy: .public) — gc disabled")
+            logger.debug("""
+            gc: removed-worktree cleanup skipped for \(worktreePath, privacy: .public) \
+            — gc disabled
+            """)
             return
         }
+
+        // Attachments first: it is one `removeItem` and cannot fail the
+        // scratchpad reclaim below.
+        //
+        // NOT additionally gated on the composer flag. The directory exists only
+        // because the composer wrote into it, and a person who turned the
+        // composer off afterwards would otherwise leave images behind
+        // permanently — a flag that gates CREATION must not gate the reclaim of
+        // what was already created.
+        let attachments = attachmentsBase.appendingPathComponent(worktreeID.uuidString)
+        if FileManager.default.fileExists(atPath: attachments.path) {
+            do {
+                try FileManager.default.removeItem(at: attachments)
+                logger.info("""
+                gc: removed attachments for worktree \
+                \(worktreeID.uuidString, privacy: .public)
+                """)
+            } catch {
+                logger.warning("""
+                gc: could not remove attachments for worktree \
+                \(worktreeID.uuidString, privacy: .public): \
+                \(error.localizedDescription, privacy: .public) — the hourly sweep will retry
+                """)
+            }
+        }
+
         guard let record = await scratchpadCollector.cleanUp(
-            forRemovedWorktreePath: path, repoPath: repoPath, now: now()
+            forRemovedWorktreePath: worktreePath, repoPath: repoPath, now: now()
         ) else {
             return
         }

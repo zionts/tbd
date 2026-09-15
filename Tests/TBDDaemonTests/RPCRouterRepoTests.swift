@@ -178,16 +178,25 @@ extension RPCRouterTests {
     /// the diagnostic lands on the primary failure line (assertion-hygiene
     /// rule 4). Mirrors `RepoRemoveCascadeTests.waitUntil`, whose error type is
     /// file-private to that suite.
+    /// The deadline is the shared saturated-pass budget rather than a literal:
+    /// what these wait for is produced by a detached task no test owns, which
+    /// SE-0417 leaves on the cooperative pool behind the whole fast pass — see
+    /// `gateHoldingTask` in `Tests/TestSupport/BoundedGateSupport.swift`.
     private func waitUntilRemoved(
-        _ what: String, timeout: TimeInterval = 10,
+        _ what: String, timeout: TimeInterval = TestDeadlines.saturatedPassSeconds,
         _ condition: @Sendable () async -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return }
-            try await Task.sleep(for: .milliseconds(10))
+        switch await pollUntilTrue(
+            timeout: .seconds(timeout), pollInterval: .milliseconds(10), condition
+        ) {
+        case .satisfied:
+            return
+        case .cancelled:
+            // Propagated, not swallowed — see `RepoRemoveCascadeTests.waitUntil`.
+            throw CancellationError()
+        case .timedOut:
+            throw RepoRemoveWaitTimeout(what: what, seconds: timeout)
         }
-        throw RepoRemoveWaitTimeout(what: what, seconds: timeout)
     }
 
     /// Medium-2 review finding: `repo.remove` hard-deletes every worktree

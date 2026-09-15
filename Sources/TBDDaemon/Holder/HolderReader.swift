@@ -1,6 +1,12 @@
 import Darwin
 import Foundation
 import SwiftTerm
+// Scoped, not a whole-module import: `TBDShared.Terminal` is the DB row model
+// and `SwiftTerm.Terminal` is the emulator, and this file is full of the
+// second. Naming the two types it needs keeps every bare `Terminal` here
+// meaning the emulator.
+import struct TBDShared.TerminalModeReading
+import struct TBDShared.TerminalScreen
 import TBDTerminalSerialization
 import os
 
@@ -106,6 +112,17 @@ actor HolderReader {
     }
 
     let sessionID: UUID
+    /// Whether this reader's emulator was born with its child — the one fact
+    /// behind both `TerminalScreen.modesObserved` and
+    /// `TerminalScreen.contentObserved`.
+    ///
+    /// Exposed beside the emulator's own copy because the idle sweep needs it
+    /// next to `modeReading().source` and must not pay for a whole-buffer walk
+    /// to get it: `screen(maxLines:)` holds the emulator lock a live session's
+    /// drain thread needs, and the sweep asks this of every idle holder row on
+    /// every pass. `nonisolated` for the same reason it is a `let` — it is
+    /// fixed at construction, so reading it can never race the actor.
+    nonisolated let observedChildFromStart: Bool
     private let descriptor: PTYDescriptor
     private let emulator: HolderEmulator
     private let stopTimeout: Duration
@@ -131,6 +148,36 @@ actor HolderReader {
     ///   session's output is exhausted — see `hasReachedEndOfOutput`. It must
     ///   not block, and must not stop this reader inline; the registry's
     ///   reclaimer hops onto the actor instead.
+    /// - Parameter observedChildFromStart: whether this reader's emulator will
+    ///   see every byte the child has ever written. `true` at spawn, where the
+    ///   child's startup `DECSET`s are still sitting in the pty buffer waiting
+    ///   for the first reader, so the emulator's modes become the child's and
+    ///   its grid is painted by every write the child makes. It is `false` when
+    ///   the reader is built over a child that was already running — the daemon
+    ///   re-adopting a session across a restart — where the setup has long
+    ///   since been read by somebody else, this emulator holds a fresh
+    ///   terminal's defaults for as long as it lives, and its grid starts
+    ///   blank under a TUI that paints only the cells it is changing.
+    ///
+    ///   Reported as **both** `modesObserved` and `contentObserved` on every
+    ///   screen this reader gives, and as `modesObserved` on every mode
+    ///   reading: the flags are unobserved and so are the cells, from the one
+    ///   fact that this emulator was not there when the child started.
+    ///
+    ///   Required and named at every construction site, for the same reason
+    ///   `take` names it: a default would be right on one path — a test harness
+    ///   feeding its own emulator from the start, `true` — and a silent lie on
+    ///   the other, the registry's adoption path, where the honest answer is
+    ///   `false`.
+    /// - Parameter monotonicNow: reads the monotonic clock, for the two
+    ///   instants the emulator stamps — its adoption and its last consumed
+    ///   byte — whose difference is a screen's `age`. It sits *before* `clock`
+    ///   so `clock` stays the last parameter, per the repo's clock-seam rule,
+    ///   and it is a separate seam because `any Clock<Duration>` pins
+    ///   `Duration` and not `Instant`: it can express a delay but cannot do the
+    ///   instant arithmetic an age is. `ContinuousClock.Instant` can, which is
+    ///   what lets a test hand back `base + .minutes(41)` and assert an exact
+    ///   age rather than a tolerance window.
     init(
         sessionID: UUID,
         ptyFD: Int32,
@@ -140,9 +187,12 @@ actor HolderReader {
         stopTimeout: Duration = HolderReader.defaultStopTimeout,
         readFault: HolderReadFault? = nil,
         onEndOfOutput: (@Sendable () -> Void)? = nil,
+        observedChildFromStart: Bool,
+        monotonicNow: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now },
         clock: any Clock<Duration> = ContinuousClock()
     ) {
         self.sessionID = sessionID
+        self.observedChildFromStart = observedChildFromStart
         self.stopTimeout = stopTimeout
         self.clock = clock
         self.onEndOfOutput = onEndOfOutput
@@ -156,6 +206,8 @@ actor HolderReader {
             columns: columns,
             rows: rows,
             scrollback: scrollbackLines,
+            observedChildFromStart: observedChildFromStart,
+            monotonicNow: monotonicNow,
             reply: { [descriptor] bytes in descriptor.replyBestEffort(bytes) })
     }
 
@@ -470,9 +522,68 @@ actor HolderReader {
         emulator.renderScreen()
     }
 
-    /// The tail of the scrollback plus the viewport, at most `maxLines` lines.
-    func renderScreenWithScrollback(maxLines: Int) -> String {
-        emulator.renderScreenWithScrollback(maxLines: maxLines)
+    /// The typed screen `terminal.output` answers with: the tail of the
+    /// scrollback plus the viewport at most `maxLines` long, plus the facts a
+    /// string cannot carry — where the viewport starts, where the cursor is,
+    /// what modes the child is in, which store answered, and how stale that
+    /// store is.
+    ///
+    /// The one whole-buffer walk. A second one existed while `terminal.output`
+    /// was migrating and produced the same lines with none of the facts; it is
+    /// gone, because two walks over one buffer are two chances for a
+    /// projection fix to land in only one of them.
+    ///
+    /// **`source` is read from this reader's own drain state**, which is the
+    /// only place it can be read honestly. A reader that is draining is on the
+    /// pty and its emulator is live, so it answers `.daemon`. A reader in any
+    /// other state — suspended for an attach, idle, stopped — is holding a
+    /// screen it is no longer updating, and a consumer told `.daemon` about it
+    /// would apply a live-screen policy to a frozen one. `.viewer` never comes
+    /// from here: it is the app's answer to a pull, on a path this reader is
+    /// not part of.
+    ///
+    /// Throws only what `TerminalScreen`'s construction refuses. That is a
+    /// projection bug rather than a session state, and the handler above turns
+    /// it into an error naming the offending line rather than an empty screen.
+    func screen(maxLines: Int) throws -> TerminalScreen {
+        try emulator.screen(maxLines: maxLines, source: currentSource)
+    }
+
+    /// The child's modes, their provenance and their age, with no line walk.
+    ///
+    /// What the send path's oracle asks. A whole screen would be the same
+    /// answer at the price of walking the retained scrollback on every message
+    /// composed.
+    func modeReading() -> TerminalModeReading {
+        emulator.modeReading(source: currentSource)
+    }
+
+    /// Whether this reader's emulator is live or frozen — see `screen`.
+    ///
+    /// Three states answer `.staleDaemon`, but **only one of them is reachable
+    /// in production**, and that is what makes the answer mean what the type
+    /// says it does. `HolderRegistry` publishes a reader into its `.adopted`
+    /// slot only after `start()` has returned, and `reader(for:)` reads no
+    /// other slot — so no caller can reach an `.idle` reader — while a stopped
+    /// reader has been through `.releasing` and been dropped from the slot, so
+    /// no caller can reach one of those either. What a consumer can reach is a
+    /// reader suspended for an attach, which is exactly the case `staleDaemon`
+    /// describes: a viewer holds the pty, and this emulator has been frozen
+    /// since it did.
+    ///
+    /// A test harness *can* hold an `.idle` reader, and one answers
+    /// `staleDaemon` there. That is not a special case to be excused: an idle
+    /// reader's emulator is by definition not being fed, so a screen taken from
+    /// it is a frozen one and saying so is the truthful answer.
+    ///
+    /// **What it does not encode is whether the emulator has watched this child
+    /// since birth.** A reader draining a session it re-adopted after a restart
+    /// answers `.daemon`, correctly — every byte arriving now is parsed live —
+    /// while its modes are a fresh terminal's defaults and its grid holds
+    /// whatever the child has happened to repaint since. That is the separate
+    /// axis `modesObserved` and `contentObserved` carry.
+    private var currentSource: TerminalScreen.Source {
+        state == .draining ? .daemon : .staleDaemon
     }
 
     /// The session's whole screen — modes, scrollback, viewport, cursor — as a
@@ -508,6 +619,16 @@ actor HolderReader {
     /// *ordered*, and a live byte parsed ahead of the prelude would be erased
     /// by it — output the viewer never saw and the daemon then throws away.
     /// A stopped reader ignores the feed: its screen has no further readers.
+    ///
+    /// **A preamble restores values and not provenance.** The writer states
+    /// every mode the capture carries and repaints the screen it held, so the
+    /// flags and the cells after the feed are the departing viewer's — but that
+    /// viewer's emulator was itself seeded by *this* reader's attach preamble,
+    /// so what comes back is what this reader handed out. A preamble can carry
+    /// no more provenance than the reader already had. Nothing here therefore
+    /// moves `modesObserved` or `contentObserved`: a re-adopted session stays
+    /// unobserved on both axes across every attach and handback, and only a
+    /// session this daemon spawned is ever observed.
     func ingest(preamble: Data) {
         guard state != .stopped, !preamble.isEmpty else { return }
         emulator.feed([UInt8](preamble)[...])
@@ -1163,10 +1284,63 @@ private final class HolderEmulator: @unchecked Sendable {
     /// Held strongly: `Terminal.tdel` is `weak`, so a delegate nobody else
     /// retains is deallocated and the child's terminal queries go unanswered.
     private let delegate: ReplyForwardingDelegate
+    private let monotonicNow: @Sendable () -> ContinuousClock.Instant
+    /// When this emulator started existing — the floor for a screen's age.
+    ///
+    /// A store that has never consumed a byte reports its own age rather than
+    /// no age at all, so a fresh, silent session reads as exactly as old as it
+    /// is instead of as instantly current.
+    private let adoptedAt: ContinuousClock.Instant
+    /// When this emulator last took in bytes that came from outside the daemon.
+    ///
+    /// Under `terminalLock` like everything else here, and stamped in `feed`
+    /// only — which is the whole definition, because it is what decides the
+    /// answer for each of the three things that reach `feed` and the one that
+    /// does not:
+    ///
+    /// - **The drain loop's reads** and **the quiesce remainder** stamp it.
+    ///   They are the child's own output; this is the measurement's subject.
+    /// - **A handback preamble** (`ingest(preamble:)`) stamps it, deliberately.
+    ///   A returning viewer hands back the screen as it stood a moment ago, so
+    ///   the emulator's view really is fresh again, and reporting it as an hour
+    ///   old would make a take-back look like a session nobody had watched.
+    /// - **`snapshotPreamble`'s `DECRQM` probes** do not, because they feed the
+    ///   `Terminal` directly rather than through this method. The daemon asking
+    ///   its own emulator a question must never make a stale screen look fresh.
+    ///   Keep it that way — routing a probe through `feed` would make every
+    ///   read reset the age it was taken to measure.
+    ///
+    /// `screen` asks nothing at all: it reads the delegate's `DECTCEM` flag.
+    private var lastByteAt: ContinuousClock.Instant?
+    /// Whether this emulator was built with its child, so that both its mode
+    /// flags and its grid are observations rather than a fresh terminal's
+    /// defaults over a blank screen.
+    ///
+    /// One fact with two consequences, and it is reported as both: as
+    /// `modesObserved` on every screen and mode reading, and as
+    /// `contentObserved` on every screen. Unobserved modes are a terminal's
+    /// defaults; unobserved content is a grid whose cells the child has not
+    /// repainted since this emulator existed, and a TUI repaints only what it
+    /// is changing.
+    ///
+    /// Set at construction by whoever knows how this emulator came to exist,
+    /// and never moved afterwards: nothing this emulator can be fed carries
+    /// provenance it was not built with, because every preamble in the system
+    /// originates from a daemon emulator's own snapshot. Read under
+    /// `terminalLock`, like `lastByteAt` and everything else here.
+    private let observedChildFromStart: Bool
 
-    init(columns: Int, rows: Int, scrollback: Int, reply: @escaping @Sendable (ArraySlice<UInt8>) -> Void) {
+    init(
+        columns: Int, rows: Int, scrollback: Int,
+        observedChildFromStart: Bool,
+        monotonicNow: @escaping @Sendable () -> ContinuousClock.Instant,
+        reply: @escaping @Sendable (ArraySlice<UInt8>) -> Void
+    ) {
         let delegate = ReplyForwardingDelegate(reply: reply)
         self.delegate = delegate
+        self.observedChildFromStart = observedChildFromStart
+        self.monotonicNow = monotonicNow
+        self.adoptedAt = monotonicNow()
         self.terminal = Terminal(
             delegate: delegate,
             options: TerminalOptions(
@@ -1175,8 +1349,17 @@ private final class HolderEmulator: @unchecked Sendable {
                 scrollback: max(0, scrollback)))
     }
 
+    /// Bytes from outside — the drain loop's reads, the quiesce remainder, a
+    /// handback preamble. **None of it marks the modes or the content
+    /// observed**: the child's running output says nothing about the modes it
+    /// set or the cells it painted before this emulator existed, so a session
+    /// that happens to print a lot must not talk its way into a provenance it
+    /// never earned. A busy child repaints some of the grid and leaves the rest
+    /// exactly as blank as it found it, which is the state `contentObserved`
+    /// exists to name.
     func feed(_ bytes: ArraySlice<UInt8>) {
         terminal.terminalLock.withLock {
+            lastByteAt = monotonicNow()
             terminal.feed(buffer: bytes)
         }
     }
@@ -1186,31 +1369,127 @@ private final class HolderEmulator: @unchecked Sendable {
             var lines: [String] = []
             lines.reserveCapacity(terminal.rows)
             for row in 0..<terminal.rows {
-                lines.append(terminal.getLine(row: row)?.translateToString(trimRight: true) ?? "")
+                lines.append(terminal.getLine(row: row).map(Self.rowText) ?? "")
             }
             return Self.joined(lines)
         }
     }
 
-    /// The tail of the whole buffer — scrollback and viewport together.
+    /// The typed screen, taken as **one observation** under a single
+    /// `terminalLock` hold.
     ///
-    /// Enumeration starts at `totalLinesTrimmed`, the absolute index of the
-    /// oldest line still held, and runs until `getScrollInvariantLine` returns
-    /// nil: there is no public line count, and `Buffer.lines` is internal.
-    func renderScreenWithScrollback(maxLines: Int) -> String {
-        guard maxLines > 0 else { return "" }
-        return terminal.terminalLock.withLock {
-            var lines: [String] = []
+    /// The lock is what makes lines, cursor, modes and size one fact rather
+    /// than four. Taken separately, a drain-thread feed between two of them
+    /// would produce a screen that never existed — modes from after a mode
+    /// change beside lines from before it, which is exactly the pairing the
+    /// input path must not compose against.
+    ///
+    /// The line walk enumerates from `totalLinesTrimmed`, the absolute index of
+    /// the oldest line still held, until `getScrollInvariantLine` returns nil —
+    /// because there is no public line count and `Buffer.lines` is internal.
+    /// It is the only whole-buffer walk in this type: the string-returning twin
+    /// that answered `terminal.output` before the screen contract is gone, so a
+    /// change to the projection cannot land in one walk and miss the other.
+    ///
+    /// **Nothing here feeds the terminal**, which is why the cursor's
+    /// visibility is read from a flag the delegate keeps rather than probed
+    /// with a `DECRQM` 25 query. `Terminal.cursorHidden` is not public, but
+    /// SwiftTerm calls `showCursor`/`hideCursor` on its delegate every time the
+    /// child sets or resets `DECTCEM`, so the fact arrives without asking.
+    ///
+    /// A probe here would be fed into a live parser: this method runs on every
+    /// `terminal.output`, including against a reader whose drain thread is
+    /// mid-stream, and SwiftTerm's parser carries its state across `feed` calls
+    /// while an `ESC` in any state aborts whatever sequence is pending. A read
+    /// whose last chunk ended mid-sequence — routine when a TUI repaint exceeds
+    /// the pty buffer — would therefore truncate the child's sequence, print
+    /// its remainder into the screen model as literal text, and swallow the
+    /// reply to a query the child was in the middle of asking. `snapshotPreamble`
+    /// still probes, once per attach; its own doc argues that case.
+    ///
+    /// It does not touch `lastByteAt` either — a daemon reading its own
+    /// emulator must not make a stale screen look fresh.
+    func screen(maxLines: Int, source: TerminalScreen.Source) throws -> TerminalScreen {
+        try terminal.terminalLock.withLock {
+            var enumerated: [String] = []
             var row = terminal.buffer.totalLinesTrimmed
             while let line = terminal.getScrollInvariantLine(row: row) {
-                lines.append(line.translateToString(trimRight: true))
+                enumerated.append(Self.rowText(line))
                 row += 1
             }
-            if lines.count > maxLines {
+            let enumeratedCount = enumerated.count
+
+            var lines = enumerated
+            if maxLines <= 0 {
+                lines = []
+            } else if lines.count > maxLines {
                 lines.removeFirst(lines.count - maxLines)
             }
-            return Self.joined(lines)
+            let droppedFromFront = enumeratedCount - lines.count
+            while let last = lines.last, last.isEmpty { lines.removeLast() }
+
+            // SwiftTerm's line list is always `yBase + rows` long, so the
+            // viewport is its tail — but `yBase` is not public, so the index of
+            // the viewport's first row is derived from the length instead. The
+            // tail cut then shifts it, which is why `droppedFromFront` comes
+            // off it: the result is an index into `lines`, not into the buffer.
+            // It can land outside `lines` in both directions, which the type's
+            // own documentation states and callers must bounds check.
+            let viewportStart = enumeratedCount - terminal.rows - droppedFromFront
+
+            let cursor = TerminalScreen.Cursor(
+                row: terminal.buffer.y,
+                column: terminal.buffer.x,
+                visible: delegate.cursorVisible)
+
+            return try TerminalScreen(
+                lines: lines,
+                viewportStart: viewportStart,
+                cursor: cursor,
+                size: TerminalScreen.Size(columns: terminal.cols, rows: terminal.rows),
+                modes: currentModes(),
+                modesObserved: observedChildFromStart,
+                contentObserved: observedChildFromStart,
+                source: source,
+                ageMilliseconds: ageMilliseconds())
         }
+    }
+
+    /// The modes, their provenance and their age, without the line walk.
+    func modeReading(source: TerminalScreen.Source) -> TerminalModeReading {
+        terminal.terminalLock.withLock {
+            TerminalModeReading(
+                modes: currentModes(), modesObserved: observedChildFromStart, source: source,
+                ageMilliseconds: ageMilliseconds())
+        }
+    }
+
+    /// The three child modes, all readable from public properties.
+    ///
+    /// `TerminalModeCapture` reads these same three the same way, and its
+    /// comment records why 1049 in particular must come from the property:
+    /// `cmdDecRqm`'s switch does not carry it, so a `DECRQM` query answers
+    /// "unknown". Caller holds `terminalLock`.
+    private func currentModes() -> TerminalScreen.ChildModes {
+        TerminalScreen.ChildModes(
+            bracketedPaste: terminal.bracketedPasteMode,
+            applicationCursor: terminal.applicationCursor,
+            alternateScreen: terminal.isCurrentBufferAlternate)
+    }
+
+    /// How long ago this emulator last consumed a byte, in milliseconds, never
+    /// negative. Caller holds `terminalLock`.
+    ///
+    /// Clamped at zero rather than trusted: the clock is injected, and a seam
+    /// that ever moved backwards would otherwise produce an age the screen type
+    /// refuses — turning a test double's mistake into a failed machine read.
+    private func ageMilliseconds() -> Int {
+        let since = lastByteAt ?? adoptedAt
+        let elapsed = since.duration(to: monotonicNow())
+        let milliseconds =
+            elapsed.components.seconds * 1_000
+            + elapsed.components.attoseconds / 1_000_000_000_000_000
+        return Int(max(0, milliseconds))
     }
 
     /// Serializes the whole terminal — modes, scrollback, viewport, cursor —
@@ -1231,6 +1510,10 @@ private final class HolderEmulator: @unchecked Sendable {
     /// switched from forwarding to collecting for the duration, which is also
     /// how `DelegateModeReader` reads the answers at all. This is the
     /// daemon-side twin of the app's quiet ingest, in the opposite direction.
+    ///
+    /// Those queries feed the `Terminal` directly rather than through `feed`,
+    /// so they do not stamp `lastByteAt` — an attach must not make a session
+    /// that has been silent for an hour report an age of zero.
     func snapshotPreamble(maxScrollbackLines: Int) -> Data {
         terminal.terminalLock.withLock {
             let reader = DelegateModeReader(terminal: terminal, delegate: delegate)
@@ -1252,6 +1535,60 @@ private final class HolderEmulator: @unchecked Sendable {
         terminal.terminalLock.withLock { (terminal.cols, terminal.rows) }
     }
 
+    /// One row of the grid as text, the way a reader of `terminal.output`
+    /// needs it: **a cell nobody ever wrote projects as a space, never as
+    /// `U+0000`.**
+    ///
+    /// A never-written or erased cell holds `CharData.Null`, whose code is 0,
+    /// and `translateToString`'s default path renders that literally. The
+    /// result looks right and is not: a TUI paints differentially, positioning
+    /// the cursor past the cells it is leaving alone rather than overwriting
+    /// them with blanks, so the skipped cells become invisible NULs scattered
+    /// through the line — and which cells get skipped changes with every
+    /// repaint, so the holes appear to move. Every consumer of this string
+    /// matches on text (fleet supervision, the pending-input rail, the login
+    /// driver), and a NUL is a missing character nothing displays. `tmux
+    /// capture-pane`, which this replaces for machine reads, returns spaces;
+    /// so does the app-side serializer in `TerminalCellWalk`.
+    ///
+    /// `skipNullCellsFollowingWide` is the other half and not optional: the
+    /// trailing cell of a two-column glyph carries code 0 as well, and padding
+    /// *it* to a space would put a stray blank after every CJK character and
+    /// every emoji. Trimming is unaffected — `trimRight` is computed from
+    /// `getTrimmedLength()` before the projection runs, so a row nobody wrote
+    /// still renders empty rather than as a row of spaces.
+    ///
+    /// **`U+0000` is not the only cell a screen line may not hold.** SwiftTerm's
+    /// printable-run inserter takes every byte from `0x20` through `0x7f`
+    /// without consulting a width, so a `printf '\x7f'` leaves a `DEL` in a cell
+    /// — legal for a child to emit, and refused by `TerminalScreen`'s
+    /// whitelist. Mapping only the NUL would therefore let one such byte break
+    /// *every* later read of that session until the line left the scrollback: a
+    /// session-wide outage caused by the session's own output.
+    ///
+    /// `DEL` is the only one reachable today — a C1 control is dropped before
+    /// insertion, because non-ASCII goes through a width table and nothing of
+    /// width zero is inserted. The projection is written against
+    /// `TerminalScreen.isDisallowed` anyway, rather than against the list of
+    /// scalars currently known to get through: the render and the whitelist
+    /// cannot disagree if they read the same predicate, and a width table that
+    /// changes its mind cannot reopen the outage. `U+FFFD` rather than a space
+    /// for these, because unlike a never-written cell something *was* written
+    /// and a reader should see that something is there.
+    private static func rowText(_ line: BufferLine) -> String {
+        line.translateToString(
+            trimRight: true,
+            skipNullCellsFollowingWide: true,
+            characterProvider: { cell in
+                let character = cell.getCharacter()
+                if character == Character(Unicode.Scalar(0)) { return " " }
+                guard character.unicodeScalars.contains(where: TerminalScreen.isDisallowed) else {
+                    return character
+                }
+                return "\u{FFFD}"
+            })
+    }
+
     /// Trailing blank lines are dropped — a screen is 24 rows whether or not
     /// the job filled them, and rendering 20 empty ones helps nobody.
     private static func joined(_ lines: [String]) -> String {
@@ -1261,11 +1598,19 @@ private final class HolderEmulator: @unchecked Sendable {
     }
 }
 
-/// The emulator's only required delegate hook: bytes the terminal itself wants
-/// to send back — device-status replies, cursor-position reports, the answers
-/// to `DECRQM`. `TerminalDelegate` declares 31 methods and a public extension
-/// defaults 30 of them; this is the one that has no default, and routing it
-/// anywhere but the child would turn every terminal query into a hang.
+/// The emulator's delegate: the terminal's outbound wire, plus the one piece of
+/// its state that is not readable from a public property.
+///
+/// `send` is the required hook — bytes the terminal itself wants to send back:
+/// device-status replies, cursor-position reports, the answers to `DECRQM`.
+/// `TerminalDelegate` declares 31 methods and a public extension defaults 30 of
+/// them; `send` is the one that has no default, and routing it anywhere but the
+/// child would turn every terminal query into a hang.
+///
+/// `showCursor`/`hideCursor` are overridden from that default set, because
+/// being *told* about `DECTCEM` is the only way to know the cursor's visibility
+/// without asking the terminal — and asking is what `HolderEmulator.screen`
+/// must never do.
 private final class ReplyForwardingDelegate: TerminalDelegate {
     private let reply: @Sendable (ArraySlice<UInt8>) -> Void
     /// While true, replies are kept here instead of being written to the pty.
@@ -1277,8 +1622,48 @@ private final class ReplyForwardingDelegate: TerminalDelegate {
     private var collecting = false
     private var collected: [UInt8] = []
 
+    /// Whether the child's cursor is currently visible — `DECTCEM`, mode 25.
+    ///
+    /// `Terminal.cursorHidden` is not public, and the emulator must not ask for
+    /// it: a `DECRQM` probe fed into a parser that is mid-sequence aborts the
+    /// child's sequence (see `HolderEmulator.screen`). So the fact is taken
+    /// where SwiftTerm volunteers it instead — `showCursor`/`hideCursor` are
+    /// called on the delegate whenever the child sets or resets the mode.
+    /// Starts `true`, the mode's own default: a terminal shows its cursor until
+    /// a program hides it.
+    ///
+    /// Like `collecting`, this needs no lock of its own. The terminal calls its
+    /// delegate from inside a parse, which always runs under `terminalLock`,
+    /// and `HolderEmulator.screen` reads the flag under that same lock.
+    ///
+    /// **Both resets leave it true, by different mechanisms**, and each is
+    /// worth stating because a reset that moved the cursor silently would leave
+    /// this reading wrong for the rest of the session. A soft reset (`DECSTR`,
+    /// `CSI ! p`, `Terminal.cmdSoftReset`) shows the cursor and calls
+    /// `showCursor` on the delegate as its last act, so the flag follows it out
+    /// of hidden. A full reset (`RIS`, `ESC c`) makes no cursor call at all and
+    /// needs none: `resetToInitialState` saves `cursorHidden` around the
+    /// `setup(isReset:)` that clears it and restores it afterwards, so the
+    /// terminal ends where the flag already is.
+    ///
+    /// What a silent change *would* cost is why both are pinned in
+    /// `HolderScreenContractTests` rather than assumed. A divergence here does
+    /// not self-correct on a bare `DECSET 25`: `Terminal.showCursor` returns
+    /// early when `cursorHidden` is already false, so the delegate call the
+    /// flag needs never happens until something sets it true again, and only a
+    /// hide-then-show pair puts it back.
+    private(set) var cursorVisible = true
+
     init(reply: @escaping @Sendable (ArraySlice<UInt8>) -> Void) {
         self.reply = reply
+    }
+
+    func showCursor(source: Terminal) {
+        cursorVisible = true
+    }
+
+    func hideCursor(source: Terminal) {
+        cursorVisible = false
     }
 
     func send(source: Terminal, data: ArraySlice<UInt8>) {
@@ -1322,9 +1707,13 @@ private final class ReplyForwardingDelegate: TerminalDelegate {
 /// rather than a suppressing one: the same switch that keeps the answers away
 /// from the child is what makes them readable here.
 ///
-/// The caller must hold `terminal.terminalLock` and must have put the delegate
-/// in collecting mode; `HolderEmulator.snapshotPreamble` is the only construction
-/// site and does both.
+/// The caller must hold `terminal.terminalLock` — the lock every parse, and so
+/// every `send`, arrives under — and must have put the delegate in collecting
+/// mode with `beginCollectingReplies`, or the answers go to the child and this
+/// reads nothing. `HolderEmulator.snapshotPreamble` is the only construction
+/// site, and it does both. Deliberately only that one: a probe is safe there
+/// because it runs once per attach, and unsafe on the per-`terminal.output`
+/// path, where it would abort a sequence the child is mid-way through sending.
 private struct DelegateModeReader: ModeReplyReader {
     let terminal: Terminal
     let delegate: ReplyForwardingDelegate

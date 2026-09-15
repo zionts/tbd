@@ -17,6 +17,50 @@ import Testing
 // MARK: - Hang guard
 
 public extension Trait where Self == TimeLimitTrait {
+    /// **The** hang guard for a suite or test that runs in the fast parallel
+    /// pass. One dial, shared by every such site; ``clockDriven`` is this value
+    /// under a name that says *why* a clock-driven suite needs it.
+    ///
+    /// **(a) The value is derived from the pass's measured latency, not from
+    /// how long the test ought to take.** Swift Testing runs the whole
+    /// population in one process with no concurrency cap, on a 3-thread CI
+    /// runner, so a test's *reported* duration is mostly time suspended waiting
+    /// for a thread. Mined from a green run: fast pass 1 (`^TBDDaemonTests\.`,
+    /// ~5200 tests) reported p50 65.6 s, p99 92.1 s, max 95.5 s, with 87% of
+    /// tests over 45 s; fast pass 2 (everything else, ~4800 tests) reported p90
+    /// 51.4 s and max 55.3 s. A limit of one minute therefore sits **below the
+    /// median** of a healthy pass 1 and five seconds above the **maximum** of a
+    /// healthy pass 2 — it is a coin flip on green runs, and it fired that way
+    /// on three `TerminalLockedAccessTests` tests at the same instant, twice in
+    /// five days, with no hang anywhere. Four minutes clears the measured
+    /// maximum by ~2.5x while staying a small fraction of the step budget. The
+    /// full derivation — how 240 s composes with `ciSafeDeadline` (90 s) and
+    /// `waitForSuspension` (45 s), and the invariant the three satisfy together
+    /// — is on ``clockDriven`` below; re-derive all of them together when the
+    /// population moves materially.
+    ///
+    /// **(b) The rule: a fast-pass suite uses this trait rather than a literal
+    /// `.timeLimit`, unless the limit is itself the regression detector.** A
+    /// hang guard asserts nothing and costs a passing run nothing, so there is
+    /// no reason for two of them to carry different numbers — a per-suite
+    /// literal is a second dial that nobody re-derives when the population
+    /// moves, and every one of them in this tree was reasoned from a runtime
+    /// measured on an idle machine. The exception is a limit the test *depends*
+    /// on: where a child must outlive the limit, or a regressed drain must, the
+    /// number is a mutation-verified proof and raising it disarms the proof with
+    /// nothing going red. Those live in the tier-3 target, which runs
+    /// `--no-parallel` on an idle machine and never sees this saturation, and
+    /// they pin their own `.timeLimit(.minutes(1))` with the reason in their
+    /// suite docs: `SubprocessTimeoutStarvationTests` (a `sleep 90` child must
+    /// outlive the limit), `GitManagerTimeoutTests` and `SubprocessTimeoutTests`
+    /// (a regressed EOF-waiting drain must outlive it). Don't tidy those to this
+    /// trait; do reach for it everywhere else.
+    ///
+    /// An inner bounded wait keeps its own, smaller deadline — this limit is the
+    /// outer backstop that lets that wait's named diagnostic land instead of
+    /// being truncated into a bare "Time limit was exceeded".
+    static var fastPassBounded: Self { .timeLimit(.minutes(4)) }
+
     /// Suite/test trait for anything driven by a `TestClock`.
     ///
     /// The known failure mode of virtual time (§5, "Known failure mode") is
@@ -120,7 +164,15 @@ public extension Trait where Self == TimeLimitTrait {
     /// limit), `GitManagerTimeoutTests` and `SubprocessTimeoutTests` (a
     /// regressed EOF-waiting drain must outlive it). Don't widen those to
     /// `.clockDriven` for consistency's sake.
-    static var clockDriven: Self { .timeLimit(.minutes(4)) }
+    ///
+    /// **It is ``fastPassBounded`` under another name, and deliberately so.**
+    /// Everything derived above is a property of the fast parallel pass rather
+    /// than of virtual time, so a clock-driven suite and a suite that merely
+    /// waits on a subprocess want the same number; keeping one dial is what
+    /// stops the two drifting. The two names exist because the *reason* differs
+    /// — here it is the never-advanced `TestClock` sleep — and the reason is
+    /// what a reader needs at the call site.
+    static var clockDriven: Self { .fastPassBounded }
 }
 
 // MARK: - TestClock
@@ -221,6 +273,27 @@ public extension TestClock {
     /// as the code re-arms, which would dissolve that proof. Use the explicit
     /// `advanceWhenSuspended` pair there.
     ///
+    /// **And — the sharper limit — where the loop under test re-arms under a
+    /// saturated fast pass, because this helper starves the re-arm it is
+    /// waiting for.** Each turn probes `isArmed()`, which is
+    /// `checkSuspension()`, which opens with a `megaYield`: twenty
+    /// serially-awaited **background-QoS** tasks. At a 25 ms poll interval that
+    /// is ~1,800 probes and ~36,000 background tasks over the 45 s budget,
+    /// queued on the same cooperative pool the poller needs a turn from. The
+    /// field signature is this helper's own diagnostic
+    /// reading **"observed 1 clock advance"**: the first tick landed and the
+    /// re-arm after it was never seen. On 2026-09-08 that reddened
+    /// `ModelProxySupervisorTests` on three consecutive CI dispatches of one
+    /// SHA, over 45–170 s, with nothing wrong with the supervisor.
+    ///
+    /// So this helper is for a **one-shot** wait — something that arms once and
+    /// fires once. A re-arming loop belongs on `EventDrivenTestClock`
+    /// (`Tests/TestSupport/EventDrivenTestClock.swift`), whose arming signal is
+    /// emitted from inside the critical section that registers the sleeper, as
+    /// an explicit ladder of `requireAdvanceWhenArmed` closed by a
+    /// `requireSleeperArmed` — the re-arm being the proof that the tick before
+    /// it finished. `Tests/CLAUDE.md`, "The event-driven alternative".
+    ///
     /// - Parameters:
     ///   - what: names the effect being waited for, for the timeout diagnostic.
     ///   - interval: virtual time per step — normally the pacing the code under
@@ -246,6 +319,12 @@ public extension TestClock {
         var advances = 0
         repeat {
             if await condition() { return true }
+            // This loop cannot delegate to `pollUntilTrue` — it *advances* the
+            // clock rather than only reading — so it carries the cancellation
+            // guard itself. Placed before both branches: the armed branch does
+            // not suspend at all, so a cancelled task would spin there just as
+            // readily as on the `try?` sleep below.
+            if Task.isCancelled { break }
             if await isArmed() {
                 await advance(by: interval)
                 advances += 1
@@ -254,6 +333,7 @@ public extension TestClock {
             }
         } while ContinuousClock.now < deadline
         if await condition() { return true }
+        if Task.isCancelled { return false }
         Issue.record(
             ClockAdvanceTimeout(what: what, advances: advances, timeout: timeout),
             sourceLocation: sourceLocation)
@@ -383,15 +463,18 @@ public extension TestClock {
     func waitForSuspension(timeout: Swift.Duration = .seconds(45),
                            pollInterval: Swift.Duration = .milliseconds(25),
                            sourceLocation: SourceLocation = #_sourceLocation) async {
-        let deadline = ContinuousClock.now.advanced(by: timeout)
-        repeat {
+        // `checkSuspension()` throws when a sleeper *is* registered, so the
+        // probe reads inverted — that polarity is the whole reason this helper
+        // cannot share `advanceUntil`'s condition shape directly.
+        let armed = await pollUntilTrue(timeout: timeout, pollInterval: pollInterval) {
             do {
                 try await checkSuspension()
+                return false
             } catch {
-                return  // A sleeper is registered — that is what we were waiting for.
+                return true
             }
-            try? await Task.sleep(for: pollInterval)
-        } while ContinuousClock.now < deadline
+        }
+        guard case .timedOut = armed else { return }
         Issue.record(
             """
             TestClock: no task was suspended on the clock within \(timeout) — the \

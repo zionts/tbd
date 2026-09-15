@@ -113,16 +113,24 @@ public struct WorktreeLifecycle: Sendable {
     /// on the success path, right after `completeArchiveWorktree` renames it
     /// into `WorktreeDeletionQueue` (bytes may still be draining); on the
     /// fallback leg, only once `git.worktreeRemove` is verified to have
-    /// actually removed it from disk. Carries the removed worktree's path and
-    /// its owning repo's path (the archive caller has `repo` in scope). `nil`
-    /// by default (tests, older callers).
+    /// actually removed it from disk. `nil` by default (tests, older callers).
+    ///
+    /// Carries the removed worktree's **id**, its path, and its owning repo's
+    /// path (the archive caller has `worktree` and `repo` in scope). The id is
+    /// what the attachments reclaim needs: `~/tbd/attachments/<worktreeID>/` is
+    /// keyed by it, and the path is not derivable from a directory that no
+    /// longer exists.
+    ///
     /// `Daemon` wires this to
-    /// `OrphanGC.scratchpadCleanup(forRemovedWorktreePath:repoPath:)` so the
-    /// worktree's Claude Code scratchpad is reclaimed event-driven instead of
-    /// waiting for the next hourly sweep, stamped with the repo path so it
-    /// surfaces in that repo's History UI. Deliberately NOT fired by
-    /// `forgetWorktree` — forget leaves the directory in place.
-    public var onWorktreeRemoved: (@Sendable (_ worktreePath: String, _ repoPath: String) async -> Void)?
+    /// `OrphanGC.removedWorktreeCleanup(worktreeID:worktreePath:repoPath:)` so
+    /// the worktree's Claude Code scratchpad and its composer attachments are
+    /// reclaimed event-driven instead of waiting for the next hourly sweep, the
+    /// scratchpad stamped with the repo path so it surfaces in that repo's
+    /// History UI. Deliberately NOT fired by `forgetWorktree` — forget leaves
+    /// the directory in place.
+    public var onWorktreeRemoved:
+        (@Sendable (_ worktreeID: UUID, _ worktreePath: String, _ repoPath: String)
+            async -> Void)?
 
     /// Opt-in tmux control-mode wiring. `nil` when the daemon did not provide
     /// one (tests, older callers); when present, lifecycle paths open a gated
@@ -154,6 +162,16 @@ public struct WorktreeLifecycle: Sendable {
     /// load-bearing rather than tidy: two registries would each take their own
     /// dup of a session's pty master and steal bytes from each other.
     var holderRegistry: HolderRegistry?
+
+    /// The daemon's `ModelProxySupervisor`, wired post-construction by
+    /// `Daemon.swift` the way `holderRegistry` is. `nil` in mock mode and in
+    /// every test that does not exercise the proxy, where a holder spawn simply
+    /// gets no route and runs against the model API directly.
+    ///
+    /// Held as `any ModelProxyRouting` rather than as the actor so the spawn
+    /// decision can be pinned without a proxy process; the concrete supervisor
+    /// conforms, so `Daemon.swift` assigns it unchanged.
+    var modelProxySupervisor: (any ModelProxyRouting)?
 
     /// How the create path builds the scheduler that recaptures a resumed
     /// session's ID. `nil` in production, which builds the ordinary
@@ -314,10 +332,43 @@ public struct WorktreeLifecycle: Sendable {
     /// either: a holder's screen lives in the daemon's own emulator, not in a
     /// tmux pane, so there was never a capture to preserve.
     func disposeHolder(for terminal: Terminal) async -> String? {
-        guard let holderRegistry else {
+        await Self.disposeHolder(
+            for: terminal, registry: holderRegistry, config: db.config,
+            supervisor: modelProxySupervisor)
+    }
+
+    /// The teardown itself, once, for both owners of a holder-backed row.
+    ///
+    /// `RPCRouter+TerminalHandlers` tears down the same rows through the same
+    /// steps, and the two copies of this method were maintained by hand — both
+    /// gained the route retirement in the same change, which is precisely the
+    /// edit that could have reached only one of them. A teardown step added to
+    /// one and not the other leaks whatever that step reclaims, silently and
+    /// only on half the paths.
+    ///
+    /// Static, and given everything it needs, because the two callers share no
+    /// type: what they have in common is a row, a registry, a database and a
+    /// supervisor.
+    static func disposeHolder(
+        for terminal: Terminal,
+        registry: HolderRegistry?,
+        config: ConfigStore,
+        supervisor: (any ModelProxyRouting)?
+    ) async -> String? {
+        // Before the registry check: the row is about to be deleted, so this is
+        // the last moment anything can name its route, and a daemon with no
+        // registry is exactly the one whose routes nothing else would ever
+        // find. The lookup itself is skipped only when the row was provably
+        // never routed — see `ModelProxyRouteAttachment.retire`.
+        await ModelProxyRouteAttachment.retire(
+            terminalID: terminal.id,
+            streamPath: terminal.transcriptStreamPath,
+            proxyEnabled: (try? await config.get())?.modelProxyEnabled ?? true,
+            supervisor: supervisor)
+        guard let registry else {
             return "terminal \(terminal.id) runs on the holder transport but this daemon has "
                 + "no holder registry, so its holder and job were left running"
         }
-        return await holderRegistry.abandon(terminal: terminal)
+        return await registry.abandon(terminal: terminal)
     }
 }

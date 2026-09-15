@@ -216,6 +216,10 @@ public final class RPCRouter: Sendable {
     /// Which Claude terminals owe a delegation sample, and what their last
     /// sample claimed. Marked at every idle report; read during `terminal.list`.
     let claudeDelegationTracker = ClaudeDelegationTracker()
+    /// Answers `terminal.completions`. Holds the per-session inventory cache for
+    /// the daemon's lifetime, which is why it is a stored collaborator rather
+    /// than something the handler builds per request.
+    let completionInventory: CompletionInventoryService
     /// Opt-in tmux control-mode wiring. `nil` when the daemon did not provide
     /// one (tests, older callers); when present, terminal handlers open a gated
     /// logging-only `tmux -CC` connection after each `ensureServer()`.
@@ -234,12 +238,52 @@ public final class RPCRouter: Sendable {
     /// reader rather than crashing.
     nonisolated(unsafe) var holderRegistry: HolderRegistry?
 
+    /// The daemon's `ModelProxySupervisor`, set by `Daemon` after construction
+    /// from the same value the lifecycle and the hibernation coordinator hold.
+    /// Two things read it: `daemon.capabilities`, which reports whether this
+    /// daemon can route at all, and the terminal teardown path, which retires
+    /// the route of a row it is about to delete. `nil` in mock mode and in tests
+    /// that never exercise the proxy — capabilities then answer "unsupported,
+    /// no port, no version", which is the honest reading of a daemon that
+    /// cannot route.
+    nonisolated(unsafe) var modelProxySupervisor: (any ModelProxySupervising)?
+
+    /// How the swap paths build the scheduler that recaptures a resumed
+    /// session's ID. `nil` in production, which builds the ordinary
+    /// `SessionRecaptureScheduler(db:tmux:)`. The mirror of
+    /// `WorktreeLifecycle.sessionRecaptureFactory`, for the same reason.
+    ///
+    /// A seam because the branch it feeds — which target a fork tab's recapture
+    /// is scheduled against — is otherwise unobservable from outside. A real
+    /// scheduler's only trace is a database write five wall seconds later, made
+    /// only if a live Claude process answers; "it was scheduled against the
+    /// pane" and "it was scheduled against the holder's child" look identical
+    /// from the row. Injecting the scheduler makes the decision itself the
+    /// observable, on virtual time.
+    nonisolated(unsafe) var sessionRecaptureFactory: (
+        @Sendable (TBDDatabase, TmuxManager) -> SessionRecaptureScheduler
+    )?
+
     /// Delivers `terminal.send` to a holder-backed session, routed by who is
     /// reading its pty. Set by `Daemon` after construction, beside the registry
     /// and the sidecar it is built from. `nil` in mock mode and in tests that
     /// never exercise the transport, where a holder row is told there is no
     /// input path in this daemon rather than being silently dropped.
     nonisolated(unsafe) var holderInjectionCourier: HolderInjectionCourier?
+
+    /// Answers what modes a holder-backed session's child is in, for the send
+    /// path to compose against. A **test seam only** — production leaves it
+    /// nil and `performHolderSend` falls through to the registry's own reader,
+    /// which is the single source the design names.
+    ///
+    /// It exists because the alternative is worse: reaching the three answers
+    /// (`daemon`, `staleDaemon`, and no answer at all) through a real registry
+    /// means a real holder, a real pty and a real attach for what is a pure
+    /// question about which bytes get composed. The registry-backed path is
+    /// exercised live; this is how the composition's own branches are pinned.
+    ///
+    /// `nil` from the seam means the same thing as no reader: nothing answered.
+    nonisolated(unsafe) var holderModeOracle: (@Sendable (UUID) async -> TerminalModeReading?)?
 
     let decoder = JSONDecoder()
     let encoder = JSONEncoder()
@@ -251,13 +295,6 @@ public final class RPCRouter: Sendable {
     /// it is not a general-purpose "what time is it".
     let now: @Sendable () -> Date
 
-    /// Where a named tmux server's socket file lives. Held as an injected
-    /// collaborator rather than read ad hoc, so `terminal.attachCommand` can be
-    /// tested against a pinned `TMUX_TMPDIR` and uid without `setenv` — which
-    /// `Tests/CLAUDE.md` forbids outside `TBDHomeSerialized`. The default reads
-    /// the daemon's own environment, which is the environment the servers it
-    /// spawned were created under.
-    let tmuxSocketPathResolver: TmuxSocketPathResolver
     /// How a session transcript is measured when a prompt is recorded against
     /// it. A seam, not a clock: a file's modification time is data, so it
     /// follows the same rule as `now` rather than the `Clock` rule.
@@ -266,6 +303,39 @@ public final class RPCRouter: Sendable {
     /// and attributed. Paired with the fingerprinter: the stat says the file
     /// moved, this says whether the session itself did.
     let transcriptDeltaInspector: TranscriptDeltaInspector
+
+    /// How the daemon asks whether Claude owns a pane's foreground process
+    /// group. The same seam the limit-resume actuator uses, held here so the
+    /// send path can refuse a pane whose agent has left without any test
+    /// needing a real `ps`. A process-table fact, never screen text.
+    let paneProcessInspector: any PaneProcessInspecting
+
+    /// The identity the FD-vending sidecar recorded for its current client.
+    ///
+    /// That client is the app: it connects the sidecar eagerly and
+    /// unconditionally as soon as the RPC socket answers, and the sidecar has
+    /// exactly one. The daemon already treats this identity as load-bearing —
+    /// `AppLivenessArbiter` decides on it whether the daemon may read a pty
+    /// again — so nothing new is being trusted here, only read from one more
+    /// place.
+    ///
+    /// Injected, and defaulting to "no recorded client", so a router built in a
+    /// test authenticates nobody until a test says otherwise. That default is
+    /// the fail-closed one.
+    let recordedAppIdentity: @Sendable () async -> ProcessIdentity?
+    /// The one process-fact reader, injected for the same reason `AgentReaper`
+    /// and `AppLivenessArbiter` take one: the re-verification must be statable
+    /// in a test without a process to inspect.
+    let processSignaller: any ProcessSignaller
+
+    /// Behavior seam for the one place the send path has to *wait*: the settle
+    /// after an image paste, before whatever the parts arm does next. A
+    /// `Duration` is behavior, so this is the `Clock` seam rather than the
+    /// `now` date seam beside it, and it is existential (`any Clock<Duration>`)
+    /// for the reason every other subsystem here holds one that way — a generic
+    /// parameter would infect the `Sendable` conformances the router already
+    /// carries.
+    let clock: any Clock<Duration>
 
     public init(
         db: TBDDatabase,
@@ -288,16 +358,24 @@ public final class RPCRouter: Sendable {
         codexHomeEnsurer: (@Sendable () throws -> URL)? = nil,
         prBindingRepoResolver: (@Sendable (UUID) async -> (owner: String, name: String, host: String)?)? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
-        tmuxSocketPathResolver: TmuxSocketPathResolver = TmuxSocketPathResolver(),
         transcriptFingerprinter: @escaping TranscriptFingerprinter = TranscriptFingerprinting.live,
         transcriptDeltaInspector: @escaping TranscriptDeltaInspector
             = TranscriptDeltaInspection.live,
-        actuationLog: ActuationLog
+        paneProcessInspector: any PaneProcessInspecting = ProductionPaneProcessInspector(),
+        completionInventory: CompletionInventoryService = CompletionInventoryService(),
+        recordedAppIdentity: @escaping @Sendable () async -> ProcessIdentity? = { nil },
+        processSignaller: any ProcessSignaller = ProductionProcessSignaller(),
+        actuationLog: ActuationLog,
+        clock: any Clock<Duration> = ContinuousClock()
     ) {
+        self.recordedAppIdentity = recordedAppIdentity
+        self.processSignaller = processSignaller
+        self.clock = clock
         self.now = now
-        self.tmuxSocketPathResolver = tmuxSocketPathResolver
         self.transcriptFingerprinter = transcriptFingerprinter
         self.transcriptDeltaInspector = transcriptDeltaInspector
+        self.paneProcessInspector = paneProcessInspector
+        self.completionInventory = completionInventory
         self.actuationLog = actuationLog
         self.db = db
         self.lifecycle = lifecycle
@@ -387,17 +465,26 @@ public final class RPCRouter: Sendable {
 
     /// Handle a raw JSON Data blob representing an RPCRequest.
     /// Returns an RPCResponse.
-    public func handleRaw(_ data: Data) async -> RPCResponse {
+    ///
+    /// `connection` is what the daemon knows about the socket the bytes arrived
+    /// on, as opposed to what they say about themselves. Defaulted to nil —
+    /// "not established" — because most callers are not sockets at all, and
+    /// that is the fail-closed answer for every one of them.
+    public func handleRaw(
+        _ data: Data, connection: RPCConnectionContext? = nil
+    ) async -> RPCResponse {
         do {
             let request = try decoder.decode(RPCRequest.self, from: data)
-            return await handle(request)
+            return await handle(request, connection: connection)
         } catch {
             return RPCResponse(error: "Failed to decode request: \(error.localizedDescription)")
         }
     }
 
     /// Handle a decoded RPCRequest and return an RPCResponse.
-    public func handle(_ request: RPCRequest) async -> RPCResponse {
+    public func handle(
+        _ request: RPCRequest, connection: RPCConnectionContext? = nil
+    ) async -> RPCResponse {
         do {
             switch request.method {
             case RPCMethod.repoAdd:
@@ -458,10 +545,13 @@ public final class RPCRouter: Sendable {
                 return try await handleTerminalContinueInCodex(request.paramsData, actor: request.actor)
             case RPCMethod.terminalList:
                 return try await handleTerminalList(request.paramsData)
-            case RPCMethod.terminalAttachCommand:
-                return try await handleTerminalAttachCommand(request.paramsData)
             case RPCMethod.terminalSend:
-                return try await handleTerminalSend(request.paramsData, actor: request.actor)
+                // The ONE case that is handed the connection, because it is the
+                // one that makes an authorization decision on it.
+                return try await handleTerminalSend(
+                    request.paramsData, actor: request.actor, connection: connection)
+            case RPCMethod.terminalCompletions:
+                return try await handleTerminalCompletions(request.paramsData)
             case RPCMethod.terminalDelete:
                 return try await handleTerminalDelete(request.paramsData, actor: request.actor)
             case RPCMethod.terminalSetPin:
@@ -701,18 +791,12 @@ public final class RPCRouter: Sendable {
                 return try await handleConfigSetGCProfileDirsEnabled(request.paramsData)
             case RPCMethod.configSetGCOrphanProcessesEnabled:
                 return try await handleConfigSetGCOrphanProcessesEnabled(request.paramsData)
-            case RPCMethod.configSetGCHolderRendezvousEnabled:
-                return try await handleConfigSetGCHolderRendezvousEnabled(request.paramsData)
-            case RPCMethod.configSetGCRowlessHoldersEnabled:
-                return try await handleConfigSetGCRowlessHoldersEnabled(request.paramsData)
-            case RPCMethod.configSetReapHolderChildrenEnabled:
-                return try await handleConfigSetReapHolderChildrenEnabled(request.paramsData)
+            case RPCMethod.configSetGCHangStacksEnabled:
+                return try await handleConfigSetGCHangStacksEnabled(request.paramsData)
             case RPCMethod.configSetGCRetainedTranscriptsEnabled:
                 return try await handleConfigSetGCRetainedTranscriptsEnabled(request.paramsData)
             case RPCMethod.configSetRemoteDeleteEnabled:
                 return try await handleConfigSetRemoteDeleteEnabled(request.paramsData)
-            case RPCMethod.configSetHolderRowReconcileEnabled:
-                return try await handleConfigSetHolderRowReconcileEnabled(request.paramsData)
             case RPCMethod.configSetSupervisionEnabled:
                 return try await handleConfigSetSupervisionEnabled(request.paramsData)
             case RPCMethod.remoteProviders:
@@ -759,6 +843,12 @@ public final class RPCRouter: Sendable {
                 return try await handleConfigSetUpdateMode(request.paramsData)
             case RPCMethod.configSetPtyHolderEnabled:
                 return try await handleConfigSetPtyHolderEnabled(request.paramsData)
+            case RPCMethod.configSetTranscriptComposerEnabled:
+                return try await handleConfigSetTranscriptComposerEnabled(request.paramsData)
+            case RPCMethod.configSetModelProxyEnabled:
+                return try await handleConfigSetModelProxyEnabled(request.paramsData)
+            case RPCMethod.configSetTranscriptStreamingEnabled:
+                return try await handleConfigSetTranscriptStreamingEnabled(request.paramsData)
             case RPCMethod.peerStatus:
                 return try await handlePeerStatus()
             case RPCMethod.gcList:
@@ -825,7 +915,7 @@ public final class RPCRouter: Sendable {
             version = nil
         }
         let config = try await db.config.get()
-        return try RPCResponse(result: DaemonCapabilitiesResult(
+        var result = DaemonCapabilitiesResult(
             controlModeEnabled: enabled,
             tmuxVersion: version?.description,
             controlModeSupported: version.map { $0 >= TmuxVersion.controlModeMinimum } ?? false,
@@ -847,7 +937,28 @@ public final class RPCRouter: Sendable {
             // unable to start a holder, and with the flag on that combination
             // falls back to tmux silently. Reported so Settings can say so
             // instead of offering a switch that would change nothing.
-            ptyHolderSupported: holderRegistry?.canSpawn == true))
+            ptyHolderSupported: holderRegistry?.canSpawn == true,
+            transcriptComposerEnabled: config.transcriptComposerEnabled)
+        // Assigned rather than passed: this initializer's argument list is at
+        // the Swift type-checker's expression budget — adding to it produces
+        // "unable to type-check this expression in reasonable time" — so the
+        // model-proxy fields are set after construction instead.
+        result.modelProxyEnabled = config.modelProxyEnabled
+        // The conjunction, not the raw column: a hand-edited row holding
+        // streaming on with the proxy off streams nothing, and the app should
+        // not have to re-derive that.
+        result.transcriptStreamingEnabled = config.transcriptStreamingEffective
+        // One actor hop for all three, so a port and a version cannot come
+        // from either side of a proxy replacement. With no supervisor wired
+        // they keep their initializer defaults — false, nil, nil — which is the
+        // honest answer for a daemon that cannot route a session, and what
+        // Settings greys the toggle out on.
+        let proxy = await modelProxySupervisor?.capabilitySnapshot()
+            ?? ModelProxyCapabilitySnapshot.none
+        result.modelProxySupported = proxy.supported
+        result.modelProxyPort = proxy.port
+        result.modelProxyVersion = proxy.version
+        return try RPCResponse(result: result)
     }
 
     // MARK: - PR Status

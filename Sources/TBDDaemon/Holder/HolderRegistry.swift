@@ -118,13 +118,39 @@ actor HolderRegistry {
         }
     }
 
-    /// A reader and the description the hand-over rode with.
+    /// A reader, the description the hand-over rode with, and the pid of the
+    /// holder that answered it.
     ///
     /// The description is not decoration: it is the one place a job that
     /// finished while no daemon was listening reports how it ended.
+    ///
+    /// The holder pid is read off the socket rather than off the wire — see
+    /// `HolderClient.peerPID` — so it is known for every adoption, including
+    /// one this daemon inherited from a previous one. It is optional because
+    /// the kernel may decline to answer, and because nothing here depends on
+    /// having it: the child pid is the anchor every reclaimer uses.
     private struct Adoption: Sendable {
         let reader: HolderReader
         let description: HolderChildDescription
+        let holderPID: Int32?
+    }
+
+    /// The processes behind a session this registry currently holds a reader
+    /// for.
+    ///
+    /// First-hand rather than inferred: both numbers come from the hand-over
+    /// that produced the reader, so a caller holding one of these is holding
+    /// what the *registry* observed, not what a row happens to say. That is
+    /// what makes it usable to repair a row whose pids were lost — a wake
+    /// interrupted between `spawn` publishing its reader and the row recording
+    /// its pids leaves exactly that, and after a restart `adoptAll` re-adopts
+    /// the holder anyway, so the reader is back while the row still names
+    /// nothing.
+    struct HolderAdoptedProcess: Sendable, Equatable {
+        /// The holder process, when the kernel would name it.
+        let holderPID: Int32?
+        /// The job the holder forked. The anchor every reclaimer sweeps by.
+        let childPID: Int32
     }
 
     /// What the registry knows about one session.
@@ -195,12 +221,12 @@ actor HolderRegistry {
     /// This installation's token, compared against every holder's before it is
     /// adopted.
     let owner: HolderOwnerToken
-    /// The environment the rendezvous paths are derived from, the holder
-    /// processes run under, and the jobs they fork inherit. Explicit rather
-    /// than ambient so tests never reach the developer's real `~/tbd` — or the
-    /// developer's real login shell. In production it *is* the daemon's own
-    /// environment, which is also what a tmux pane inherits from the server the
-    /// daemon started, so the two transports launch a job into the same place.
+    /// The environment the rendezvous paths are derived from and the holder
+    /// processes run under. Explicit rather than ambient so tests never reach
+    /// the developer's real `~/tbd` — or the developer's real login shell. In
+    /// production it *is* the daemon's own environment; the base environment of
+    /// the job a holder forks is derived from it by `SpawnBaseEnvironment`
+    /// (see there).
     ///
     /// Immutable and `Sendable`, so a caller composing a `HolderLaunchRequest`
     /// can read it without hopping onto the actor.
@@ -211,6 +237,14 @@ actor HolderRegistry {
     /// pretending it could have spawned one. Adoption does not need it: an
     /// already-running holder is reached through its socket.
     private let spawner: HolderSpawner?
+    /// How this registry asks the kernel about, and signals, a pid.
+    ///
+    /// Injected rather than reached for statically because the one path that
+    /// *verifies* a pid before signalling it — `abandonVerifiedJob` — is only
+    /// testable if the process table can be scripted: the whole point of that
+    /// check is what it does about a pid the kernel has handed to somebody
+    /// else, and that is not a state a test can arrange with real processes.
+    private let signaller: any ProcessSignaller
     /// Whether this registry can start a holder at all — that is, whether
     /// `spawn` can do anything but throw `.holderExecutableUnavailable`.
     ///
@@ -251,9 +285,13 @@ actor HolderRegistry {
     ///
     /// Unreachability arguments elsewhere in this type rest on it — notably
     /// `confirmAttach`'s second guard, which is argued dead by enumerating the
-    /// writers of `slots`. **A new writer of `slots` or of either map has to
-    /// keep this true**, because the next reader will reach the guard long
-    /// before reaching the chain that makes it unreachable.
+    /// writers of `slots`. That enumeration is `spawn`, `beginAdoption` (which
+    /// `adopt` and the take-back's no-reader arm both reach), `release` and its
+    /// `clearIfStillReleasing`, and it does **not** include `confirmAttach`:
+    /// an acknowledgement leaves the slot exactly as it found it, `.adopted`
+    /// with a suspended reader. **A new writer of `slots` or of
+    /// either map has to keep this true**, because the next reader will reach
+    /// the guard long before reaching the chain that makes it unreachable.
     private var pendingAttaches: [UUID: PendingAttach] = [:]
     /// Sessions whose pty a viewer owns, and the attach generation that owns
     /// it. **The daemon reads none of these**, and `adopt` refuses them, which
@@ -269,6 +307,13 @@ actor HolderRegistry {
     private var lastAttachGeneration: UInt64 = 0
 
     private var slots: [UUID: Slot] = [:]
+
+    /// What the hand-over said about each published session's processes.
+    ///
+    /// Keyed and cleared exactly like `slots`' `.adopted` case, in `publish`
+    /// and `release`, so it cannot outlive the reader it describes and point a
+    /// caller at pids this daemon stopped observing.
+    private var adoptedProcesses: [UUID: HolderAdoptedProcess] = [:]
     /// The last status a holder reported for a session, and the only home it
     /// has: no `terminal` column records an exit status, and the row's fate
     /// belongs to the holder reconciler Milestone B adds. Recorded here so a
@@ -294,6 +339,16 @@ actor HolderRegistry {
     /// The decrement happens inside the releasing task, before anything awaiting
     /// that task resumes, so an adoption queued behind a release can never see
     /// its own publish overlap the reader it waited for.
+    ///
+    /// **A suspended reader stays counted, and both suspending paths agree on
+    /// that.** An attach that timed out unacknowledged keeps its reader
+    /// suspended and its loop counted; so does an attach that was
+    /// acknowledged, which retains the same reader for the same reason. Only a
+    /// release decrements. The number therefore means "loops this registry is
+    /// on the hook for", which is what the one-reader invariant needs it to
+    /// mean — a suspended reader is one this registry may put back on a pty,
+    /// and a second one built beside it would be the byte theft `peakLiveDrainLoops`
+    /// exists to see.
     private var liveDrainLoops = 0
     /// The most drain loops that have ever been live at one time.
     ///
@@ -378,6 +433,7 @@ actor HolderRegistry {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         listTerminals: @escaping @Sendable () async throws -> [Terminal],
         spawner: HolderSpawner? = nil,
+        signaller: any ProcessSignaller = ProductionProcessSignaller(),
         busyRetryBudget: Duration = HolderRegistry.defaultBusyRetryBudget,
         adoptAllBudget: Duration = HolderRegistry.defaultAdoptAllBudget,
         clock: any Clock<Duration> = ContinuousClock()
@@ -386,6 +442,7 @@ actor HolderRegistry {
         self.environment = environment
         self.listTerminals = listTerminals
         self.spawner = spawner
+        self.signaller = signaller
         self.canSpawn = spawner != nil
         self.busyRetryBudget = busyRetryBudget
         self.adoptAllBudget = adoptAllBudget
@@ -418,14 +475,35 @@ actor HolderRegistry {
 
     // MARK: - Reading
 
-    /// The live reader for a session, or nil if none has been adopted.
+    /// The reader this registry holds for a session, or nil if it holds none.
     ///
-    /// A session still being adopted answers nil: there is no drain loop yet.
-    /// So does one being released — its reader may still be draining, but it is
+    /// **A returned reader may be suspended**, and most attached sessions'
+    /// readers are: `beginAttach` suspends the drain, and neither the
+    /// acknowledgement nor a timed-out attach resumes or discards it. So this
+    /// answers "which emulator is this session's" rather than "who is on the
+    /// pty". Writing through a suspended reader is fine — the one-reader
+    /// invariant is about readers, and several writers on a pty master are not
+    /// a hazard. Anything that needs the *drain* must ask `isDraining`, and
+    /// anything that needs to know who owns the pty must ask
+    /// `viewerAttachment(for:)`.
+    ///
+    /// A session still being adopted answers nil: there is no reader yet. So
+    /// does one being released — its reader may still be draining, but it is
     /// on its way out and nothing new should be routed to it.
     func reader(for terminalID: UUID) -> HolderReader? {
         guard case .adopted(let reader) = slots[terminalID] else { return nil }
         return reader
+    }
+
+    /// The processes behind a session this registry holds a published reader
+    /// for, or nil when it holds none.
+    ///
+    /// Answers for exactly the sessions `reader(for:)` answers for, because it
+    /// is written and cleared in the same two places. A caller that has just
+    /// seen a live reader can therefore rely on this answering, and one that
+    /// has not must be prepared for nil.
+    func adoptedProcess(for terminalID: UUID) -> HolderAdoptedProcess? {
+        adoptedProcesses[terminalID]
     }
 
     /// The last status a holder reported for a session, if one ever has.
@@ -455,11 +533,16 @@ actor HolderRegistry {
     /// defect the adoption path was fixed for once already, seen from the other
     /// side.
     ///
+    /// **The grid tracks the viewer for the whole of an attach**, confirmed or
+    /// not, because the reader is retained across both. So a session a viewer
+    /// is resizing keeps a daemon-side emulator at the width the viewer is
+    /// painting at, which is what makes the fallback screen (`staleDaemon`) and
+    /// the next adoption's re-render read correctly instead of wrapping every
+    /// later line at a width nobody is looking at.
+    ///
     /// A session with no reader is skipped silently: there is no grid to
-    /// reshape and no descriptor to size. That is the ordinary state of a
-    /// *confirmed* attach — the daemon released its reader at the
-    /// acknowledgement — and there the viewer's own ioctl is the whole resize,
-    /// with the pty itself carrying the geometry into the next adoption.
+    /// reshape and no descriptor to size. That is a session being adopted or
+    /// released, not an attached one.
     func applyViewerResize(terminalID: UUID, columns: Int, rows: Int) async {
         guard let reader = reader(for: terminalID) else { return }
         if viewerAttachment(for: terminalID) != nil {
@@ -501,6 +584,11 @@ actor HolderRegistry {
                 terminalID: terminalID,
                 over: spawned.client,
                 expecting: owner,
+                // The job has only just been forked, and nothing has read its
+                // pty yet, so whatever it says about its modes on startup lands
+                // in this emulator — and so does every cell it ever paints,
+                // which is what makes this emulator's screen the child's own.
+                observedChildFromStart: true,
                 onEndOfOutput: endOfOutputNotifier(for: terminalID))
         } catch {
             // The holder is up and supervising a job that no row will ever
@@ -510,9 +598,7 @@ actor HolderRegistry {
             throw error
         }
 
-        slots[terminalID] = .adopted(adoption.reader)
-        statuses[terminalID] = adoption.description.status
-        drainLoopsStarted += 1
+        publish(adoption, for: terminalID)
         Self.logger.info(
             """
             spawned and adopted a holder for session \(terminalID.uuidString, privacy: .public): \
@@ -557,10 +643,25 @@ actor HolderRegistry {
     /// pid. Each one leaks a live process, so each is reported rather than
     /// swallowed.
     func abandon(terminal: Terminal) async -> String? {
+        await abandon(
+            terminalID: terminal.id,
+            holderPID: terminal.holderPID,
+            childPID: terminal.childPID)
+    }
+
+    /// The same teardown for a caller that no longer has a row to read the pids
+    /// back from.
+    ///
+    /// The pre-session hook tab is the case: its worktree row can be cascaded
+    /// away mid-wait, taking every terminal row with it, and what is left is
+    /// the descriptor phase 2b returned. The rendezvous still comes from this
+    /// registry's own environment, so the caller needs nothing but the pids it
+    /// was handed at spawn.
+    func abandon(terminalID: UUID, holderPID: Int32?, childPID: Int32?) async -> String? {
         let socketPath: String
         do {
             socketPath = try HolderRendezvous.socketPath(
-                sessionID: terminal.id, environment: environment)
+                sessionID: terminalID, environment: environment)
         } catch {
             return "\(error)"
         }
@@ -571,16 +672,143 @@ actor HolderRegistry {
         // signal — deliberately, since `kill(0, …)` would signal the daemon's
         // own process group.
         await abandon(
-            terminalID: terminal.id,
+            terminalID: terminalID,
             handle: HolderHandle(
-                holderPID: terminal.holderPID ?? 0,
-                childPID: terminal.childPID ?? 0,
+                holderPID: holderPID ?? 0,
+                childPID: childPID ?? 0,
                 socketPath: socketPath))
-        guard terminal.childPID != nil else {
-            return "terminal \(terminal.id) recorded no child pid, so its holder was told to "
+        guard childPID != nil else {
+            return "terminal \(terminalID) recorded no child pid, so its holder was told to "
                 + "let go but the job it forked was not killed"
         }
         return nil
+    }
+
+    /// The hook-tab spelling of the teardown above: the same `forget`, the
+    /// same reap, and a job kill that happens **only** once the pid has been
+    /// proved to still name the process this session recorded.
+    ///
+    /// A hook tab is the one holder session whose job has usually already
+    /// exited by the time anything tears it down — the setup tab's auto-close
+    /// fires *because* the hook finished — so the window between the job's
+    /// death and this teardown is wide open, and a pid the kernel reissued in
+    /// it is the pid `dispose` would signal. `jobProcessGroup`'s `pgid ==
+    /// childPID` test does not close that: a reissued pid that is its own
+    /// session leader (any shell a stranger's `forkpty` made) passes it, and
+    /// the group-widening `SIGKILL` then takes that whole stranger's session.
+    ///
+    /// So the identity check the reaper's holder leg and the park ladder both
+    /// apply is applied here too, against the same anchor and the same window,
+    /// and with the same asymmetry: **every answer but `.same` keeps.** A
+    /// missed job is one process a later sweep can still find; a wrong kill
+    /// destroys somebody else's work on a machine running dozens of sessions.
+    ///
+    /// It is deliberately *not* `dispose`'s behaviour, and must not be folded
+    /// into it. `isHolderChildExecutable` admits agents and login shells only,
+    /// so a plain holder terminal whose shell exec'd into `htop` would never be
+    /// killed on `terminal.delete` if the general path adopted this gate. Hook
+    /// tabs are narrower by construction: their job is the shell wrapper this
+    /// daemon composed, and it is the only thing that may ever run there.
+    ///
+    /// The holder is told to let go, and reaped, on every path — including the
+    /// ones that decline to kill. Leaving the daemon holding a pty whose job it
+    /// cannot identify would keep a reader alive over a session nobody can
+    /// describe, and the holder is this daemon's own child, so nothing else can
+    /// collect it.
+    ///
+    /// Returns a description of what was left running, or nil when the whole
+    /// teardown was carried out.
+    func abandonVerifiedJob(
+        terminalID: UUID, holderPID: Int32?, childPID: Int32?, childStartedAt: Date?
+    ) async -> String? {
+        let socketPath: String
+        do {
+            socketPath = try HolderRendezvous.socketPath(
+                sessionID: terminalID, environment: environment)
+        } catch {
+            return "\(error)"
+        }
+        await release(terminalID: terminalID)
+        statuses[terminalID] = nil
+
+        let client = HolderClient(socketPath: socketPath)
+        try? await client.forget()
+        await client.close()
+
+        // `dispose` resolves the job's process group *before* the `forget`, so
+        // that a group member which ignored the hangup is still reachable after
+        // the leader died of it. There is no such pre-resolve here, and there
+        // cannot be: this path may only signal a pid it has identified, and a
+        // group whose leader is gone is a group whose members it cannot
+        // identify at all. `signaller.forceKill` widens to the group on its own
+        // when the pid is still there to name one, which is every case this
+        // path is allowed to kill in.
+        let left = killVerifiedJob(
+            terminalID: terminalID, childPID: childPID, childStartedAt: childStartedAt)
+        await reap(holderPID: holderPID ?? 0)
+        return left
+    }
+
+    /// The decision half of `abandonVerifiedJob`: whether this pid may be
+    /// signalled, and what to say when it may not.
+    ///
+    /// Split out so the ladder reads top to bottom in the order its gates
+    /// actually fail — no pid, no anchor, a corpse, a stranger — and so the
+    /// `forget`/reap either side of it stay unconditional.
+    private func killVerifiedJob(
+        terminalID: UUID, childPID: Int32?, childStartedAt: Date?
+    ) -> String? {
+        guard let childPID, childPID > 1 else {
+            // `0` is the sentinel a row that never recorded a pid decodes to,
+            // and signalling it would reach the daemon's own process group —
+            // the hazard `jobProcessGroup` guards in the same words.
+            return "terminal \(terminalID) recorded no child pid, so its holder was told to "
+                + "let go but the job it forked was not killed"
+        }
+        guard let childStartedAt else {
+            Self.logger.warning(
+                """
+                hook terminal \(terminalID, privacy: .public) recorded no child start time, so \
+                pid \(childPID, privacy: .public) could not be identified and was left alone
+                """)
+            return "terminal \(terminalID) recorded no child start time, so the job at pid "
+                + "\(childPID) could not be proved to be ours and was left running"
+        }
+        // A corpse first, and for the reason `holderChildDisposition` asks it
+        // first: `ps` prints a zombie's command in parentheses, which the
+        // executable gate below would read as a stranger's. A zombie is past
+        // its last instruction and its number cannot be reissued while the
+        // entry stands, so there is nothing here to kill and nothing to fear.
+        if signaller.stat(childPID)?.hasPrefix("Z") == true { return nil }
+        let verdict = ProcessIdentityCheck.verify(
+            pid: childPID,
+            startedWithin: AgentReaper.defaultHolderIdentityWindow,
+            of: childStartedAt,
+            executableIsAcceptable: AgentReaper.isHolderChildExecutable,
+            signaller: signaller)
+        switch verdict {
+        case .same:
+            // `forceKill` widens to the process group exactly as `killJob`
+            // does — `ProductionProcessSignaller.signal` group-kills when the
+            // pid is its own group leader, which a `forkpty` job always is —
+            // so a job that declined the hangup is still reclaimed with its
+            // descendants.
+            signaller.forceKill(childPID)
+            return nil
+        case .notRunning:
+            // The job exited on its own, which on the auto-close path is the
+            // ordinary case rather than an exception.
+            return nil
+        case .startTimeUnreadable, .startTimeMismatch, .commandUnreadable, .foreignExecutable:
+            Self.logger.warning(
+                """
+                hook terminal \(terminalID, privacy: .public) left pid \
+                \(childPID, privacy: .public) running: it did not verify as this session's job \
+                (\(String(describing: verdict), privacy: .public))
+                """)
+            return "terminal \(terminalID) left its job running: pid \(childPID) did not verify "
+                + "(\(String(describing: verdict)))"
+        }
     }
 
     /// `forget`, kill, reap: the holder closes the pty master and winds down,
@@ -823,6 +1051,18 @@ actor HolderRegistry {
                 busyRetryBudget: budget,
                 receiveTimeout: Self.adoptionReceiveTimeout,
                 clock: clock,
+                // The child has been running without this emulator — since the
+                // last daemon, or since a viewer took the pty — so its mode
+                // setup was consumed by somebody else and the fresh terminal
+                // this builds starts on defaults, permanently. Its grid starts
+                // blank for the same reason, and a TUI above it repaints only
+                // the cells it is changing, so the screen this reader projects
+                // holds the child's text only where the child has since written
+                // it. A preamble, when there is one, restores the values and
+                // not their provenance: the viewer that captured it was itself
+                // seeded by this session's attach preamble, so it can hand back
+                // no more than the daemon gave it.
+                observedChildFromStart: false,
                 onEndOfOutput: notifyEndOfOutput,
                 seedingScreenWith: preamble)
         }
@@ -871,11 +1111,7 @@ actor HolderRegistry {
                 """)
             throw Error.superseded(terminalID: terminalID)
         }
-        slots[terminalID] = .adopted(adoption.reader)
-        statuses[terminalID] = adoption.description.status
-        drainLoopsStarted += 1
-        liveDrainLoops += 1
-        peakLiveDrainLoops = max(peakLiveDrainLoops, liveDrainLoops)
+        publish(adoption, for: terminalID)
         Self.logger.info(
             """
             adopted the holder for session \(terminalID.uuidString, privacy: .public): child \
@@ -1137,6 +1373,7 @@ actor HolderRegistry {
         busyRetryBudget: Duration,
         receiveTimeout: Duration,
         clock: any Clock<Duration>,
+        observedChildFromStart: Bool,
         onEndOfOutput: (@Sendable () -> Void)?,
         seedingScreenWith preamble: Data = Data()
     ) async throws -> Adoption {
@@ -1148,6 +1385,7 @@ actor HolderRegistry {
                     socketPath: socketPath,
                     expecting: owner,
                     receiveTimeout: receiveTimeout,
+                    observedChildFromStart: observedChildFromStart,
                     onEndOfOutput: onEndOfOutput,
                     seedingScreenWith: preamble)
             } catch HolderClient.Error.rejected(let version) {
@@ -1171,6 +1409,7 @@ actor HolderRegistry {
         socketPath: String,
         expecting owner: HolderOwnerToken,
         receiveTimeout: Duration,
+        observedChildFromStart: Bool,
         onEndOfOutput: (@Sendable () -> Void)?,
         seedingScreenWith preamble: Data = Data()
     ) async throws -> Adoption {
@@ -1178,6 +1417,7 @@ actor HolderRegistry {
             terminalID: terminalID,
             over: HolderClient(socketPath: socketPath, receiveTimeout: receiveTimeout),
             expecting: owner,
+            observedChildFromStart: observedChildFromStart,
             onEndOfOutput: onEndOfOutput,
             seedingScreenWith: preamble)
     }
@@ -1191,10 +1431,22 @@ actor HolderRegistry {
     /// holder serves one client at a time, so a connection kept past the
     /// hand-over would refuse every later verb, a `forget` on the deletion path
     /// above all.
+    ///
+    /// - Parameter observedChildFromStart: whether the reader this builds will
+    ///   have seen every byte its child ever wrote — `true` for a session this
+    ///   daemon just spawned, whose startup `DECSET`s are still queued in the
+    ///   pty, and `false` for one adopted while it was already running, whose
+    ///   mode setup was read by somebody else long ago and whose screen this
+    ///   emulator therefore starts blank underneath. It rides all the way to
+    ///   `TerminalScreen.modesObserved` and `TerminalScreen.contentObserved` —
+    ///   one fact, both consequences — and it is named at every call site
+    ///   rather than defaulted, because a default is right on one of these two
+    ///   paths and a silent lie on the other.
     private static func take(
         terminalID: UUID,
         over client: HolderClient,
         expecting owner: HolderOwnerToken,
+        observedChildFromStart: Bool,
         onEndOfOutput: (@Sendable () -> Void)? = nil,
         seedingScreenWith preamble: Data = Data()
     ) async throws -> Adoption {
@@ -1206,6 +1458,10 @@ actor HolderRegistry {
             await client.close()
             throw error
         }
+        // Read while the connection is still open — `LOCAL_PEERPID` is a
+        // property of the socket, not of the path — and after a verb has been
+        // answered, so it names a peer that has provably spoken the protocol.
+        let holderPID = await client.peerPID()
         await client.close()
 
         guard description.owner == owner else {
@@ -1239,7 +1495,8 @@ actor HolderRegistry {
             ptyFD: ptyFD,
             columns: grid.columns,
             rows: grid.rows,
-            onEndOfOutput: onEndOfOutput)
+            onEndOfOutput: onEndOfOutput,
+            observedChildFromStart: observedChildFromStart)
         // BEFORE the drain starts, and that ordering is the whole of the
         // handback's fidelity: the preamble's reset prelude erases the display
         // and the scrollback, so a live byte parsed ahead of it would be wiped
@@ -1256,7 +1513,7 @@ actor HolderRegistry {
             await reader.stop()
             throw error
         }
-        return Adoption(reader: reader, description: description)
+        return Adoption(reader: reader, description: description, holderPID: holderPID)
     }
 
     // MARK: - Handing a session to a viewer
@@ -1349,7 +1606,7 @@ actor HolderRegistry {
         Self.logger.info(
             """
             vended the pty for session \(terminalID.uuidString, privacy: .public) to a viewer as \
-            attach \(generation, privacy: .public); the daemon has stopped reading it and will not \
+            attach \(generation, privacy: .public); the daemon's reader is suspended and will not \
             resume without an answer about that viewer
             """)
         return HolderAttachVend(
@@ -1357,16 +1614,34 @@ actor HolderRegistry {
     }
 
     /// The viewer's acknowledgement: it is reading the descriptor, so this
-    /// session is now its to read and the daemon's reader is released for good.
+    /// session is now the viewer's to read, and the daemon's reader stays
+    /// suspended and retained.
+    ///
+    /// **Suspended, not stopped, and that is the whole of what an
+    /// acknowledgement decides.** `beginAttach` already took the daemon off the
+    /// pty; what is left to settle is whether the emulator it built goes with
+    /// it. It does not. That emulator holds the session's screen as it stood at
+    /// the attach, and it is the only store there is whenever the viewer cannot
+    /// answer for itself — a machine read of an open session falls back to it
+    /// (`source: .staleDaemon`), the input path asks it what modes the child is
+    /// in, and a take-back resumes it instead of opening a second hand-over.
+    /// Stopping it would make every one of those answers an empty screen or an
+    /// error naming the wrong cause. The cost is one emulator per attached
+    /// session, which is what the transport budgets for every session anyway.
+    ///
+    /// A suspended reader still holds its descriptor, so the daemon can still
+    /// *write* to the pty — the one-reader invariant is about readers, and
+    /// several writers on a pty master are fine. What it must never do is
+    /// resume the drain without evidence the viewer is gone; `acceptHandback`
+    /// and `seizeFromDeadApp` are the only two callers that carry it.
     ///
     /// The jiggle goes here rather than at the vend, and that ordering is the
     /// point of it: a program repaints on `SIGWINCH` into the tty, and the ack
     /// is the first moment anybody is certainly there to receive the repaint.
-    /// It happens before the reader is stopped because the reader owns the
-    /// descriptor the ioctl rides on.
+    /// The reader owns the descriptor the ioctl rides on, and keeps owning it.
     ///
     /// Generation-checked. A stale ack — a superseded viewer's, or a duplicate
-    /// — is refused rather than allowed to release a reader a live attach is
+    /// — is refused rather than allowed to hand away a pty a live attach is
     /// relying on.
     ///
     /// **A refused ack records no claim, and that is examined rather than
@@ -1380,7 +1655,9 @@ actor HolderRegistry {
     ///   is unreachable. Every writer of `slots` that can change the reader
     ///   under a live pending entry clears `pendingAttaches` first (`release`),
     ///   and the two that would install a different reader refuse outright
-    ///   while a pending entry exists (`adopt`, `beginAttach`).
+    ///   while a pending entry exists (`adopt`, `beginAttach`). This method
+    ///   does not write `slots` at all — it leaves the slot exactly as it
+    ///   found it — so it is not itself one of the writers to enumerate.
     /// - The **first** guard (the pending entry is already gone) is reachable
     ///   only through a clearer that has itself settled the question:
     ///   `cancelPendingAttach(.unacknowledged)` records the claim,
@@ -1403,25 +1680,24 @@ actor HolderRegistry {
         }
         clearPendingAttach(terminalID: terminalID, generation: generation)
         // Recorded BEFORE anything that suspends — the jiggle below is a
-        // deliberate 10 ms sleep, and the stop after it is longer again. Two
-        // callers resume inside that window and both must find the session
-        // already marked as the viewer's: an `adopt` waiting on the release,
-        // and a `beginAttach` parked between its quiesce and its guard, which
-        // would otherwise hand out a second live descriptor for a pty this
-        // acknowledgement has just given away.
+        // deliberate 10 ms sleep. Two callers resume inside that window and
+        // both must find the session already marked as the viewer's: an
+        // `adopt` waiting on this actor, and a `beginAttach` parked between its
+        // quiesce and its guard, which would otherwise hand out a second live
+        // descriptor for a pty this acknowledgement has just given away.
         viewerAttachments[terminalID] = generation
 
         await reader.jiggle()
 
-        let task = Task<Void, Never> { await self.stopPublished(reader) }
-        slots[terminalID] = .releasing(task)
-        await task.value
-        clearIfStillReleasing(task, for: terminalID)
+        // The slot is left as it was found: `.adopted(reader)`, with the reader
+        // suspended since `beginAttach` and nothing here resuming it. Nothing
+        // decrements `liveDrainLoops` either, which is deliberate and matches
+        // the `.unacknowledged` arm — see the counter's own comment.
         Self.logger.info(
             """
             attach \(generation, privacy: .public) for session \
             \(terminalID.uuidString, privacy: .public) was acknowledged; the daemon's reader is \
-            released and the viewer owns the pty
+            suspended and retained, and the viewer owns the pty
             """)
     }
 
@@ -1596,16 +1872,13 @@ actor HolderRegistry {
     /// last `read()` is still outstanding, which is the double-reader
     /// corruption in miniature.
     ///
-    /// Two states arrive here, and they differ in what "resume" means:
-    ///
-    /// - **An acknowledged attach** released the daemon's reader for good
-    ///   (`confirmAttach`), so the slot is empty and the session is taken back
-    ///   through a fresh hand-over from its holder. The holder `dup`s on every
-    ///   `handOverPTY`, so there is always another descriptor to be had.
-    /// - **An attach that timed out unacknowledged** kept its reader, suspended
-    ///   (`AttachCancelReason.unacknowledged`) — the viewer may have been
-    ///   reading all along, and it evidently was, because it is detaching. That
-    ///   reader is put back on the pty it never let go of.
+    /// **Every attach keeps its reader**, suspended, whether or not it was
+    /// acknowledged — an acknowledgement decides who reads the pty, not who
+    /// owns the emulator. So the ordinary take-back ingests the viewer's screen
+    /// into that reader and resumes the drain it never restarted, rather than
+    /// opening a second hand-over against a master this registry already holds.
+    /// The reader kept its descriptor throughout, so the resume needs nothing
+    /// from the holder — not even a reachable rendezvous socket.
     ///
     /// **The claim is held across the resume and cleared only after it lands**,
     /// the same invariant `cancelPendingAttach`'s resuming arm states: no window
@@ -1638,9 +1911,23 @@ actor HolderRegistry {
     /// rot.
     ///
     /// With no preamble there is simply nothing to ingest: the suspended reader
-    /// still holds the screen it had before the attach, a fresh adoption seeds
-    /// from the holder's hand-over as any adoption does, and the jiggle is what
+    /// still holds the screen it had before the attach, and the jiggle is what
     /// gets a repainting program to redraw the rest.
+    ///
+    /// **The `.adopted` arm serves every attach**, acknowledged or timed out,
+    /// because both keep their reader suspended on a descriptor they never let
+    /// go of. It is the ordinary path, and the strictly better one: no holder
+    /// round trip, no second `dup`, no second drain loop, and the screen the
+    /// daemon had at the attach is still underneath whatever the preamble puts
+    /// on top of it.
+    ///
+    /// **The `nil` arm is defensive and expected to be dead.** A claim can only
+    /// outlive its reader if something emptied the slot while the claim stood,
+    /// and the one writer that empties a slot — `release` — clears the claim
+    /// first. It is kept rather than turned into a `throw` because the
+    /// alternative to a fresh adoption here is a session bricked for the
+    /// daemon's whole life, and a hand-over from the holder is a legitimate
+    /// recovery whenever that state is somehow reached.
     private func takeBackFromViewer(
         terminalID: UUID, generation: UInt64, preamble: Data?
     ) async throws {
@@ -1652,13 +1939,15 @@ actor HolderRegistry {
         do {
             switch slots[terminalID] {
             case .adopted(let suspended):
-                // The unacknowledged-attach arm. The reader never left the
-                // descriptor, so the screen goes in before the drain restarts
-                // and the resume is a restart of its thread.
+                // Every attach's arm. The reader never left the descriptor, so
+                // the screen goes in before the drain restarts and the resume is
+                // a restart of its thread.
                 if let preamble { await suspended.ingest(preamble: preamble) }
                 try await suspended.resumeDraining()
                 reader = suspended
             case nil:
+                // Defensive; see the header. A claim with no reader under it
+                // means something emptied the slot without clearing the claim.
                 reader = try await beginAdoption(
                     of: terminalID, seedingScreenWith: preamble ?? Data())
             case .adopting, .releasing:
@@ -2134,6 +2423,10 @@ actor HolderRegistry {
         // ID that no longer means anything.
         pendingAttaches[terminalID] = nil
         viewerAttachments[terminalID] = nil
+        // The processes are named only for as long as this daemon is reading
+        // them. A session it has let go of is one whose pids it has no
+        // first-hand claim about any more.
+        adoptedProcesses[terminalID] = nil
         switch slots[terminalID] {
         case nil:
             return
@@ -2153,6 +2446,29 @@ actor HolderRegistry {
             await task.value
             clearIfStillReleasing(task, for: terminalID)
         }
+    }
+
+    /// Publishes an adopted reader into its slot, records the status that came
+    /// with it, and counts the drain loop it carries.
+    ///
+    /// The one publish site for both callers — `spawn` and `beginAdoption` —
+    /// because the counters only mean anything if *every* publish touches all
+    /// three. They diverged once: `spawn` incremented `drainLoopsStarted`
+    /// alone, so `stopPublished`'s unconditional decrement drove
+    /// `liveDrainLoops` negative for a spawned session, and
+    /// `peakLiveDrainLoops` could not see a second loop running beside a
+    /// spawned one — the exact byte theft that counter exists to catch.
+    private func publish(_ adoption: Adoption, for terminalID: UUID) {
+        slots[terminalID] = .adopted(adoption.reader)
+        statuses[terminalID] = adoption.description.status
+        // Recorded with the reader and cleared with it, so "the registry holds
+        // a reader for this session" and "the registry can name that session's
+        // processes" are the same fact rather than two that can disagree.
+        adoptedProcesses[terminalID] = HolderAdoptedProcess(
+            holderPID: adoption.holderPID, childPID: adoption.description.childPID)
+        drainLoopsStarted += 1
+        liveDrainLoops += 1
+        peakLiveDrainLoops = max(peakLiveDrainLoops, liveDrainLoops)
     }
 
     /// Stops a reader this registry published, and drops it from the live count

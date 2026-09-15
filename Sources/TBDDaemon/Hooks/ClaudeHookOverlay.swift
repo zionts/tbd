@@ -131,10 +131,20 @@ public enum ClaudeHookOverlay {
     static let waitingForUserCommand =
         #"tbd terminal-activity waiting_for_user 2>/dev/null || true"#
 
-    /// Clears any standing delegation claim when a session ends. A session
-    /// that exits while background agents are live leaves a final
-    /// `turn_duration` record still reporting them, and no later turn ever
-    /// corrects it — so without this the claim would stand forever.
+    /// Reports the end of a session, which lands two facts.
+    ///
+    /// It clears any standing delegation claim: a session that exits while
+    /// background agents are live leaves a final `turn_duration` record still
+    /// reporting them, and no later turn ever corrects it, so without this the
+    /// claim would stand forever.
+    ///
+    /// And, when the reason means the process itself is leaving, it stamps the
+    /// terminal as parked with `HibernateReason.exited` — the machine-readable
+    /// "Claude is not running here" a send refuses on, rather than pasting a
+    /// message into the shell sitting in the pane. The stamp is a fast path, not
+    /// the guarantee: the send path also reads the pane's foreground process
+    /// group, so a lost hook costs a slower answer and a stale claim, never a
+    /// message run as a shell command.
     static let sessionEndCommand =
         #"tbd session-end 2>/dev/null || true"#
 
@@ -145,8 +155,9 @@ public enum ClaudeHookOverlay {
     /// actually bounds the hook is Claude Code's ~1.5-second SessionEnd
     /// shutdown budget, which cuts the callback off first either way; this
     /// value stays above it so a healthy RPC has the whole budget to land the
-    /// clear. Losing the clear to either bound costs only a stale claim on a
-    /// terminal whose session is gone.
+    /// clear. Losing the hook to either bound costs a stale claim and an
+    /// unstamped row on a terminal whose session is gone; the send path's
+    /// foreground-process rail still refuses the send.
     static let sessionEndTimeoutSeconds = 2
 
     /// The extended regex the prefilter greps a Bash hook payload for.
@@ -629,5 +640,31 @@ public enum ClaudeHookOverlay {
     /// belt-and-braces check before we add `--settings` to the spawn command.
     public static func overlayExists() -> Bool {
         FileManager.default.fileExists(atPath: overlayPath)
+    }
+
+    /// Whether the settings file this spawn will run with sets `key` in its
+    /// top-level `env` object.
+    ///
+    /// Asked of the **resolved** overlay — the exact path handed to
+    /// `--settings`, fragments already deep-merged — rather than of the repo
+    /// fragment or the per-spawn fragment separately, because a key may come
+    /// from either and what decides the session is the merged file.
+    ///
+    /// It exists for one caller: the model proxy has to know whether the user's
+    /// own settings will override the `ANTHROPIC_BASE_URL` it is about to put
+    /// in the process environment (Claude Code applies `settings.json`'s `env`
+    /// after the environment it inherits), and route a session it cannot
+    /// actually route.
+    ///
+    /// A pure read. A nil path, a file that is not there, bytes that are not
+    /// JSON, and a document with no `env` object all answer false — the same
+    /// answer, because none of them is a setting that would win, and none of
+    /// them is a reason to refuse a spawn.
+    static func overlaySetsEnv(_ key: String, overlayPath: String?) -> Bool {
+        guard let overlayPath,
+              let data = FileManager.default.contents(atPath: overlayPath),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let env = root["env"] as? [String: Any] else { return false }
+        return env[key] != nil
     }
 }

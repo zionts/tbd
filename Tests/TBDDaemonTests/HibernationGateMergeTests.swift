@@ -38,7 +38,8 @@ struct HibernationGateMergeTests {
         lastInputAt: Date? = nil
     ) -> HibernationGate.Decision {
         HibernationGate.decideForMerge(
-            terminal: terminal, inputVetoEnabled: inputVetoEnabled, lastInputAt: lastInputAt)
+            terminal: terminal, inputVetoEnabled: inputVetoEnabled,
+            lastInputAt: lastInputAt)
     }
 
     // MARK: - The go path: no idle window at all
@@ -199,5 +200,53 @@ struct HibernationGateMergeTests {
             hibernatedAt: now.addingTimeInterval(-60),
             activityStateObservedAt: now.addingTimeInterval(-10 * 60))
         #expect(decideForMerge(t, inputVetoEnabled: true, lastInputAt: now) == .alreadyHibernated)
+    }
+
+    // MARK: - Merge-park rides the same rails on every transport
+
+    /// A holder-backed row that passes every other merge rail — including the
+    /// input veto's `activityStateObservedAt` requirement, so the only thing
+    /// the tests below vary is the transport.
+    private func holderTerminal() -> Terminal {
+        Terminal(
+            worktreeID: UUID(), tmuxWindowID: "", tmuxPaneID: "",
+            label: "claude", claudeSessionID: "sess-1", kind: .claude,
+            activityState: .idle,
+            activityStateObservedAt: now.addingTimeInterval(-10 * 60),
+            transport: .holder)
+    }
+
+    /// Merge-park elects a holder row on the same terms it elects a tmux one —
+    /// the per-worktree tri-state and `auto_hibernate_on_merge_default` decide
+    /// the fan-out, and transport decides nothing.
+    @Test func mergeParkElectsAHolderRow() {
+        #expect(HibernationGate.decideForMerge(
+            terminal: holderTerminal(), inputVetoEnabled: false,
+            lastInputAt: nil) == .eligible)
+    }
+
+    /// A holder row still answers to every other rail — the input veto
+    /// included.
+    @Test func theInputVetoStillAppliesToAHolderRow() {
+        #expect(HibernationGate.decideForMerge(
+            terminal: holderTerminal(), inputVetoEnabled: true,
+            lastInputAt: now) == .pendingTypedInput)
+    }
+
+    /// The two transports get the same answer from the same facts, which is
+    /// what makes the assertions above about the rails rather than about a
+    /// transport special case.
+    @Test func bothTransportsGetTheSameAnswerFromTheSameFacts() {
+        #expect(HibernationGate.decideForMerge(
+            terminal: claudeTerminal(), inputVetoEnabled: false,
+            lastInputAt: nil) == .eligible)
+        #expect(HibernationGate.decideForMerge(
+            terminal: claudeTerminal(keepWarm: true), inputVetoEnabled: false,
+            lastInputAt: nil) == .keepWarm)
+        var warmHolder = holderTerminal()
+        warmHolder.keepWarm = true
+        #expect(HibernationGate.decideForMerge(
+            terminal: warmHolder, inputVetoEnabled: false,
+            lastInputAt: nil) == .keepWarm)
     }
 }

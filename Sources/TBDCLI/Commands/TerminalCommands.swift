@@ -6,7 +6,7 @@ struct TerminalCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "terminal",
         abstract: "Manage terminals",
-        subcommands: [TerminalCreate.self, TerminalList.self, TerminalSend.self, TerminalWake.self, TerminalClose.self, TerminalOutput.self, TerminalConversation.self, TerminalFocus.self, TerminalPin.self, TerminalUnpin.self, TerminalSwapProfile.self, TerminalContinueInCodex.self, TerminalAttach.self]
+        subcommands: [TerminalCreate.self, TerminalList.self, TerminalSend.self, TerminalWake.self, TerminalClose.self, TerminalOutput.self, TerminalConversation.self, TerminalFocus.self, TerminalPin.self, TerminalUnpin.self, TerminalSwapProfile.self, TerminalContinueInCodex.self, TerminalCompletions.self]
     )
 }
 
@@ -134,7 +134,7 @@ struct TerminalSend: AsyncParsableCommand {
                                   standing unless --submit is also passed.
               --text "…" --submit  the message, submitted. This is the pair every
                                   delivery uses.
-              --keys "Escape Enter"  whitespace-separated tmux key names, sent one
+              --keys "Escape Enter"  whitespace-separated key names, sent one
                                   at a time. Interrupt is a keys payload
                                   (--keys "C-c"). Enter is itself a key, so
                                   --submit does not apply here.
@@ -164,7 +164,7 @@ struct TerminalSend: AsyncParsableCommand {
     @Option(name: .long, help: "Text to send")
     var text: String?
 
-    @Option(name: .long, help: "Whitespace-separated tmux key names to send, e.g. \"Escape Enter\" or \"C-c\"")
+    @Option(name: .long, help: "Whitespace-separated key names to send, e.g. \"Escape Enter\" or \"C-c\"")
     var keys: String?
 
     @Flag(name: .long, help: "Press Enter after sending text")
@@ -487,8 +487,84 @@ struct TerminalOutput: AsyncParsableCommand {
         if json {
             printJSON(result)
         } else {
+            // stdout stays exactly the screen text — scripts pipe it, diff it
+            // and match on it — so the provenance goes to stderr, where a
+            // human and a supervising agent both see it and no pipeline does.
+            // One write, however many caveats the screen carries: they arrive
+            // already joined by newlines, so a reader gets whole lines.
+            if let screen = result.screen, let note = Self.stalenessNote(for: screen) {
+                FileHandle.standardError.write(Data("\(note)\n".utf8))
+            }
             print(result.output)
         }
+    }
+
+    /// What to tell a reader about a screen they cannot read at face value, or
+    /// `nil` when there is nothing to say.
+    ///
+    /// `tbd terminal output` is one of the consumers the screen contract makes
+    /// declare a policy for `.staleDaemon`, and its declared policy is *accept
+    /// and surface*: the answer is still the best one available, and a reader
+    /// told which store produced it and how old it is has learned something the
+    /// bare string could never tell them. Before the typed screen this call
+    /// simply failed on a session a viewer held; answering with a frozen screen
+    /// and saying nothing would be the worse of the two, because a supervisor
+    /// reading a three-hour-old composer sees a live one.
+    ///
+    /// **Two caveats, two notes, and a screen can carry both.** The source says
+    /// which store answered and how old its view is; `contentObserved` says
+    /// whether that store's grid was ever painted by this child. A live
+    /// `daemon` screen from an emulator built over a running child is the case
+    /// the source alone cannot express — nothing about it is stale, and cells
+    /// nobody repainted since the daemon restarted are still text the child
+    /// never wrote. When both hold, the source note comes first: it is the one
+    /// with an age in it, and it is the one a script's existing prefix match
+    /// expects to find.
+    ///
+    /// The source is spelled with the enum's own raw value, so the note and the
+    /// `--json` field a script correlates against can never drift apart.
+    static func stalenessNote(for screen: TerminalScreen) -> String? {
+        var notes: [String] = []
+        let age = humaneAge(milliseconds: screen.ageMilliseconds)
+        switch screen.source {
+        case .daemon:
+            break
+        case .viewer:
+            notes.append(
+                """
+                note: screen came from the viewer holding this session's pty \
+                (source \(screen.source.rawValue), age \(age))
+                """)
+        case .staleDaemon:
+            notes.append(
+                """
+                note: screen is the daemon's emulator as it stood when a viewer attached \
+                (source \(screen.source.rawValue), age \(age))
+                """)
+        }
+        if !screen.contentObserved {
+            notes.append(
+                """
+                note: screen comes from an emulator built over a child that was already \
+                running, so cells the child has not repainted since the daemon restarted \
+                may be stale or blank (contentObserved false)
+                """)
+        }
+        return notes.isEmpty ? nil : notes.joined(separator: "\n")
+    }
+
+    /// An age a person can judge at a glance: seconds under a minute, minutes
+    /// and seconds under an hour, hours and minutes above it.
+    ///
+    /// Milliseconds are the wire's unit because a threshold is compared in
+    /// them; nobody reading a note decides anything on the difference between
+    /// 2,460,000 and 2,461,000.
+    private static func humaneAge(milliseconds: Int) -> String {
+        let seconds = max(0, milliseconds) / 1_000
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m \(seconds % 60)s" }
+        return "\(minutes / 60)h \(minutes % 60)m"
     }
 }
 
@@ -670,247 +746,70 @@ private func resolveWorktreeArg(_ nameOrID: String, client: SocketClient) throws
     return match.id
 }
 
-// MARK: - terminal attach
+// MARK: - terminal completions
 
-/// The coordinates half of `terminal.attachCommand`, without the script.
-///
-/// `--json` exists so the *sharper* instrument for the byte-burst question —
-/// `tmux pipe-pane -o`, which needs a socket path and a pane id and attaches no
-/// client at all — is drivable from this command. Emitting the script there too
-/// would invite a consumer to `sh`-pipe a field out of a JSON document; the two
-/// output modes are deliberately disjoint.
-///
-/// Built from the RPC result rather than from separately resolved values: the
-/// `paneID` reported here is the one the daemon's identity probe answered for.
-struct ExternalAttachCoordinates: Encodable {
-    let socketPath: String
-    let sessionName: String
-    let windowID: String
-    let paneID: String
-    let terminalID: UUID
-
-    init(_ result: TerminalAttachCommandResult) {
-        self.socketPath = result.socketPath
-        self.sessionName = result.sessionName
-        self.windowID = result.windowID
-        self.paneID = result.paneID
-        self.terminalID = result.terminalID
-    }
-}
-
-/// Pick the terminal `tbd terminal attach` should target.
-///
-/// Never guesses. An explicit `--terminal` must name a terminal that actually
-/// belongs to this worktree — attaching to a stranger's window is the failure
-/// reused pane coordinates already produced once (issue #384), and the list is
-/// in hand, so checking costs nothing. With no `--terminal`, a worktree holding
-/// exactly one terminal resolves to it and any other count is an error that
-/// lists what was available.
-func resolveAttachTerminal(
-    explicit: String?,
-    terminals: [Terminal],
-    worktreeLabel: String
-) throws -> Terminal {
-    if let explicit {
-        guard let id = UUID(uuidString: explicit) else {
-            throw CLIError.invalidArgument("Invalid terminal ID: \(explicit)")
-        }
-        guard let match = terminals.first(where: { $0.id == id }) else {
-            throw CLIError.invalidArgument(
-                "Terminal \(id) is not in worktree '\(worktreeLabel)'."
-                + attachCandidateList(terminals))
-        }
-        return match
-    }
-
-    if terminals.count == 1, let only = terminals.first {
-        return only
-    }
-
-    if terminals.isEmpty {
-        throw CLIError.invalidArgument("Worktree '\(worktreeLabel)' has no terminals to attach to.")
-    }
-
-    throw CLIError.invalidArgument(
-        "Worktree '\(worktreeLabel)' has \(terminals.count) terminals — "
-        + "pass --terminal <id> to choose one."
-        + attachCandidateList(terminals))
-}
-
-/// The candidate lines appended to every ambiguous-or-absent resolution error.
-/// Empty for an empty list, so the caller's sentence stands on its own.
-private func attachCandidateList(_ terminals: [Terminal]) -> String {
-    guard !terminals.isEmpty else { return "" }
-    return "\n" + terminals.map { term in
-        "  \(term.id.uuidString)  \(term.tmuxWindowID)  \(term.label ?? "-")"
-    }.joined(separator: "\n")
-}
-
-/// The refusal text for attaching from *inside* tmux, or nil when the exec path
-/// may proceed.
-///
-/// Taking the environment as an argument is what makes both branches of the
-/// gate testable without a subprocess: `run()` passes the real environment and
-/// the tests pass a dictionary. An empty `$TMUX` is treated as unset — that is
-/// how a shell that exported and cleared it presents, and tmux itself sets a
-/// non-empty triple.
-func externalAttachNestingRefusal(environment: [String: String]) -> String? {
-    guard let tmux = environment["TMUX"], !tmux.isEmpty else { return nil }
-    return """
-        Refusing to attach from inside tmux ($TMUX is set): a tmux client nested \
-        in a tmux pane is not the second emulator this command exists to give you. \
-        Run it from another terminal emulator, or run \
-        `sh -c "$(tbd terminal attach <worktree> --print)"` there. Piping --print \
-        into `sh` does not work: the attach needs a tty on stdin.
-        """
-}
-
-/// The process image the exec path replaces itself with.
-///
-/// The composed script is shell, not a single tmux invocation — a
-/// verify-then-reuse-or-rebuild of the terminal-keyed session joined by `&&`
-/// to the attach (see `ExternalAttachCommand.script`) — so the thing exec'd is
-/// a shell running it, not tmux directly. `sh` exits with the attach's status,
-/// which is what lets a harness tell a failed attach from an empty
-/// measurement.
-///
-/// Split out from `run()` so the argv is asserted in a test rather than only
-/// observed by a process that never returns.
-func externalAttachExecInvocation(script: String) -> (executable: String, arguments: [String]) {
-    ("/bin/sh", ["-c", script])
-}
-
-struct TerminalAttach: AsyncParsableCommand {
+struct TerminalCompletions: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "attach",
-        abstract: "Attach an external terminal emulator to a TBD terminal's tmux window",
+        commandName: "completions",
+        abstract: "Show the slash commands, skills and subagents this session knows",
         discussion: """
-            Puts a second client — iTerm2, Terminal.app, Ghostty — on the window a
-            TBD panel is already showing, so somebody else's renderer sits next to
-            SwiftTerm's on the identical byte stream. With no flags this command
-            replaces itself with the attached session — it does not return — so
-            run it in the emulator you want attached. It refuses when $TMUX is
-            set: pass --print and run the script in the target emulator instead.
+            Asks the session's OWN Claude Code binary, so a command that binary \
+            has and another version does not is listed correctly. Requires the \
+            transcript composer to be enabled (Settings → General, next to \
+            "Live transcript pane").
 
-            --terminal picks the terminal when the worktree has more than one. With
-            one terminal it can be omitted; with several, omitting it is an error
-            listing the candidates rather than a guess.
-
-            --print writes the script and nothing else, to be run from a tty:
-            sh -c "$(tbd terminal attach <worktree> --print)", or equivalently
-            eval "$(tbd terminal attach <worktree> --print)". Both keep the
-            caller's terminal as stdin. PIPING THE SCRIPT INTO `sh` DOES NOT WORK:
-            `tmux attach` requires a tty on stdin, and a shell reading its script
-            from a pipe leaves stdin as that pipe, so the attach dies with
-            "open terminal failed: not a terminal". The setup half of the script
-            has already created the session by then, and the reaping option rides
-            the attach that just failed, so every piped attempt also leaves a
-            client-less session behind for the daemon to reclaim. Use one of the
-            two forms above.
-
-            --json writes the coordinates instead — socket path, session name,
-            @window, %pane, terminal id — which is what drives `tmux pipe-pane -o`,
-            an instrument that needs those values and attaches no client at all.
-            --print and --json are mutually exclusive.
-
-            SIZING THE EXTERNAL WINDOW. Match TBD's panel dimensions EXACTLY
-            whenever you will run the external-alone condition (TBD's tab switched
-            away). The window follows the external client's dimensions once it is
-            the only one left, so an exactly-sized window resizes it to the size it
-            already had and the both-attached and external-alone conditions share a
-            geometry. Larger is acceptable when running only the TBD-alone and
-            both-attached conditions. SMALLER IS NEVER ACCEPTABLE: while both
-            clients are attached the window keeps TBD's dimensions, so a narrower
-            external window wraps or clips a stream cut for a wider window, which
-            makes the external client look worse than it is and fakes a result in
-            TBD's favour. Expect exact sizing to be fiddly to hit by hand: emulator
-            windows are dragged in pixels while tmux counts character cells, so
-            landing on a given rows-by-columns geometry usually takes several
-            tries. Nothing enforces it — the size is yours to get right.
-
-            WHAT THIS DOES NOT MEASURE. tmux tailors its output to each client's
-            declared terminal capabilities, so two different emulators attached to
-            one window do not receive identical bytes. The comparison is
-            informative about order-of-magnitude jerkiness. It is not a calibrated
-            measurement, and must not be reported as one.
+            `source` says which mechanism answered: `probe` means the binary \
+            itself, `scan` means a filesystem read of the same directories, \
+            which lists everything except built-ins. `freshness` says whether \
+            this request produced the answer (`fresh`), served a cache \
+            (`stale`), or degraded to the scan (`fallback`).
             """
     )
 
-    @Argument(help: "Worktree name or ID")
-    var worktree: String
+    @Option(name: .long, help: "Terminal ID")
+    var terminal: String
 
-    @Option(name: .long, help: "Terminal ID (required when the worktree has more than one terminal)")
-    var terminal: String?
-
-    @Flag(name: .customLong("print"), help: "Write the attach script to stdout and exit (run it as sh -c \"$(...)\"; piping into sh does not work)")
-    var printScript = false
-
-    @Flag(name: .long, help: "Write the coordinates (socket path, session name, window id, pane id, terminal id) as JSON")
+    @Flag(name: .long, help: "Output JSON")
     var json = false
 
-    /// `--print` and `--json` name two different documents on one stdout.
-    /// Refused at parse time so the caller learns before a socket is opened.
-    func validate() throws {
-        if printScript && json {
-            throw ValidationError(
-                "--print and --json are mutually exclusive: one writes a shell script, "
-                + "the other writes a coordinates object.")
-        }
-    }
-
     mutating func run() async throws {
-        // The nesting gate runs before anything else so a user inside tmux is
-        // told what to do instead, rather than after a round trip.
-        if !printScript && !json,
-           let refusal = externalAttachNestingRefusal(
-            environment: ProcessInfo.processInfo.environment) {
-            FileHandle.standardError.write(Data((refusal + "\n").utf8))
-            throw ExitCode.failure
+        guard let terminalID = UUID(uuidString: terminal) else {
+            throw CLIError.invalidArgument("Invalid terminal ID: \(terminal)")
         }
-
         let client = SocketClient()
-        let worktreeID = try resolveWorktreeArg(worktree, client: client)
-
-        let terminals: [Terminal] = try client.call(
-            method: RPCMethod.terminalList,
-            params: TerminalListParams(worktreeID: worktreeID),
-            resultType: [Terminal].self
-        )
-        let target = try resolveAttachTerminal(
-            explicit: terminal, terminals: terminals, worktreeLabel: worktree)
-
-        let result: TerminalAttachCommandResult = try client.call(
-            method: RPCMethod.terminalAttachCommand,
-            params: TerminalAttachCommandParams(worktreeID: worktreeID, terminalID: target.id),
-            resultType: TerminalAttachCommandResult.self
+        let result: TerminalCompletionsResult = try client.call(
+            method: RPCMethod.terminalCompletions,
+            params: TerminalCompletionsParams(terminalID: terminalID),
+            resultType: TerminalCompletionsResult.self
         )
 
         if json {
-            // Same discipline as `terminal list --json`: an encoding failure
-            // names itself on stderr and exits nonzero. Printing nothing at
-            // exit 0 would read to a harness as a terminal with no coordinates.
-            guard let output = jsonString(ExternalAttachCoordinates(result)) else {
+            guard let output = jsonString(result) else {
                 FileHandle.standardError.write(Data(
-                    "Error: could not encode the attach coordinates as JSON\n".utf8))
+                    "Error: could not encode the completions result as JSON\n".utf8))
                 throw ExitCode.failure
             }
             print(output)
             return
         }
 
-        if printScript {
-            // The script and nothing else — no banner, no trailing prose. A
-            // consumer runs it as `sh -c "$(...)"`, which keeps their tty as
-            // stdin; piping it into `sh` leaves stdin a pipe and the attach
-            // fails for want of a terminal.
-            print(result.script)
-            return
+        print("source: \(result.source.rawValue)  freshness: \(result.freshness.rawValue)")
+        print("\(result.commands.count) command(s), \(result.agents.count) agent(s)")
+        print("")
+        for command in result.commands {
+            let alias = command.aliases.isEmpty
+                ? "" : " (\(command.aliases.joined(separator: ", ")))"
+            let hint = command.argumentHint.map { " \($0)" } ?? ""
+            print("/\(command.name)\(alias)\(hint)")
+            if !command.description.isEmpty {
+                print("    \(command.description)")
+            }
         }
-
-        let invocation = externalAttachExecInvocation(script: result.script)
-        try execReplacingCurrentProcess(
-            executablePath: invocation.executable,
-            arguments: invocation.arguments,
-            environment: ProcessInfo.processInfo.environment)
+        for agent in result.agents {
+            print("@\(agent.name)")
+            if !agent.description.isEmpty {
+                print("    \(agent.description)")
+            }
+        }
     }
 }

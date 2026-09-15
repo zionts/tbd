@@ -27,6 +27,18 @@ struct PaneSendTargetQueryTests {
         ])
     }
 
+    /// Every one-shot tmux client runs UTF-8 whatever the inherited locale, or
+    /// tmux sanitizes this query's tab separators to `_`. The builder's argv is
+    /// left alone; `-u` is added once, in front, at execution.
+    @Test("execution argv puts -u in front exactly once and keeps the rest")
+    func executionArgumentsForceUTF8() {
+        let query = TmuxManager.paneSendTargetQuery(server: "tbd-acme", paneID: "%7")
+        let executed = TmuxManager.executionArguments(query)
+        #expect(executed == ["-u"] + query)
+        #expect(executed.filter { $0 == "-u" }.count == 1)
+        #expect(TmuxManager.executionArguments([]) == ["-u"])
+    }
+
     /// `list-panes -t %N` lists every pane in `%N`'s *window*, not just `%N`.
     /// Without `#{pane_id}` in the format there is no way to tell which line
     /// answered, so the query must keep asking for it.
@@ -52,6 +64,35 @@ struct PaneSendTargetQueryTests {
         let args = TmuxManager.setPaneTerminalIDCommand(
             server: "tbd-acme", target: "%7", terminalID: "F1A2")
         #expect(args == ["-L", "tbd-acme", "set-option", "-p", "-t", "%7", "@tbd_terminal_id", "F1A2"])
+    }
+
+    /// The format string must actually request the window id: everything that
+    /// reads `PaneSendTarget.windowID` can only compare a field the production
+    /// query asked tmux for.
+    @Test("the pane probe query asks tmux for the window id")
+    func probeQueryReadsWindowID() {
+        let query = TmuxManager.paneSendTargetQuery(server: "tbd-acme", paneID: "%7")
+        #expect(query.contains { $0.contains("#{window_id}") })
+    }
+
+    /// The window a pane lives in is read from the line for the *named* pane,
+    /// not from whichever line tmux happened to list first.
+    @Test("the probe parser reads the window id from the line for the named pane")
+    func probeParserReadsWindowID() {
+        // Two panes in one window is the case `#{pane_id}`-first selection
+        // exists for: `list-panes -t %N` lists every pane in %N's window.
+        let output = """
+            %6\t@3\t0\t\t/bin/zsh
+            %7\t@3\t0\t\t/bin/zsh
+            """
+        let probe = TmuxManager.parsePaneSendProbe(output, paneID: "%7")
+        #expect(probe.windowID == "@3")
+        #expect(probe.target == .live(terminalID: nil))
+
+        // Nothing answered for this coordinate: no window to report either.
+        let missing = TmuxManager.parsePaneSendProbe(output, paneID: "%99")
+        #expect(missing.windowID == nil)
+        #expect(missing.target == .missing)
     }
 
     // MARK: - Parsing

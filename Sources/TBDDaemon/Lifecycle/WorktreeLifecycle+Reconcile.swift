@@ -532,11 +532,6 @@ extension WorktreeLifecycle {
     ) async throws {
         for server in servers.sorted() {
             try await tmux.withServerResourceLock(server: server) {
-                // Reclaim `tbd-ext-*` sessions before judging the server: the
-                // branch below may kill the whole server, which would take
-                // them with it, but only when nothing references it. A server
-                // that stays alive is the case this pass exists for.
-                await reapExternalAttachSessions(server: server)
                 // Ownership must be read only after acquiring the same lock a
                 // creator holds through its terminal-row commit.
                 let globalLiveRows = try await db.worktrees.listLocal(excludeArchived: true)
@@ -640,19 +635,11 @@ extension WorktreeLifecycle {
     private func reconcileTerminals(
         in worktrees: [LocalWorktree], actuationLog: ActuationLog
     ) async throws {
-        // Read once per pass, not per row: the gate decides what this whole
-        // sweep is allowed to do, and re-reading it mid-pass would let a flip
-        // land between two rows of one judgement.
-        let holderArmEnabled =
-            (try? await db.config.get().holderRowReconcileEnabled)
-            ?? Config.holderRowReconcileEnabledDefault
         // The budget covers the pass, not one server: the arm is serial across
         // every server this call reconciles, so a per-server budget would
         // multiply by the server count exactly the way a per-probe timeout
         // multiplies by the row count.
-        if holderArmEnabled {
-            await holderProbeBudget.begin(Self.holderPhaseBudget, clock: clock)
-        }
+        await holderProbeBudget.begin(Self.holderPhaseBudget, clock: clock)
         // `end()` has to run on every exit, including the throwing one: the
         // budget's timer is what makes `begin` a no-op while a pass is running,
         // so a pass that walked away from its own timer would leave every later
@@ -660,8 +647,7 @@ extension WorktreeLifecycle {
         // caught and rethrown instead.
         do {
             try await reconcileTerminalsWhileLockedPerServer(
-                in: worktrees, actuationLog: actuationLog,
-                holderArmEnabled: holderArmEnabled)
+                in: worktrees, actuationLog: actuationLog)
         } catch {
             await holderProbeBudget.end()
             throw error
@@ -672,7 +658,7 @@ extension WorktreeLifecycle {
     /// The per-server half of `reconcileTerminals`, split out only so its
     /// caller can bracket it with the pass's probe budget.
     private func reconcileTerminalsWhileLockedPerServer(
-        in worktrees: [LocalWorktree], actuationLog: ActuationLog, holderArmEnabled: Bool
+        in worktrees: [LocalWorktree], actuationLog: ActuationLog
     ) async throws {
         let grouped = Dictionary(grouping: worktrees, by: \.tmuxServer)
         for server in grouped.keys.sorted() {
@@ -685,8 +671,7 @@ extension WorktreeLifecycle {
                     currentWorktrees.append(current)
                 }
                 try await reconcileTerminalsWhileLocked(
-                    in: currentWorktrees, actuationLog: actuationLog,
-                    holderArmEnabled: holderArmEnabled)
+                    in: currentWorktrees, actuationLog: actuationLog)
             }
         }
     }
@@ -697,8 +682,7 @@ extension WorktreeLifecycle {
     /// depend on it: a holder row's ground truth is its own rendezvous, and
     /// holding this lock neither protects nor delays it.
     private func reconcileTerminalsWhileLocked(
-        in worktrees: [LocalWorktree], actuationLog: ActuationLog,
-        holderArmEnabled: Bool
+        in worktrees: [LocalWorktree], actuationLog: ActuationLog
     ) async throws {
         // Probe the server each worktree row actually stores, not a canonical
         // name. Promoted scratch worktrees keep their inherited scratch server.
@@ -711,6 +695,10 @@ extension WorktreeLifecycle {
         // 2026-09-02. `unknown` is ignorance, not evidence: it parks nothing,
         // deletes nothing, and leaves the row for the next sweep.
         var serverPresenceByName: [String: TmuxPresence] = [:]
+        // Read once for the whole pass rather than per row. It only ever makes
+        // a route lookup cheaper (`ModelProxyRouteAttachment.retire`), and an
+        // unreadable config answers "on", which skips nothing.
+        let modelProxyEnabled = (try? await db.config.get())?.modelProxyEnabled ?? true
         for wt in worktrees {
             let serverPresence: TmuxPresence
             if let cached = serverPresenceByName[wt.tmuxServer] {
@@ -746,14 +734,6 @@ extension WorktreeLifecycle {
                 let disposal: String
                 switch terminal.transport {
                 case .holder:
-                    // The gate, and the same `continue` the old exemption
-                    // took. Off — the shipped default — this arm establishes
-                    // nothing and moves nothing, so a holder row is exactly as
-                    // untouched as it was before the arm existed.
-                    guard holderArmEnabled else {
-                        logger.debug("reconcile: leaving holder-backed terminal \(terminal.id, privacy: .public) alone — holder_row_reconcile_enabled is off")
-                        continue
-                    }
                     switch await holderRowVerdict(for: terminal) {
                     case .keep(let reason):
                         logger.debug("reconcile: keeping holder-backed terminal \(terminal.id, privacy: .public) — \(reason, privacy: .public)")
@@ -823,22 +803,29 @@ extension WorktreeLifecycle {
                     disposal = "window \(terminal.tmuxWindowID) gone or reassigned"
                 }
 
-                // **Parking is a tmux-transport outcome, and only that.** A
-                // holder-backed row is deleted even when it names a resumable
-                // Claude session, because a parked holder row is inert and
-                // noisy rather than recoverable: `HibernationCoordinator.wake`
-                // refuses `transport == .holder` ahead of its "wake any parked
-                // row" branch, and this sweep skips parked rows, so nothing
-                // would ever judge it again — while the app's focus-wake
-                // selects exactly `isParked && isClaudeResumable &&
-                // hibernateReason != .manual` and would fire a failing wake RPC
-                // on every focus of that worktree, forever. Deleting says the
-                // true thing instead. The cost is real and named in the PR: a
-                // holder-backed resumable Claude session that ends loses the
-                // park a tmux one would get, until a holder wake path lands —
-                // which is a feature, not a reconciler's job.
-                if terminal.transport != .holder, terminal.isClaudeResumable,
-                   let sessionID = terminal.claudeSessionID {
+                // Whichever of the two shapes below the row becomes, its
+                // session is over — that is what `disposal` above established —
+                // so the route that named its process goes now. Ahead of the
+                // branch rather than inside both arms, because the delete arm
+                // removes the only row that could ever name this terminal
+                // again, and a route retired for a row that no longer exists is
+                // a directory listing nobody will make.
+                if terminal.transport == .holder {
+                    await ModelProxyRouteAttachment.retire(
+                        terminalID: terminal.id,
+                        streamPath: terminal.transcriptStreamPath,
+                        proxyEnabled: modelProxyEnabled,
+                        supervisor: modelProxySupervisor)
+                }
+
+                // **What a finished session's row becomes is one rule, on every
+                // transport.** A resumable Claude row is PARKED, preserving its
+                // session id for a later wake; anything else is deleted,
+                // because there is nothing to preserve. A parked row is only
+                // worth having if something can wake it, and every transport
+                // has a wake path: tmux respawns the window, holder spawns a
+                // fresh holder running `claude --resume`.
+                if terminal.isClaudeResumable, let sessionID = terminal.claudeSessionID {
                     // This park bypasses `HibernationCoordinator`, so the
                     // reconcile rail records its own independent actuation.
                     // Fail closed if that authoritative record cannot be made.
@@ -852,6 +839,19 @@ extension WorktreeLifecycle {
                     do {
                         try await db.terminals.setHibernated(
                             id: terminal.id, sessionID: sessionID, reason: .recovery)
+                        // A parked holder row names no processes. The holder
+                        // and its job are already gone — that is what
+                        // `.sessionOver` established — so leaving their pids on
+                        // the row would point the reaper's holder leg and every
+                        // identity check at numbers the kernel has recycled.
+                        if terminal.transport == .holder {
+                            try await db.terminals.setHolderProcess(
+                                id: terminal.id, holderPID: nil, childPID: nil, startedAt: nil)
+                            // Same reason, same write: the column names a
+                            // stream file the retirement above just dropped.
+                            try await db.terminals.setTranscriptStreamPath(
+                                terminalID: terminal.id, path: nil)
+                        }
                         await actuationLog.appendOutcome(
                             confirms: actuationID, result: .dispatched)
                     } catch {
@@ -861,7 +861,7 @@ extension WorktreeLifecycle {
                     logger.info("reconcile: parked terminal \(terminal.id, privacy: .public) — \(disposal, privacy: .public), session \(sessionID, privacy: .public) preserved, wakeable via the unified resume path")
                 } else {
                     try? await db.deleteTerminalAndTab(id: terminal.id)
-                    logger.info("reconcile: deleted terminal \(terminal.id, privacy: .public) — \(disposal, privacy: .public), \(Self.deletionRationale(for: terminal), privacy: .public)")
+                    logger.info("reconcile: deleted terminal \(terminal.id, privacy: .public) — \(disposal, privacy: .public), no session to preserve")
                 }
                 await pendingQuestions.clear(terminalID: terminal.id)
                 await subscriptions?.broadcastPendingQuestions(
@@ -913,20 +913,6 @@ extension WorktreeLifecycle {
     /// See `HolderProbeBudget` for why a per-probe timeout is not a bound on a
     /// pass at all.
     static let holderPhaseBudget: Duration = .seconds(5)
-
-    /// Why the sweep deleted a row rather than parking it, for the one log line
-    /// that records the judgement.
-    ///
-    /// Composed by a named function so a test can pin the text: the two
-    /// deletions are not the same event, and a line that told a
-    /// holder-transport Claude row it had "no session to preserve" would be
-    /// false about the one row shape whose park was deliberately withheld.
-    static func deletionRationale(for terminal: Terminal) -> String {
-        guard terminal.transport == .holder, terminal.isClaudeResumable,
-            terminal.claudeSessionID != nil
-        else { return "no session to preserve" }
-        return "its Claude session is not resumable from a park on the holder transport"
-    }
 
     /// How a finished session's job ended, in words, for the one log line that
     /// records the sweep's judgement.
@@ -1097,13 +1083,9 @@ extension WorktreeLifecycle {
     /// signals nothing, ever.
     ///
     /// **Naming that contingency honestly: the loop does not always close.**
-    /// The reaper leg this gate waits for is itself gated on
-    /// `reapHolderChildrenEnabled`, which ships off, so on the shipped defaults
-    /// nothing ever kills the job and the row is kept for as long as the pid is
-    /// alive. Even with both flags on, the reaper keeps rather than signals
-    /// whenever identity is uncertain — `holder-unrecorded`,
-    /// `start-time-mismatch`, `foreign-executable` — and each of those is a
-    /// permanent keep here too. A pid the row names that has been reused by a
+    /// The reaper keeps rather than signals whenever identity is uncertain —
+    /// `holder-unrecorded`, `start-time-mismatch`, `foreign-executable` — and
+    /// each of those is a permanent keep here too. A pid the row names that has been reused by a
     /// stranger therefore keeps the row indefinitely instead of killing that
     /// stranger. That is the direction to fail in, and a kept row is a visible
     /// session the user can close by hand.
@@ -1184,125 +1166,6 @@ extension WorktreeLifecycle {
             return .keep(reason: "job-still-running")
         }
         return verdict
-    }
-
-    /// Reclaim the external-attach sessions on one tmux server.
-    ///
-    /// `tbd terminal attach` mints a `tbd-ext-<tid8>` session per terminal so
-    /// an external emulator can be a second client on a TBD window. Those
-    /// sessions are a durable external resource, so they get a named
-    /// reconciler, and this is it. `destroy-unattached on` reclaims the
-    /// ordinary case the instant the last client leaves; this pass carries
-    /// every case that option misses.
-    ///
-    /// Candidates are exactly the names `ExternalAttachCommand` mints —
-    /// `isGeneratedSessionName`, the prefix followed by eight lowercase hex
-    /// digits — so TBD's own panel sessions (`tbd-view-*`), the daemon's
-    /// `main`, and any hand-made session are out of scope. The prefix alone
-    /// would not do it: a hand-made `tbd-ext-notes` matches the prefix, and a
-    /// hand-made `tbd-ext-aa ; kill-server` would be fed to the conditional
-    /// kill, whose inner command tmux re-parses and splits on `;` — see
-    /// `TmuxManager.killSessionIfClientlessCommand`. Killing a session does
-    /// not disturb the terminal: its window is `link-window`ed from `main` and
-    /// survives.
-    ///
-    /// The 60-second grace period is the point, not a courtesy — see
-    /// `ExternalAttachReclamation.gracePeriod`, which also explains why the
-    /// clock lives on the tmux session rather than in this process.
-    func reapExternalAttachSessions(server: String) async {
-        let sessions: [TmuxSessionInfo]
-        do {
-            sessions = try await tmux.listSessions(server: server)
-        } catch {
-            // A server that will not answer is not evidence about any session
-            // on it. Leave every stamp standing and retry next sweep.
-            logger.debug("reconcile: could not list sessions on \(server, privacy: .public) for external-attach reclamation: \(error, privacy: .public)")
-            return
-        }
-        let observedAt = now()
-        for session in sessions
-        where ExternalAttachCommand.isGeneratedSessionName(session.name) {
-            switch ExternalAttachReclamation.decide(session: session, now: observedAt) {
-            case .leaveAlone:
-                continue
-            case .stamp(let date):
-                do {
-                    try await tmux.setExternalAttachClientlessSince(
-                        server: server, session: session.name, date: date)
-                } catch {
-                    logger.debug("reconcile: could not stamp external attach session \(session.name, privacy: .public) on \(server, privacy: .public): \(error, privacy: .public)")
-                }
-            case .clearStamp:
-                do {
-                    try await tmux.clearExternalAttachClientlessSince(
-                        server: server, session: session.name)
-                } catch {
-                    logger.debug("reconcile: could not clear the client-less stamp on external attach session \(session.name, privacy: .public) on \(server, privacy: .public): \(error, privacy: .public)")
-                }
-            case .reap:
-                do {
-                    // Conditional, decided inside tmux: a client that attached
-                    // between the listing above and this call keeps its session
-                    // rather than being disconnected mid-measurement.
-                    let killed = try await tmux.killSessionIfClientless(
-                        server: server, session: session.name)
-                    guard killed else {
-                        logger.debug("reconcile: spared external attach session \(session.name, privacy: .public) on \(server, privacy: .public) — a client attached after it was listed")
-                        continue
-                    }
-                    logger.info("\(Self.externalAttachReapLogLine(server: server, session: session.name), privacy: .public)")
-                } catch {
-                    logger.warning("reconcile: failed to kill external attach session \(session.name, privacy: .public) on \(server, privacy: .public): \(error, privacy: .public)")
-                }
-            }
-        }
-    }
-
-    /// The line `reapExternalAttachSessions` logs for each session it kills.
-    ///
-    /// Composed by a named function so a test can assert the exact text: the
-    /// spec requires the reap to be *detectable afterwards*, so that a
-    /// truncated measurement run is distinguishable from a quiet one, and a
-    /// line that stopped naming its session would defeat that silently.
-    static func externalAttachReapLogLine(server: String, session: String) -> String {
-        "reconcile: killed external attach session \(session) on tmux server \(server) — no client had been attached to it for at least \(Int(ExternalAttachReclamation.gracePeriod))s"
-    }
-
-    /// The recurring driver for external-attach reclamation, called from the
-    /// daemon's hourly orphan-maintenance cadence.
-    ///
-    /// Reclamation needs a periodic caller of its own. The other entry points
-    /// into `reapExternalAttachSessions` are startup, `repo.add`, and the
-    /// `cleanup` RPC — none of which recur — so a session abandoned by a failed
-    /// attach would sit on the server until the daemon next restarted. The
-    /// hourly cadence is defensible because this pass is a **backstop**:
-    /// `destroy-unattached on` reclaims the ordinary case the instant the last
-    /// client detaches, and a terminal-keyed name bounds the population at one
-    /// session per terminal in the meantime. Worst case is therefore about an
-    /// hour for a never-attached orphan (one observation decides it), and about
-    /// two for the rarer session that was attached, detached, and outlived its
-    /// `destroy-unattached` — that one needs a sweep to stamp and a later sweep
-    /// to act.
-    ///
-    /// Sweeps every server named by a live local worktree row: `tbd-ext-*`
-    /// sessions only ever exist on a server that hosts a TBD terminal. Takes
-    /// the same per-server resource lock the reconcile call site holds, which
-    /// is why `reapExternalAttachSessions` itself does not (the coordinator is
-    /// not reentrant).
-    public func reclaimExternalAttachSessions() async {
-        let servers: Set<String>
-        do {
-            servers = Set(try await db.worktrees.listLocal(excludeArchived: true)
-                .map(\.tmuxServer))
-        } catch {
-            logger.warning("Failed to list worktrees for external-attach reclamation: \(error.localizedDescription, privacy: .public)")
-            return
-        }
-        for server in servers.sorted() {
-            await tmux.withServerResourceLock(server: server) {
-                await reapExternalAttachSessions(server: server)
-            }
-        }
     }
 
     /// Whether `server` hosts a live tmux window for any of `worktreeID`'s

@@ -76,7 +76,11 @@ private let logger = Logger(subsystem: "com.tbd.daemon", category: "claude-trust
 /// daemon's own environment. The seed then lands in `~/.claude.json` while the
 /// spawned pane reads config from the shell-rc dir, so the trust prompt still
 /// appears. This is no worse than the pre-seeder behavior and is unresolvable from
-/// the daemon side, so we accept it.
+/// the daemon side, so we accept it. A `CLAUDE_CONFIG_DIR` the daemon inherited
+/// from the session that launched it, naming a directory under this
+/// installation's profiles root, is likewise not observed — deliberately, since
+/// `SpawnBaseEnvironment` strips exactly that value from the base the spawned
+/// pane receives, so seeding into it would seed a config dir no job reads.
 enum ClaudeTrustSeeder {
     /// Pre-accept Claude Code's folder-trust dialog for a worktree whose trust
     /// answer TBD holds, by writing `projects["<path>"].hasTrustDialogAccepted
@@ -99,12 +103,22 @@ enum ClaudeTrustSeeder {
     /// `async` only because the read-merge-write hops onto `writer` to
     /// serialize; the gate and path resolution below are pure and stay on the
     /// caller.
+    ///
+    /// `environment` defaults to the *scrubbed* daemon environment — the same
+    /// base `SpawnBaseEnvironment` hands the spawned job — rather than the raw
+    /// process environment. The seeder must resolve the config dir the job will
+    /// actually read: a profile-less spawn under a daemon restarted from a
+    /// profile-bound session would otherwise be seeded into the launcher's
+    /// profile dir while the job reads `~/.claude.json`, and the trust dialog
+    /// would block before SessionStart, where nothing can detect or dismiss it.
+    /// `Daemon.scrubInheritedTBDEnv` makes the two agree at startup anyway; the
+    /// explicit default keeps them in lockstep by construction.
     static func ensureTrusted(
         worktree: Worktree,
         autoTrustNonScratch: Bool,
         profileConfigDir: String?,
         homeDirectory: String = NSHomeDirectory(),
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = SpawnBaseEnvironment.inheriting(ProcessInfo.processInfo.environment)
     ) async {
         // Two-tier gate (see the type doc comment for the full argument):
         // scratch spaces are TBD-owned empty dirs and always seed; a non-scratch
@@ -157,18 +171,43 @@ enum ClaudeTrustSeeder {
             projectKeys.append(resolvedPath)
         }
 
-        await writer.seed(
-            projectKeys: projectKeys,
-            configDirURL: configDirURL,
-            claudeJSONPath: claudeJSONPath,
-            worktreePath: worktree.localPath)
+        // Through the shared per-directory lane, so a completions probe running
+        // against this same config directory cannot interleave its own
+        // `.claude.json` rewrite with this read-merge-write. The inner actor is
+        // kept: it is what makes THIS body atomic, and the lane is what orders it
+        // against a suspending peer.
+        //
+        // `seed` is non-throwing — it handles every read and write failure
+        // itself — so the only error `run` could surface is one the body raised,
+        // and there is none. The `try?` therefore discards nothing that can
+        // occur; it is here because `run` is a throwing generic, not because a
+        // failure is being ignored.
+        _ = try? await ClaudeConfigDirSerializer.shared.run(
+            configDir: configDirURL.path
+        ) { [writer = Self.writer, projectKeys] in
+            await writer.seed(
+                projectKeys: projectKeys,
+                configDirURL: configDirURL,
+                claudeJSONPath: claudeJSONPath,
+                worktreePath: worktree.localPath)
+        }
     }
 
-    /// The process-wide lane every seed's read-merge-write runs on.
+    /// The process-wide actor every seed's read-merge-write runs on.
     ///
-    /// One lane rather than one per config dir: the early return below collapses
-    /// writes to at most once per newly-seen path, so contention is negligible
-    /// and a lane table would be state to keep for no measurable gain.
+    /// **Two levels, each doing what the other cannot.** This actor is what makes
+    /// one seed body atomic: the body never suspends, so the actor's serial
+    /// execution covers its whole read-through-rename window.
+    /// `ClaudeConfigDirSerializer` is what orders that body against a
+    /// *suspending* peer on the same config directory — the completions probe,
+    /// which spawns a process and awaits it, and which an actor alone would
+    /// happily let a seed run inside.
+    ///
+    /// One actor rather than one per config directory: the early return below
+    /// collapses writes to at most once per newly-seen path, so contention here
+    /// is negligible and a table would be state kept for no measurable gain. The
+    /// per-directory keying that does matter lives in the serializer, where the
+    /// waits are long enough for an unrelated profile to notice them.
     private static let writer = TrustSeedWriter()
 
     /// Serializes the read → parse → merge → write critical section.

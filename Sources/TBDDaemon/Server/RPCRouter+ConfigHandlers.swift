@@ -210,51 +210,6 @@ extension RPCRouter {
         return .ok()
     }
 
-    /// Persist the holder rendezvous sweep gate — the default-off soak switch
-    /// for unlinking the socket, lock and log a dead holder left behind, read
-    /// on top of the GC master switch. Like that master switch, flipping it off
-    /// does not cancel an in-progress sweep: `OrphanGC.sweep` re-reads the flag
-    /// on its next pass.
-    func handleConfigSetGCHolderRendezvousEnabled(_ paramsData: Data) async throws -> RPCResponse {
-        let params = try decoder.decode(
-            ConfigSetGCHolderRendezvousEnabledParams.self, from: paramsData)
-        try await db.config.setGCHolderRendezvousEnabled(params.enabled)
-        // Reuse the existing config-change channel so the app reloads Config.
-        subscriptions.broadcast(delta: .modelProfilesChanged)
-        return .ok()
-    }
-
-    /// Persist the row-less holder sweep gate — the default-off soak switch for
-    /// killing a pty holder this installation owns which no session row claims,
-    /// read on top of the GC master switch. Deliberately a different verb from
-    /// the rendezvous gate above: enabling file cleanup must never enable a
-    /// process killer. Like the master switch, flipping it off does not cancel
-    /// an in-progress sweep: `OrphanGC.sweep` re-reads the flag on its next
-    /// pass.
-    func handleConfigSetGCRowlessHoldersEnabled(_ paramsData: Data) async throws -> RPCResponse {
-        let params = try decoder.decode(
-            ConfigSetGCRowlessHoldersEnabledParams.self, from: paramsData)
-        try await db.config.setGCRowlessHoldersEnabled(params.enabled)
-        // Reuse the existing config-change channel so the app reloads Config.
-        subscriptions.broadcast(delta: .modelProfilesChanged)
-        return .ok()
-    }
-
-    /// Persist the `AgentReaper` holder leg's gate — the default-off soak
-    /// switch for killing the surviving job of a dead pty holder.
-    ///
-    /// This is how the soak is turned on. Flipping it off does not cancel an
-    /// in-progress sweep: the reaper task re-reads the flag on its next pass,
-    /// the same contract the GC gates keep.
-    func handleConfigSetReapHolderChildrenEnabled(_ paramsData: Data) async throws -> RPCResponse {
-        let params = try decoder.decode(
-            ConfigSetReapHolderChildrenEnabledParams.self, from: paramsData)
-        try await db.config.setReapHolderChildrenEnabled(params.enabled)
-        // Reuse the existing config-change channel so the app reloads Config.
-        subscriptions.broadcast(delta: .modelProfilesChanged)
-        return .ok()
-    }
-
     /// Persist the retained-transcript GC gate — the default-off soak switch
     /// for the `OrphanGC` leg that unlinks retained transcripts nobody
     /// references and drops receipts whose expiry has passed, read on top of
@@ -292,23 +247,6 @@ extension RPCRouter {
         return .ok()
     }
 
-    /// Persist the holder row sweep's gate — the default-off soak switch for
-    /// the reconcile arm that deletes a session row whose holder is gone.
-    ///
-    /// This is how the soak is turned on. It is a third verb rather than a
-    /// reuse of either holder gate above, because those reclaim a file and a
-    /// process and this one destroys the database row that names both. Flipping
-    /// it off does not cancel an in-progress sweep: the arm re-reads the flag
-    /// on its next pass, the same contract the GC gates keep.
-    func handleConfigSetHolderRowReconcileEnabled(_ paramsData: Data) async throws -> RPCResponse {
-        let params = try decoder.decode(
-            ConfigSetHolderRowReconcileEnabledParams.self, from: paramsData)
-        try await db.config.setHolderRowReconcileEnabled(params.enabled)
-        // Reuse the existing config-change channel so the app reloads Config.
-        subscriptions.broadcast(delta: .modelProfilesChanged)
-        return .ok()
-    }
-
     /// Persist the orphaned-process collector gate — the default-off soak
     /// switch for reclaiming processes that outlived the worktree they were
     /// rooted in, read on top of the GC master switch.
@@ -325,6 +263,26 @@ extension RPCRouter {
         let params = try decoder.decode(
             ConfigSetGCOrphanProcessesEnabledParams.self, from: paramsData)
         try await db.config.setGCOrphanProcessesEnabled(params.enabled)
+        // Reuse the existing config-change channel so the app reloads Config.
+        subscriptions.broadcast(delta: .modelProfilesChanged)
+        return .ok()
+    }
+
+    /// Persist the hang-stack reclaimer gate — the default-off soak switch for
+    /// bounding `~/Library/Logs/TBD/hang-stacks/` by age and by count, read on
+    /// top of the GC master switch.
+    ///
+    /// The broadcast is load-bearing beyond refreshing a Settings toggle (there
+    /// is none for this flag): the app mirrors the resolved value into
+    /// `HangStackWriter`'s write-time cap, so this delta is how the write side
+    /// of the policy learns it was turned on without waiting for a relaunch.
+    ///
+    /// Like the master switch, flipping it off does not cancel an in-progress
+    /// sweep: `OrphanGC.sweep` re-reads the flag on its next pass.
+    func handleConfigSetGCHangStacksEnabled(_ paramsData: Data) async throws -> RPCResponse {
+        let params = try decoder.decode(
+            ConfigSetGCHangStacksEnabledParams.self, from: paramsData)
+        try await db.config.setGCHangStacksEnabled(params.enabled)
         // Reuse the existing config-change channel so the app reloads Config.
         subscriptions.broadcast(delta: .modelProfilesChanged)
         return .ok()
@@ -437,6 +395,118 @@ extension RPCRouter {
         let params = try decoder.decode(
             ConfigSetPtyHolderEnabledParams.self, from: paramsData)
         try await db.config.setPtyHolderEnabled(params.enabled)
+        // Reuse the existing config-change channel so the app reloads Config.
+        subscriptions.broadcast(delta: .modelProfilesChanged)
+        return .ok()
+    }
+
+    /// Persist the transcript-composer gate — the default-off soak switch for
+    /// the composer, its completions probe, its attachment writes and its GC
+    /// leg. This is how the soak is turned on: the flag is the feature's only
+    /// opt-in, and leaving it reachable only by hand-editing `~/tbd/state.db`
+    /// would put the sole way to enable it behind a database the project's own
+    /// rules say not to go into.
+    ///
+    /// It takes effect on the daemon already running: the composer's handlers
+    /// read the column per request rather than at boot.
+    func handleConfigSetTranscriptComposerEnabled(
+        _ paramsData: Data
+    ) async throws -> RPCResponse {
+        let params = try decoder.decode(
+            ConfigSetTranscriptComposerEnabledParams.self, from: paramsData)
+        try await db.config.setTranscriptComposerEnabled(params.enabled)
+        // Reuse the existing config-change channel so the app reloads Config.
+        subscriptions.broadcast(delta: .modelProfilesChanged)
+        return .ok()
+    }
+
+    /// Persist the model-proxy gate — the default-off soak switch for routing a
+    /// pty-holder session's Messages API traffic through the loopback proxy.
+    /// This is how the soak is turned on: the flag is the feature's only opt-in,
+    /// and leaving it reachable only by hand-editing `~/tbd/state.db` would put
+    /// the sole way to enable it behind a database the project's own rules say
+    /// not to go into.
+    ///
+    /// **It applies to sessions created after the call, and to no others.** A
+    /// session's `ANTHROPIC_BASE_URL` is fixed in its environment at spawn, so
+    /// flipping this on never re-routes a running session and flipping it off
+    /// never un-routes one.
+    ///
+    /// The coupling — turning the proxy off also writes streaming off, in one
+    /// transaction — lives in `ConfigStore.setModelProxyEnabled`, not here, so
+    /// every caller of the store gets it, not only this RPC.
+    ///
+    /// **The supervisor follows the flag on the daemon already running**, which
+    /// is the half a column write cannot do: the boot path starts a supervisor
+    /// only when the flag was already on, so without this a user who turned the
+    /// proxy on would get routes minted against nothing until the next restart.
+    /// On the way off the supervisor starts **draining** rather than retiring
+    /// the proxy where it stands — see `beginDraining`. The sessions already
+    /// routed through it carry its port in their environment for the rest of
+    /// their lives, so cutting the proxy would break them mid-task rather than
+    /// merely un-routing them, and the help text above promises otherwise.
+    ///
+    /// Acted on the *written* value rather than on a flip computed from a
+    /// preceding read: both calls are idempotent (`startIfEnabled` returns
+    /// early on a supervisor already started, `beginDraining` on one that never
+    /// started), so a second call in the same direction changes nothing, and no
+    /// window opens between reading the old value and writing the new one.
+    ///
+    /// Both are awaited before this RPC answers, which is what makes the
+    /// Settings checkbox's response wait on them. Milliseconds normally, and
+    /// bounded in the worst case by the control client's 2-second probe plus
+    /// the spawner's 10-second bind budget — and, when a session is still
+    /// routed against the persisted port and something transient holds it, by
+    /// the supervisor's port wait of up to 30 seconds
+    /// (`ModelProxySupervisor.defaultPortRetryAttempts` ×
+    /// `defaultPortRetryInterval`), paid only in the case where minting a fresh
+    /// port would strand that session. Answering early would be worse than
+    /// the wait: the reply is what the app reloads its capabilities on, and a
+    /// reply that landed before the supervisor had a port would render the
+    /// toggle's own state wrong.
+    func handleConfigSetModelProxyEnabled(_ paramsData: Data) async throws -> RPCResponse {
+        let params = try decoder.decode(
+            ConfigSetModelProxyEnabledParams.self, from: paramsData)
+        try await db.config.setModelProxyEnabled(params.enabled)
+        if params.enabled {
+            await modelProxySupervisor?.startIfEnabled()
+        } else {
+            await modelProxySupervisor?.beginDraining()
+        }
+        // Reuse the existing config-change channel so the app reloads Config.
+        subscriptions.broadcast(delta: .modelProfilesChanged)
+        return .ok()
+    }
+
+    /// Persist the transcript-streaming gate — the default-off soak switch for
+    /// the transcript's provisional assistant row, read from the file the proxy
+    /// writes.
+    ///
+    /// **It applies to sessions created after the call**, for the same reason
+    /// the proxy gate does: only a session spawned with a route has a stream
+    /// file to read.
+    ///
+    /// The coupling — turning streaming on also writes the proxy on, in one
+    /// transaction — lives in `ConfigStore.setTranscriptStreamingEnabled`. What
+    /// readers act on is `Config.transcriptStreamingEffective`, the conjunction
+    /// of the two columns, because a hand-edited row can hold a combination no
+    /// gesture here can produce.
+    ///
+    /// Because turning streaming on turns the proxy on, this is also a way to
+    /// arm the supervisor, and it starts one for the same reason
+    /// `setModelProxyEnabled` does: a user who asked for the provisional row
+    /// and got no proxy would see a stream file that never appears. Turning
+    /// streaming **off** retires nothing — the proxy column is untouched by
+    /// that direction, and a route still routes.
+    func handleConfigSetTranscriptStreamingEnabled(
+        _ paramsData: Data
+    ) async throws -> RPCResponse {
+        let params = try decoder.decode(
+            ConfigSetTranscriptStreamingParams.self, from: paramsData)
+        try await db.config.setTranscriptStreamingEnabled(params.enabled)
+        if params.enabled {
+            await modelProxySupervisor?.startIfEnabled()
+        }
         // Reuse the existing config-change channel so the app reloads Config.
         subscriptions.broadcast(delta: .modelProfilesChanged)
         return .ok()

@@ -203,6 +203,7 @@ struct GeneralSettingsTab: View {
                 .help("When a turn dies on a transient API error (connection drop, server error, overload), TBD types \"continue\" after a backoff (60s, 2m, 5m, 10m) and gives up after 4 straight failures. Off by default. Auth and billing errors are never retried.")
                 Toggle("Live transcript pane", isOn: $enableTranscript)
                     .help("Show a chat-style live transcript pane for Claude sessions, following the session's conversation as it streams. On by default; turn it off to keep the pane out of new tabs.")
+                transcriptComposerToggle
                 Toggle("Show usage tooltip on Claude tabs", isOn: $showClaudeTabUsageTooltip)
                     .help("Show a hover card on Claude tabs with the session's account, profile, 5h/weekly usage, and spawn time.")
                 Picker("Usage reset times", selection: $usageResetTimeStyle) {
@@ -269,6 +270,8 @@ struct GeneralSettingsTab: View {
                     .help("Experimental: best-effort exit idle Claude instances when the machine is about to sleep, so a tmux server that dies during a long sleep has less to recover. Off by default — may interrupt long-running work.")
                 controlModeToggle
                 ptyHolderToggle
+                modelProxyToggle
+                transcriptStreamingToggle
                 hibernateInputVetoToggle
                 autoCloseSetupToggle
                 queuedPromptToggle
@@ -325,6 +328,62 @@ struct GeneralSettingsTab: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    /// Model-proxy opt-in. Reads the persisted flag from `daemon.capabilities`
+    /// and writes via `config.setModelProxyEnabled`. Stays enabled even when
+    /// the daemon reports `modelProxySupported == false`: turning the flag OFF
+    /// has to remain possible on a daemon that cannot start the proxy, which is
+    /// exactly the daemon an operator most wants to stop routing through.
+    @ViewBuilder
+    private var modelProxyToggle: some View {
+        let capabilities = appState.daemonCapabilities
+        Toggle("Route new sessions through the TBD model proxy", isOn: Binding(
+            get: { capabilities?.modelProxyEnabled ?? false },
+            set: { newValue in Task { await appState.setModelProxyEnabled(newValue) } }
+        ))
+        .help(AppState.modelProxyHelp)
+    }
+
+    /// Transcript-streaming opt-in, sitting under the proxy it depends on.
+    /// Reads the persisted flag from `daemon.capabilities` and writes via
+    /// `config.setTranscriptStreamingEnabled` — one write: turning this on also
+    /// turns the proxy on, and the daemon owns that coupling. Disabled with an
+    /// explanation when the daemon could not start a proxy, since the stream
+    /// file this renders is written by nothing else.
+    @ViewBuilder
+    private var transcriptStreamingToggle: some View {
+        let capabilities = appState.daemonCapabilities
+        let supported = capabilities?.modelProxySupported ?? false
+        Toggle("Stream assistant text into the transcript", isOn: Binding(
+            get: { capabilities?.transcriptStreamingEnabled ?? false },
+            set: { newValue in Task { await appState.setTranscriptStreamingEnabled(newValue) } }
+        ))
+        .help(AppState.transcriptStreamingHelp)
+        .disabled(!supported)
+        if !supported {
+            Text(AppState.transcriptStreamingUnsupportedCaption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Message-composer opt-in, shown beside the live-transcript toggle because
+    /// it is the transcript pane it appears in. Reads the persisted flag from
+    /// `daemon.capabilities` and writes via `config.setTranscriptComposerEnabled`.
+    /// Off by default (soaking). No `Supported` companion: unlike the pty-holder
+    /// gate there is no second runtime condition — a daemon that reports the
+    /// capability can serve every part of the feature.
+    @ViewBuilder
+    private var transcriptComposerToggle: some View {
+        let capabilities = appState.daemonCapabilities
+        Toggle("Message composer in the transcript pane", isOn: Binding(
+            get: { capabilities?.transcriptComposerEnabled ?? false },
+            set: { newValue in
+                Task { await appState.setTranscriptComposerEnabled(newValue) }
+            }
+        ))
+        .help(AppState.transcriptComposerHelp)
     }
 
     /// Ask for a first message when creating a worktree. Reads the persisted

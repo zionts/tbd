@@ -72,6 +72,50 @@ orphan profile dirs, ~2.9k fake worktrees and ~7,100 dead tmux sockets
 accumulated that way before anyone noticed. Read `swift test …` below
 as `scripts/test.sh …`.
 
+**Two of the things a run leaves behind are processes, and no amount of path
+fencing touches either.** A tmux server outlives the socket that named it, and a
+`TBDHolder` outlives the test process that spawned it *by design* — it calls
+`setsid()` and ignores `SIGHUP` so it can survive the daemon's death
+(`Sources/TBDHolder/Holder.swift`), which means it survives a dead test process
+just as well, re-parents to launchd, and keeps its job running. Nothing in the
+product reclaims a fixture's holder: `OrphanGC`'s rowless-holder collector
+enumerates the real `~/tbd/holders`, and `AgentReaper`'s holder leg works from
+`terminal` rows an in-memory fixture database never had. One measured instance
+ran for 24 hours with its job still looping. Three layers cover the three ways
+one can be left behind, and each covers exactly one:
+
+- **A teardown that runs** kills what its rows name, then sweeps the pids it
+  remembers — refusing any whose kernel start time no longer matches the one
+  recorded at spawn. That identity check is what makes remembering a pid safe:
+  a pid is free the instant its corpse is collected, and on this box the next
+  process to take it is somebody else's. It is the same answer `AgentReaper`
+  gives to the same question.
+- **A run that dies without reaching a teardown** leaves its rendezvous sockets
+  behind, and `cleanup` kills whoever `lsof` says owns each one before the
+  `rm -rf`. **By resource, never by pattern**: the socket path is unique to the
+  run, while a `pkill` on the holder's name would end live production holders
+  and other agents' sessions on the same machine. Note the ordering this
+  implies — a teardown that ran and removed its scratch root has taken the
+  socket with it, which is precisely why the layer above exists.
+- **A wrapper that is SIGKILLed**, where not even the EXIT trap runs, is
+  reclaimed by the *next* run: `reclaim_abandoned_run_roots` gives every sibling
+  `/tmp/tbd-test-home.*` that is both older than a day and has no live owner the
+  same two sweeps, then removes it. Every run being a sweep is what makes the
+  machine heal as soon as anybody tests again, with no timer and no daemon. It
+  is the named reconciler for fixture holders in the sense
+  `docs/specs/2026-08-15-named-reconciler-doctrine-design.md` means it.
+
+  **Age is not the whole discriminator, and the missing half is the dangerous
+  one.** No run lasts a day, so age says nobody is coming back — but a run that
+  WEDGES stops writing, so its root ages exactly like an abandoned one while its
+  holder, its tmux servers and its `TBD_HOME` are all still in use. So every run
+  claims its own root on the way in, writing its pid and that pid's kernel start
+  time into `<root>/.run-owner`, and the reconciler skips any root whose claim
+  still checks out. Same identity check as everywhere else here: a pid alone
+  would be a number the kernel is free to reissue. A root with no claim in it
+  predates the mechanism and is reclaimed on age — the one arm that is
+  deliberately not keep-biased, because immortal roots are the leak.
+
 The tmux leg is the one with no teardown remedy: **tmux never unlinks its
 socket file when a server exits.** It unlinks a stale socket lazily instead, at
 bind time, when a new server claims that exact path — and every test mints a
@@ -140,7 +184,7 @@ before trusting it: the home value has to be visible near the append, so a path
 built from a `home` that arrived as a parameter matches nothing. It narrows the
 shape rather than closing it.
 
-The wrapper's last layer, a before/after fingerprint of the four real
+The wrapper's last layer, a before/after fingerprint of the five real
 directories, is on when `$CI` is set and off otherwise; `--fingerprint` opts in
 locally and `--no-fingerprint` forces it off. The default follows the argument
 rather than contradicting it: a live daemon and sibling worktrees write to
@@ -154,9 +198,10 @@ Full rationale is in the wrapper's header.
 
 The wrapper's own guards are regression-tested by `scripts/test.test.sh`, which
 runs in the `lint` CI job: it drives the symlink and ownership refusals on the
-fake home, the post-run mode-000 recheck, the fingerprint's six arms (four
+fake home, the post-run mode-000 recheck, the fingerprint's seven arms (five
 roots, two of which are read twice), the tmux socket fence (its `sun_path`
-budget and its kill-server sweep) and the
+budget and its kill-server sweep), the holder sweep and the abandoned-run-root
+reconciler, and the
 shared-lock pin against fixture directories with a stub `swift`, so it takes
 ~11 s, builds nothing, and touches no real store. **Every case there is
 mutation-checked** — the assertion is shown going red against a deliberately
@@ -201,29 +246,39 @@ total wall time on green runs as well as red — a trivial test "takes" 16–29 
 because it is mostly suspended waiting for a turn. Population went 3013 → 4536
 in three weeks. Two consequences, both load-bearing.
 
-**The fast pass is two sequential steps in one job.** `test.yml` runs
-`--filter '^TBDDaemonTests\.'` then
-`--skip '^(TBDDaemonTests|TBDDaemonLiveTests)\.'`, sharing one build.
+**The fast pass is three sequential steps in one job.** `test.yml` runs
+`--filter '^TBDDaemonTests\.[A-O]'` (1a), then that filter's complement within
+the daemon target (1b), then
+`--skip '^(TBDDaemonTests|TBDDaemonLiveTests)\.'` (2), all sharing one build.
 Halving the in-flight population halves the tail: measured under induced load
 with arms interleaved, means over 5 iterations, p90 26.4 s → 14.6 s and p50
 8.8 s → 7.6 s, for **+26 s** of wall time (56 s → 82 s — the second invocation
 re-pays SPM's no-op build check and process startup). Quote that figure, not the
-+6 s a single iteration showed; it did not survive the other four. This is not
++6 s a single iteration showed; it did not survive the other four. Splitting the
+daemon target again pays that startup cost a third time and buys the same
+halving on the half where the tail actually lives. **Where the cut goes is
+measured, not guessed:** cut at `[A-L]` the two halves executed 1918 and 3703,
+which is a third and two thirds rather than a halving, so the cut moved to
+`[A-O]`. A local count of `@Test` attributed to the top-level suite that
+declares it predicted 1919 for that same cut, so use it — it is accurate to
+within a test — and re-cut from the counts CI prints whenever the halves drift
+apart again. This is not
 the "sharding across runners" that
 `docs/specs/2026-07-24-test-hardening-design.md` §1 rejected and §2 lists as a
 non-goal — that was about extra *jobs* paying the 5-concurrent-macOS-job cap and
-a second ~2 min build. **Step 2 is a complement, not an enumeration, and that
-is deliberate.** Two `--filter` lists would have reintroduced the hazard the
-spec's §3 names when it calls the target boundary "compiler-enforced, cannot
+a second ~2 min build. **Steps 1b and 2 are complements, not enumerations, and
+that is deliberate.** Three `--filter` lists would have reintroduced the hazard
+the spec's §3 names when it calls the target boundary "compiler-enforced, cannot
 silently zero-match like a `--filter` regex": `swift test --filter` exits GREEN
-on zero matches, so a new `TBDFooTests` named in neither list would run in
-**neither** pass with nothing going red — and the floors could not catch that,
-because adding a target reduces no existing step's count. Written as a
-complement, step 2 absorbs any new target automatically, and the three passes
-partition the package by construction. The per-step floors have a narrower job:
-catching a target that *is* named in one of these regexes collapsing or being
-renamed, where the regex would zero-match or over-skip its way to a green run
-of nothing. Keep them updated.
+on zero matches, so a new `TBDFooTests` named in no list would run in
+**no** pass with nothing going red — and the floors could not catch that,
+because adding a target reduces no existing step's count. Written as
+complements, 1b absorbs any daemon suite that falls outside `[A-O]` (including
+one renamed to start with a digit) and step 2 absorbs any new target, so the
+four passes partition the package by construction. The per-step floors have a
+narrower job: catching a target that *is* named in one of these regexes
+collapsing or being renamed, where the regex would zero-match or over-skip its
+way to a green run of nothing. Keep them updated.
 
 **Wall-clock handshake deadlines are hang-catchers sized against the population
 of the day.** `ciSafeDeadline` (`Tests/TBDDaemonTests/ControlModeTestSupport.swift`)
@@ -284,6 +339,20 @@ which advances for as long as the code keeps re-arming and fails with a named
 diagnostic carrying the advance count. Keep explicit single advances where the
 *number* of advances is the property under test.
 
+**`TestClock.advanceUntil` is for one-shot waits only, though — under the
+saturated fast pass it starves the very re-arm it is waiting for.** Its loop
+probes `checkSuspension()` every 25 ms, and each of those probes is a
+`megaYield`: twenty serially-awaited **background-QoS** tasks. Forty-five
+seconds of probing therefore floods the cooperative pool with exactly the
+low-priority work a re-arming poller needs a turn from.
+The field signature is a diagnostic reading **"observed 1 clock advance"** —
+the first tick landed, the second re-arm was never seen — and on 2026-09-08 it
+reddened `ModelProxySupervisorTests` on three consecutive dispatches of one
+SHA. So a **re-arming** loop belongs on `EventDrivenTestClock`
+instead, driven by an explicit ladder of `requireAdvanceWhenArmed` with a
+closing `requireSleeperArmed` — the re-arm being the proof that the tick before
+it finished. See "The event-driven alternative" below.
+
 On that basis, the deepest chains in the tree are the poller tests, and their
 paper tallies do not all fit under the ceiling:
 
@@ -328,6 +397,37 @@ child must outlive the limit), `GitManagerTimeoutTests` and
 "tidy" them back to `.clockDriven`; the residual — that 45 s makes two chained
 `waitForSuspension`s exceed 60 s — is acceptable only because none of those
 suites chains two and a healthy handshake there returns in milliseconds.
+
+**No bounded wait in a fast-pass target carries a literal deadline, and no
+fast-pass suite carries a hand-written `.timeLimit`.** A wait takes its deadline
+from `TestDeadlines` (`saturatedPass` as a `Duration`, `saturatedPassSeconds` as
+a `TimeInterval`), and a suite or test hang guard takes `.fastPassBounded` —
+which `.clockDriven` is an alias of, so there is one dial. The evidence is what
+the pass's own numbers say about a small number: on a **green** run, fast pass 1
+(`^TBDDaemonTests\.`, ~5200 tests) reported p50 65.6 s, p99 92.1 s and max
+95.5 s per test, and fast pass 2 (everything else, ~4800 tests) reported p90
+51.4 s and max 55.3 s — reported duration being almost entirely time suspended
+behind other runnable tests. So a 2–30 s hand-rolled wait sits an order of
+magnitude below the healthy latency of the very hop it is guarding, and a
+one-minute suite limit sits below pass 1's median and five seconds above pass
+2's maximum. Both fire on healthy runs, and both did. Three exceptions, and only
+these: a **negative-assertion window** ("nothing fires within X") is the
+assertion and is never lengthened; a **discriminating threshold** that decides
+between two diagnoses (`FileWatcherTests`' `attemptWindow`) is likewise the
+assertion; and a **gate's own self-release cap** takes `TestGate.deadline`,
+which is sized to dominate `saturatedPass` so the hold cannot expire mid-
+observation. Everything else — including a wait reached only through production
+code that hands its work to `Task.detached`, where `gateHoldingTask` cannot
+follow and only the bound is yours (see "Thread-blocking gates" below) — takes
+the shared constant.
+
+One more thing a reader should not have to mine a log for: the **"71 known
+issues" pass 1 reports on every run, and the 11 in pass 2, are deliberate
+self-tests wrapped in `withKnownIssue`, not hidden failures** — almost all of
+them `EventDrivenTestClockSelfTests` driving its own hang guards to their
+diagnostics, plus `BoundedGateWaitTests`' unsignalled gate,
+`FlakyQuarantineSelfTests.retriesUntilPass`, and pass 2's
+`AppStatePublishFrequencyTests` excess-publish records.
 
 Three remedies are already refuted; don't re-litigate them.
 
@@ -379,17 +479,50 @@ instead of leaving an anonymous job timeout. `BoundedGateWaitTests` reproduces
 the wedge on any machine by deriving its holder count from
 `activeProcessorCount`.
 
-**The preference stops at an unstructured task, and that changes the bound,
-not the call site.** SE-0417 carries a task executor preference into child
+**The preference stops at an unstructured task; what moves it is the callee,
+not the call site, and where the test does not own the callee only the bound
+is left.** SE-0417 carries a task executor preference into child
 tasks and default actors and *not* into `Task {}` or `Task.detached`. Several
 production seams hand their work to an unstructured task on purpose —
 `ShutdownLatch` does, so a cancelled signal handler cannot abandon a shutdown
 other callers await — and that work is then scheduled on the cooperative pool
 however the test started the call. It is not pinning a thread, and no
-`gateHoldingTask` can move it, so the only correct response is to bound a gate
-released from beyond such a hop at `TestDeadlines.saturatedPass` (90 s) and
-give the outer observation a strictly larger budget, so a genuinely lost
-handshake still reports before the wedge does. A snappier inner bound reports
+`gateHoldingTask` can move it. Where the test owns the callee, inject the
+executor into the callee instead: `ShutdownLatch(executor:)` and
+`ControlModeInputRouter(executor:)` are those seams, and
+`ServerShutdownLatchTests` and the two control-mode input suites build on
+`GateExecutor.shared` so their work leaves the shared queue altogether. The
+router's case shows the reach: its consumer is one unstructured task, but the
+preference carries from there into the `TmuxControlCommandClient` actor and the
+paste sends beyond it, so injecting at that single seam takes the whole
+delivery pipeline off the pass's queue. Each seam is pinned by a test that
+reads `Thread.current.name` from inside the moved work, so dropping the
+argument goes red instead of quietly returning to the pool.
+
+**What starves such a handshake is hop count, not priority.** Every task in a
+test pass runs at one priority: a test body, a `Task { }`, a `Task.detached { }`
+and a `gateHoldingTask { }` all read medium (21), measured on the 3-core CI
+runner and pinned by `TaskPriorityParityTests`
+(`Tests/TBDDaemonTests/TaskPriorityParityTests.swift`). So nothing in the pass
+is queued *behind higher-priority work* — the pool's queue is FIFO among the
+~5,000 tasks the pass keeps runnable, and one suspension hop costs the pass's
+own per-test latency: p50 65.6 s and p99 92.1 s on a green fast pass 1. A
+handshake that needs *k* hops therefore costs *k* × that, and the uninjected
+latch needs three or four — each caller starting, reaching the latch and
+awaiting the run; the run's own unstructured task starting; then every caller
+resuming. That is why CI measured 0 of 8 callers back after 90 s while the
+test's own polling task, already runnable, kept reporting on time: 90 s is one
+hop's worth of budget for a four-hop handshake. **A bound cannot buy a hop its
+turn** — sizing one to fit four hops taxes every healthy run, while injecting
+the executor removes the hops from the shared queue and costs nothing. (The one
+deliberate exception to the single priority is swift-clocks' `megaYield`, which
+creates background-QoS tasks on purpose; see "Clock and date seams".)
+
+Where the test reaches the hop through production code it does not construct —
+a server's `stop()` — the bound is all that is left: release a gate from beyond
+it at `TestDeadlines.saturatedPass` (90 s) and give the outer observation a
+strictly larger budget, so a genuinely lost handshake still reports before the
+wedge does. A snappier inner bound reports
 starvation the outer bound was sized to tolerate — which is exactly how
 `SocketServerSocketOwnershipTests` went red on a 30 s staging gate while every
 assertion in the test passed.
@@ -460,7 +593,7 @@ to cover it would turn a broken gate into silence.
 
 ## Assertion hygiene
 
-Four rules. Each traces to a real flake — provenance kept so the rule sticks.
+Five rules. Each traces to a real flake — provenance kept so the rule sticks.
 
 1. **Assert contracts, not incidents.** Prefer membership (`contains`) over
    `.last` or positional/ordering assertions unless ordering is the
@@ -513,6 +646,65 @@ Four rules. Each traces to a real flake — provenance kept so the rule sticks.
    Consequence for tooling: anything that reads a **CI summary** to extract
    diagnostics will not find them in the `#expect` form. (Readers of the full
    tee'd log are unaffected — the `↳` line is present there.)
+
+5. **Do not hand-write a bounded poll — call `pollUntilTrue`
+   (`Tests/TestSupport/BoundedPoll.swift`).** It is the only such loop in the
+   suite, and the reason it is the only one is that nine helpers wrote it
+   independently and between them got two things wrong. The rule below is what
+   it encodes; you need it to review a wait, not to write one.
+
+   **A bounded wait's verdict must come from a probe taken *after* the
+   deadline test — never from the loop's exit.** The loop shape everyone writes
+   tests the deadline before the condition:
+
+   ```swift
+   while ContinuousClock.now < deadline {
+       if condition() { return }
+       try? await Task.sleep(for: .milliseconds(5))
+   }
+   Issue.record(Timeout(...))          // WRONG: reports a sample up to `timeout` old
+   ```
+
+   `Task.sleep` is a floor, not a ceiling. When the resumption lands past the
+   deadline the loop exits having last looked at the top — possibly before the
+   task it is waiting on ever ran — and reports "never became true" about a
+   condition that has been true the whole time. Under the fast parallel pass
+   that is the *expected* path, not an exotic one: Swift Testing starts every
+   non-serialized test in one process with no concurrency cap, and mined CI
+   xUnit puts p50 per-test latency at 56-70 s against a 123-158 s pass, so a
+   5 ms step aside routinely returns its turn tens of seconds later. The verdict
+   has to be a fresh read:
+
+   ```swift
+   if condition() { return }
+   Issue.record(Timeout(...))
+   ```
+
+   Two corollaries the same flake earned. **Report elapsed, not just the
+   budget** — "still not true after 30.0 s" reads identically whether the wait
+   polled steadily or got one turn and came back 45 s later, and only the
+   second is a scheduling gap. And **`try?` around the poll sleep swallows
+   cancellation**, which throws instantly: without a `Task.isCancelled` check
+   the loop stops suspending and busy-spins its whole budget away on a
+   cooperative thread (measured: 33.7M condition reads in 30 s), then blames the
+   call site for a harness cancellation.
+
+   `pollUntilTrue` does all three, and returns `PollOutcome` rather than a
+   `Bool` so a caller cannot forget the third case: report a diagnostic on
+   `.timedOut` only. `.cancelled` means the harness ended the test, so a
+   non-throwing waiter returns silently and a throwing one rethrows
+   `CancellationError` — never a fabricated timeout, which would pin the failure
+   on an innocent call site. `advanceUntil` is the one wait that cannot delegate,
+   because it advances the clock rather than only reading it; it carries the
+   guard itself.
+
+   (Provenance: PR #716 attempts 1 and 2, where all nine `waitUntil` call sites
+   in `EventDrivenTestClockSelfTests` recorded a 30 s timeout while every
+   downstream assertion in those same tests passed — including two 50 ms hang
+   guards that would each have recorded a second issue had the handshake
+   genuinely been missing. **That contrast is the triage rule**: when a
+   handshake genuinely misses, the assertions after it fail too; when only the
+   wait fails and the rest of the test passes, the wait is lying.)
 
 Full rationale: `docs/specs/2026-07-24-test-hardening-design.md` §6.
 
@@ -724,10 +916,15 @@ Two shapes, also not interchangeable:
 Don't roll your own test clock wrapper, advance helper, `.timeLimit` default,
 or date box. This file is the whole shared surface:
 
-- `@Suite(.clockDriven)` — a four-minute time limit (Swift Testing expresses
-  limits in whole minutes, so that is the dial). A hang-catcher, not a perf
-  budget; sized against the wall-clock waits a clock-driven test can sit on in
-  the **fast parallel pass** — see "Population is the scheduler" above for the
+- `@Suite(.fastPassBounded)` — the one suite/test hang guard for the fast
+  parallel pass: a four-minute time limit (Swift Testing expresses limits in
+  whole minutes, so that is the dial). A hang-catcher, not a perf budget; its
+  value is derived from the pass's measured per-test latency, and every
+  fast-pass suite that needs a limit takes it unless the limit is itself the
+  regression detector.
+- `@Suite(.clockDriven)` — the same value under the name a clock-driven suite
+  wants at its call site, because there the hang being caught is a `TestClock`
+  sleep nobody advances. See "Population is the scheduler" above for the
   triple, its invariant, and the three tier-3 live suites that pin their own
   `.timeLimit` instead because their limit is a regression detector.
 - `await clock.advanceWhenSuspended(by:)` — the one you want by default.

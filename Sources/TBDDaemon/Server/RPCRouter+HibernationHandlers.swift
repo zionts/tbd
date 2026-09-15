@@ -8,17 +8,30 @@ extension RPCRouter {
     /// describe the same state differently. Always names
     /// `tbd terminal conversation`, which still reads a dead session's messages
     /// — context can be rebuilt before the terminal is closed.
+    ///
+    /// An empty `paneID` is a holder-backed row rather than a nameless pane:
+    /// those carry `tmuxPaneID == ""` by construction, and the classification
+    /// that produced this result asked the process table, not tmux. Naming "its
+    /// tmux pane ()" there would send a reader looking for a coordinate that
+    /// was never supposed to exist.
     static func unparkedWakeMessage(
         paneID: String, detail: UnparkedPaneDisagreement
     ) -> String {
+        let subject = paneID.isEmpty
+            ? "its holder-backed session"
+            : "its tmux pane (\(paneID))"
         let cause: String
         switch detail {
         case .paneMissing:
-            cause = "its tmux pane (\(paneID)) is gone"
+            cause = "\(subject) is gone"
         case .processExited:
-            cause = "its tmux pane (\(paneID)) is still there but its process has exited"
+            cause = paneID.isEmpty
+                ? "\(subject) has exited"
+                : "\(subject) is still there but its process has exited"
         case .paneBelongsToAnotherTerminal(let actual):
-            cause = "its pane coordinate (\(paneID)) now points at a different terminal (\(actual))"
+            cause = paneID.isEmpty
+                ? "\(subject) now belongs to a different terminal (\(actual))"
+                : "its pane coordinate (\(paneID)) now points at a different terminal (\(actual))"
         }
         return """
             TBD's row says this terminal is awake, but \(cause) — so nothing was woken and any \
@@ -56,6 +69,32 @@ extension RPCRouter {
         }
     }
 
+    /// The success payload for a wake outcome, or nil for an outcome that is an
+    /// RPC error rather than a result.
+    ///
+    /// Pure and static so the four rows that matter — woken with an id, woken
+    /// without one, and each idempotent no-op — are statable without a
+    /// coordinator, a database or a tmux server.
+    static func wakeResultPayload(for result: WakeResult) -> TerminalWakeResult? {
+        switch result {
+        case .ok(let incarnationID):
+            return TerminalWakeResult(woken: true, sessionIncarnationID: incarnationID)
+        case .notHibernated, .inFlight:
+            // Benign no-ops for an idempotent wake — `woken: false` so an
+            // autonomous caller knows its `prompt` was NOT delivered (the
+            // terminal is live; pasting into it now could hit a human session),
+            // and no incarnation, because no spawn happened to name.
+            return TerminalWakeResult(woken: false)
+        case .sessionGone, .notFound, .noSessionID, .respawnFailed, .worktreeMissing,
+            .profileMissing, .paneBusy:
+            // RPC errors, not results — the caller-facing switch in
+            // handleTerminalWake maps each to its own RPCResponse(error:).
+            // Named explicitly (not `default:`) so a new WakeResult case must
+            // be classified deliberately in BOTH switches.
+            return nil
+        }
+    }
+
     /// `terminal.wake` — respawn `claude --resume <id>` in the hibernated
     /// terminal's kept-alive window. Idempotent.
     func handleTerminalWake(
@@ -74,14 +113,10 @@ extension RPCRouter {
         await finishActuation(
             actuationID, ActuationOutcome.classify(result),
             error: ActuationOutcome.detail(result))
+        if let payload = Self.wakeResultPayload(for: result) {
+            return try RPCResponse(result: payload)
+        }
         switch result {
-        case .ok:
-            return try RPCResponse(result: TerminalWakeResult(woken: true))
-        case .notHibernated, .inFlight:
-            // Benign no-ops for an idempotent wake — but report woken: false so
-            // autonomous callers know their `prompt` was NOT delivered (the
-            // terminal is live; pasting into it now could hit a human session).
-            return try RPCResponse(result: TerminalWakeResult(woken: false))
         case .sessionGone(let paneID, let detail):
             // NOT a benign no-op: the row claims awake but its pane disagrees,
             // so there was nothing live to deliver `prompt` to. An error (not
@@ -104,8 +139,23 @@ extension RPCRouter {
             return RPCResponse(
                 error: "This session was pinned to an account profile (\(profileID.uuidString)) that no longer exists. It stays parked and resumable — wake it on your default account, or restore the profile and retry.",
                 code: RPCErrorCode.profileMissing.rawValue)
-        case .holderTransport:
-            return RPCResponse(error: HibernationCoordinator.holderTransportRefusal)
+        case .paneBusy(let pid):
+            return RPCResponse(error: HibernationCoordinator.paneBusyRefusal(pid: pid))
+        case .ok, .notHibernated, .inFlight:
+            // Unreachable: `wakeResultPayload` returns non-nil for exactly
+            // these three cases and this function already returned above.
+            // Kept explicit (rather than `default:`) so a new WakeResult case
+            // added later must be classified deliberately in BOTH switches.
+            //
+            // Fails SOFT rather than trapping. If the two switches ever drift
+            // apart, the caller gets an error naming the drift and the daemon —
+            // which is serving every other session on this machine — keeps
+            // running. A `preconditionFailure` here would take the whole fleet
+            // down over one wake.
+            return RPCResponse(
+                error: "terminal.wake produced an unclassified result (\(result)) — this is a "
+                    + "daemon bug: the wake may have happened. Re-read the terminal's state "
+                    + "before retrying.")
         }
     }
 

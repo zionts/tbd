@@ -2,9 +2,6 @@ import AppKit
 import SwiftUI
 import TBDShared
 import UniformTypeIdentifiers
-import os
-
-private let tabBarLogger = Logger(subsystem: "com.tbd.app", category: "tabBar")
 
 /// Transferable payload identifying a tab during drag/drop. App-only — never crosses the wire.
 struct TabDragPayload: Codable, Transferable {
@@ -520,13 +517,52 @@ enum TabParkMenuModel {
         case wake
     }
 
-    /// nil = show neither item (no terminal, non-Claude terminal, or a Claude
-    /// session that is mid-turn / waiting on a permission prompt).
-    static func action(for terminal: Terminal?) -> ParkAction? {
+    /// nil = show neither item (no terminal, non-Claude terminal, a Claude
+    /// session that is mid-turn / waiting on a permission prompt, or a holder
+    /// tab whose panel currently owns the pty).
+    static func action(
+        for terminal: Terminal?, panelHoldsPTY: Bool
+    ) -> ParkAction? {
         guard let terminal else { return nil }
-        if terminal.isManuallyHibernatable { return .hibernate }
+        if ManualParkAffordance.isOfferable(
+            terminal, panelHoldsPTY: panelHoldsPTY) { return .hibernate }
         if terminal.isParked { return .wake }
         return nil
+    }
+}
+
+/// Whether a manual "Hibernate now" may be *offered* for a terminal right now.
+///
+/// `Terminal.isManuallyHibernatable` answers whether the row is parkable in
+/// principle. This adds the one thing only the app knows: on the pty-holder
+/// transport the daemon's pending-input rail reads its OWN emulator, which is
+/// frozen for as long as a viewer holds the pty, so it fail-closes on any park
+/// asked for while a panel is attached. The app attaches a panel to every live
+/// tab, so an unconditional Hibernate item on a holder tab is an action that
+/// always errors — and an item that always errors is worse than no item.
+///
+/// The daemon's refusal stays as the backstop, because the two views of "is a
+/// viewer attached" can disagree for the width of an attach or detach RPC. What
+/// this removes is the *routine* failure, not the race.
+///
+/// **Why suppression rather than releasing the viewer first.** The orderly
+/// detach-and-handback lives in the panel coordinator's `cleanup()` path and is
+/// not reachable as a standalone awaitable step: it tears the attach down for
+/// good and nothing re-establishes one for a panel that stays on screen. A
+/// park that then refused — for unsent input, say — would leave a live tab
+/// showing a terminal nothing is driving.
+///
+/// The remedy is to stop holding the pty: close the tab, or let the panel be
+/// evicted from the viewer slots. Parking the worktree from the sidebar is
+/// **not** a way around this — that route fans out through the same daemon
+/// park, which fail-closes on the same attached viewer — so the app suppresses
+/// it for an attached holder row too, and the two surfaces stay honest with
+/// each other. What suppression costs the user is that one gesture; the
+/// alternative costs them the session's screen.
+enum ManualParkAffordance {
+    static func isOfferable(_ terminal: Terminal, panelHoldsPTY: Bool) -> Bool {
+        guard terminal.isManuallyHibernatable() else { return false }
+        return !(terminal.transport == .holder && panelHoldsPTY)
     }
 }
 
@@ -541,16 +577,10 @@ enum ContinueInCodexMenu {
 
 // MARK: - TabTerminalTarget
 
-/// Pure resolution of the terminal a tab is backed by: the anchor for the
-/// tab's deep link, and the target of "Copy Attach Command". A pane with no
-/// terminal behind it (webview, code viewer, note) resolves to nil — its deep
-/// link falls back to the worktree alone, and it offers no attach command at
-/// all, because there is no tmux window for an external emulator to attach to.
+/// Pure resolution of the terminal a tab is backed by: the anchor its deep
+/// link points at. A pane with no terminal behind it (webview, code viewer,
+/// note) resolves to nil, and its deep link falls back to the worktree alone.
 ///
-/// Nil *is* the menu's hide condition: `contextMenuContent` gates the "Copy
-/// Attach Command" button on `if let` over this call, so there is deliberately
-/// no boolean twin — a separate `showsAttachCommand` would be a second rule
-/// the tests could hold green while the menu's own drifted away from it.
 /// Extracted from the view so each branch is unit-testable without rendering
 /// SwiftUI (same pattern as `TabParkMenuModel` and `ContinueInCodexMenu`).
 enum TabTerminalTarget {
@@ -915,35 +945,6 @@ private struct TabBarItem: View {
             )
         }
 
-        // Attach an external emulator (iTerm2, Terminal.app, Ghostty) to this
-        // tab's tmux window. The daemon composes the command: only it can
-        // resolve the socket path from the environment that created the tmux
-        // server, and only it verifies the pane's identity before naming the
-        // window. Nothing reaches the pasteboard unless that whole round trip
-        // succeeds — a half-formed command pasted into another terminal fails
-        // far from its cause.
-        if let attachTerminalID = TabTerminalTarget.terminalID(for: tab.content) {
-            Button("Copy Attach Command") {
-                let targetWorktreeID = worktreeID
-                Task {
-                    do {
-                        let result = try await appState.daemonClient.terminalAttachCommand(
-                            worktreeID: targetWorktreeID,
-                            terminalID: attachTerminalID
-                        )
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(result.script, forType: .string)
-                    } catch {
-                        tabBarLogger.error(
-                            "terminal.attachCommand failed for terminal \(attachTerminalID, privacy: .public): \(error, privacy: .public)")
-                        appState.showAlert(
-                            "Couldn't copy the attach command: \(error.localizedDescription)",
-                            isError: true)
-                        appState.handleConnectionError(error)
-                    }
-                }
-            }
-        }
         Divider()
 
         if isClaudeTerminal {
@@ -980,7 +981,14 @@ private struct TabBarItem: View {
             // the worktree. A scheduled auto-resume can still be pending on a
             // live session that hit its limit, so keep the cancel affordance
             // here too (#341).
-            switch TabParkMenuModel.action(for: terminal) {
+            switch TabParkMenuModel.action(
+                for: terminal,
+                // This tab's own panel is exactly the viewer that would make
+                // the daemon fail the park closed — see `ManualParkAffordance`.
+                panelHoldsPTY: terminal.map {
+                    appState.terminalInjections.holdsPTY(terminalID: $0.id)
+                } ?? false
+            ) {
             case .hibernate:
                 Button {
                     guard let terminalID = terminal?.id else { return }

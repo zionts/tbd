@@ -52,12 +52,27 @@ private final class PathGate: @unchecked Sendable {
         return opened.contains(path)
     }
 
-    func wait(_ path: String, timeout: TimeInterval = 10) async {
+    /// Parks the caller until `open(path)` is called.
+    ///
+    /// The self-release cap must strictly dominate the `waitUntil` that
+    /// observes this hold, or the gate opens itself mid-observation and the
+    /// test measures nothing. `TestGate.deadline` is sized for exactly that
+    /// relationship against `TestDeadlines.saturatedPass` — see
+    /// `Tests/TestSupport/BoundedGateSupport.swift`.
+    ///
+    /// Giving up is also **loud**, because a gate that self-releases in silence
+    /// hands the test a cascade it believes is still held, and the
+    /// mis-attributed failure then lands on whatever the test asserted next.
+    /// Sizing keeps that unreachable on a healthy run; the diagnostic is what
+    /// makes it legible when the sizing is wrong.
+    func wait(_ path: String, timeout: Duration = TestGate.deadline,
+              sourceLocation: SourceLocation = #_sourceLocation) async {
         lock.withLock { entered.append(path) }
-        let deadline = Date().addingTimeInterval(timeout)
-        while !isOpen(path), Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(5))
-        }
+        guard case .timedOut = await pollUntilTrue(timeout: timeout, { isOpen(path) })
+        else { return }
+        Issue.record(
+            TestGateTimeout(gate: "PathGate(\(path))", after: timeout),
+            sourceLocation: sourceLocation)
     }
 }
 
@@ -76,17 +91,29 @@ private struct CascadeWaitTimeout: Error, CustomStringConvertible {
 @Suite("repo.remove cascade cleanup ordering")
 struct RepoRemoveCascadeTests {
 
+    /// The deadline is the shared saturated-pass budget rather than a literal:
+    /// what these wait for is produced by a detached task no test owns, which
+    /// SE-0417 leaves on the cooperative pool behind the whole fast pass — see
+    /// `gateHoldingTask` in `Tests/TestSupport/BoundedGateSupport.swift`.
     private func waitUntil(
-        _ what: String, timeout: TimeInterval = 10,
+        _ what: String, timeout: TimeInterval = TestDeadlines.saturatedPassSeconds,
         observed: @Sendable () async -> String = { "still false" },
         _ condition: @Sendable () async -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return }
-            try await Task.sleep(for: .milliseconds(10))
+        switch await pollUntilTrue(
+            timeout: .seconds(timeout), pollInterval: .milliseconds(10), condition
+        ) {
+        case .satisfied:
+            return
+        case .cancelled:
+            // A throwing waiter propagates cancellation rather than returning,
+            // which is what it did before this loop was shared. Returning would
+            // walk a cancelled test into the assertions that follow and pin the
+            // failure on them — the mis-attribution this file exists to remove.
+            throw CancellationError()
+        case .timedOut:
+            throw CascadeWaitTimeout(what: what, observed: await observed(), seconds: timeout)
         }
-        throw CascadeWaitTimeout(what: what, observed: await observed(), seconds: timeout)
     }
 
     /// Router sharing one `StateSubscriptionManager` with its lifecycle, with
@@ -106,7 +133,7 @@ struct RepoRemoveCascadeTests {
         var lifecycle = WorktreeLifecycle(
             db: db, git: GitManager(), tmux: TmuxManager(dryRun: true), hooks: HookResolver())
         if let gate {
-            lifecycle.onWorktreeRemoved = { path, _ in await gate.wait(path) }
+            lifecycle.onWorktreeRemoved = { _, path, _ in await gate.wait(path) }
         }
         let router = RPCRouter(
             db: db, lifecycle: lifecycle, tmux: TmuxManager(dryRun: true),

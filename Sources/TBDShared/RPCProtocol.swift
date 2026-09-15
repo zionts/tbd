@@ -143,7 +143,6 @@ public enum RPCMethod {
     public static let terminalCreate = "terminal.create"
     public static let terminalContinueInCodex = "terminal.continueInCodex"
     public static let terminalList = "terminal.list"
-    public static let terminalAttachCommand = "terminal.attachCommand"
     public static let terminalSend = "terminal.send"
     public static let terminalFocus = "terminal.focus"
     public static let terminalDelete = "terminal.delete"
@@ -253,6 +252,7 @@ public enum RPCMethod {
     public static let configSetScratchProfileOverride = "config.setScratchProfileOverride"
     public static let terminalHibernate = "terminal.hibernate"
     public static let terminalWake = "terminal.wake"
+    public static let terminalCompletions = "terminal.completions"
     public static let terminalSetKeepWarm = "terminal.setKeepWarm"
     public static let configSetAutoHibernate = "config.setAutoHibernate"
     public static let scratchCreate = "scratch.create"
@@ -296,9 +296,7 @@ public enum RPCMethod {
     public static let configSetGCEnabled = "config.setGCEnabled"
     public static let configSetGCProfileDirsEnabled = "config.setGCProfileDirsEnabled"
     public static let configSetGCOrphanProcessesEnabled = "config.setGCOrphanProcessesEnabled"
-    public static let configSetGCHolderRendezvousEnabled = "config.setGCHolderRendezvousEnabled"
-    public static let configSetGCRowlessHoldersEnabled = "config.setGCRowlessHoldersEnabled"
-    public static let configSetReapHolderChildrenEnabled = "config.setReapHolderChildrenEnabled"
+    public static let configSetGCHangStacksEnabled = "config.setGCHangStacksEnabled"
     /// The retained-transcript GC gate (`gc_retained_transcripts_enabled`) —
     /// the soak switch on the `OrphanGC` leg that unlinks retained transcripts
     /// nobody references and drops receipts whose expiry has passed. Reading
@@ -310,7 +308,6 @@ public enum RPCMethod {
     /// opt-in, and the supported way to turn the soak on. Reading needs no
     /// method of its own: `config.get` already carries the resolved value.
     public static let configSetRemoteDeleteEnabled = "config.setRemoteDeleteEnabled"
-    public static let configSetHolderRowReconcileEnabled = "config.setHolderRowReconcileEnabled"
     public static let remoteProviders = "remote.providers"
     public static let remoteSessions = "remote.sessions"
     public static let remoteCreate = "remote.create"
@@ -386,6 +383,23 @@ public enum RPCMethod {
     /// opt-in. Reading needs no method of its own: `config.get` already carries
     /// the resolved value.
     public static let configSetPtyHolderEnabled = "config.setPtyHolderEnabled"
+    /// The transcript-composer gate (`transcript_composer_enabled`) — the
+    /// feature's only opt-in. Reading needs no method of its own: `config.get`
+    /// already carries the resolved value.
+    public static let configSetTranscriptComposerEnabled = "config.setTranscriptComposerEnabled"
+    /// The model-proxy gate (`model_proxy_enabled`) — whether a new pty-holder
+    /// session's Messages API traffic is routed through the loopback proxy.
+    /// Reading needs no method of its own: `config.get` carries the resolved
+    /// value and `daemon.capabilities` carries it beside the supported/port
+    /// facts that explain a greyed-out toggle.
+    public static let configSetModelProxyEnabled = "config.setModelProxyEnabled"
+    /// The transcript-streaming gate (`transcript_streaming_enabled`) — whether
+    /// the transcript renders a provisional assistant row from the proxy's
+    /// stream file. Coupled to `configSetModelProxyEnabled`: streaming on turns
+    /// the proxy on, and the proxy off turns streaming off. Reading needs no
+    /// method of its own, for the same reason.
+    public static let configSetTranscriptStreamingEnabled =
+        "config.setTranscriptStreamingEnabled"
     /// The update mode (`update_mode`) — `off`, `check` or `auto`. The one
     /// policy the daemon holds about updating itself. Reading needs no method
     /// of its own: `config.get` and `daemon.capabilities` both carry the
@@ -1876,6 +1890,47 @@ public struct ConfigSetPtyHolderEnabledParams: Codable, Sendable {
     public init(enabled: Bool) { self.enabled = enabled }
 }
 
+/// Params for `config.setTranscriptComposerEnabled` — the composer gate (default
+/// OFF during soak). Writing either value is the explicit gesture that lifts the
+/// column out of its NULL "never chose" state, so an operator who turns the
+/// feature off stays off when the shipped default graduates.
+public struct ConfigSetTranscriptComposerEnabledParams: Codable, Sendable {
+    public let enabled: Bool
+    public init(enabled: Bool) { self.enabled = enabled }
+}
+
+/// Params for `config.setModelProxyEnabled` — the model-proxy gate (default OFF
+/// during soak), which decides whether a *new* pty-holder session is spawned
+/// with its Messages API base URL pointed at the loopback proxy. Writing either
+/// value is the explicit gesture that lifts the column out of its NULL "never
+/// chose" state, so an operator who turns the feature off stays off when the
+/// shipped default graduates.
+///
+/// Turning it off also writes `transcript_streaming_enabled` off — the daemon
+/// does that in one transaction, because the provisional transcript row reads a
+/// file only the proxy writes.
+public struct ConfigSetModelProxyEnabledParams: Codable, Sendable {
+    public let enabled: Bool
+    public init(enabled: Bool) { self.enabled = enabled }
+}
+
+/// Params for `config.setTranscriptStreamingEnabled` — the transcript-streaming
+/// gate (default OFF during soak), which decides whether the transcript renders
+/// a provisional assistant row from the proxy's stream file. Writing either
+/// value is the explicit gesture that lifts the column out of its NULL "never
+/// chose" state.
+///
+/// Turning it on also writes `model_proxy_enabled` on — the file it reads does
+/// not exist without the proxy, so asking for streaming is asking for both.
+///
+/// Named without the method's trailing `Enabled`: the symmetrical
+/// `ConfigSetTranscriptStreamingEnabledParams` is 41 characters and SwiftLint's
+/// `type_name` rule caps the length at 40.
+public struct ConfigSetTranscriptStreamingParams: Codable, Sendable {
+    public let enabled: Bool
+    public init(enabled: Bool) { self.enabled = enabled }
+}
+
 /// Params for `config.setUpdateMode`. A named mode rather than a Bool: the
 /// setting has three states, and the middle one — observe but do not install —
 /// is the one an operator soaks in.
@@ -2304,65 +2359,6 @@ public struct TerminalListParams: Codable, Sendable {
     public init(worktreeID: UUID? = nil) { self.worktreeID = worktreeID }
 }
 
-/// Params for `terminal.attachCommand`: compose the shell command that attaches
-/// an external terminal emulator to this terminal's tmux window.
-///
-/// Both ids are required. The worktree names the tmux server, the terminal
-/// names the window — and the daemon refuses a pair that disagrees rather than
-/// composing a command aimed at a window on another repo's server.
-public struct TerminalAttachCommandParams: Codable, Sendable {
-    public let worktreeID: UUID
-    public let terminalID: UUID
-    public init(worktreeID: UUID, terminalID: UUID) {
-        self.worktreeID = worktreeID
-        self.terminalID = terminalID
-    }
-}
-
-/// Result for `terminal.attachCommand`: the rendered script plus every
-/// coordinate that went into it.
-///
-/// The coordinates are carried alongside the script deliberately. The sharper
-/// instrument for the byte-burst question this feature serves is
-/// `tmux pipe-pane -o`, which needs a pane id and a socket path and attaches no
-/// client at all — so a caller can drive that instead of pasting the script,
-/// and neither has to re-derive values the daemon already resolved.
-public struct TerminalAttachCommandResult: Codable, Sendable, Equatable {
-    /// Absolute path to the tmux server's socket. Pinned with `-S` rather than
-    /// named with `-L` so a shell holding a different `TMUX_TMPDIR` cannot
-    /// resolve it to a fresh, empty server.
-    public let socketPath: String
-    /// The `tbd-ext-<tid8>` session the script creates or reuses.
-    public let sessionName: String
-    /// The terminal's stable `@N` tmux window id — never a window index.
-    public let windowID: String
-    /// The `%N` pane id **the identity probe answered for**, not a separately
-    /// resolved value: a second resolution that could disagree with the
-    /// verified one is how reused pane coordinates previously sent keystrokes
-    /// into an unrelated live session (issue #384).
-    public let paneID: String
-    public let terminalID: UUID
-    /// The shell snippet, with every interpolated value single-quoted. No
-    /// trailing newline — a caller printing it adds one.
-    public let script: String
-
-    public init(
-        socketPath: String,
-        sessionName: String,
-        windowID: String,
-        paneID: String,
-        terminalID: UUID,
-        script: String
-    ) {
-        self.socketPath = socketPath
-        self.sessionName = sessionName
-        self.windowID = windowID
-        self.paneID = paneID
-        self.terminalID = terminalID
-        self.script = script
-    }
-}
-
 /// Which terminals `session.states` should report on. Absent `worktreeID` means
 /// the whole fleet — the ordinary call, since the point of the method is asking
 /// about every agent every cycle.
@@ -2381,6 +2377,81 @@ public struct SessionStatesResult: Codable, Sendable {
     public init(reports: [SessionStateReport]) { self.reports = reports }
 }
 
+/// One piece of a composed message.
+///
+/// The composer splits its text at image tokens into an ordered list, and the
+/// daemon delivers each piece as its own bracketed paste. The split exists
+/// because of a measured property of Claude Code's paste handler: it turns a
+/// paste into an image attachment only when the WHOLE paste is one quoted path
+/// with an image extension. Measured on 2.1.261 — a bare quoted path pasted
+/// alone became a base64 image block in the user message, while the same path
+/// inside a sentence, and any path given as a command-line argument, stayed
+/// literal text. Pasting the parts in order reproduces what drag-and-drop
+/// produces: an `[Image #N]` placeholder at the caret between the words around
+/// it.
+///
+/// A tagged object rather than a bare string, deliberately. A reader has to be
+/// able to tell an image path from a sentence that happens to look like one, and
+/// a third kind later must not change the JSON type of a field that already
+/// exists.
+public enum SendPart: Codable, Sendable, Equatable {
+    /// Pasted as text.
+    case text(String)
+    /// Pasted as the bare quoted absolute path and nothing else.
+    case imagePath(String)
+
+    private enum CodingKeys: String, CodingKey { case kind, value }
+    private enum Kind: String, Codable { case text, imagePath }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let value = try c.decode(String.self, forKey: .value)
+        switch try c.decode(Kind.self, forKey: .kind) {
+        case .text: self = .text(value)
+        case .imagePath: self = .imagePath(value)
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .text(let value):
+            try c.encode(Kind.text, forKey: .kind)
+            try c.encode(value, forKey: .value)
+        case .imagePath(let value):
+            try c.encode(Kind.imagePath, forKey: .kind)
+            try c.encode(value, forKey: .value)
+        }
+    }
+}
+
+/// Whether a send carries the `<tbd-dispatch/>` line ahead of its body.
+///
+/// **Asking for suppression is not the same as getting it, and this field is the
+/// asking.** The daemon honors `.suppressed` only on a connection it has already
+/// authenticated as the app's — the peer pid the kernel reports for the socket,
+/// matched against the pid the FD-vending sidecar recorded for its current
+/// client and then re-verified through the daemon's one start-time and
+/// command-line check. It does **not** read the request's declared actor, which
+/// is an ambient self-declaration any local process can stamp.
+///
+/// The envelope is how an agent-to-agent dispatch stays attributed inside the
+/// receiving session. A suppression switch any caller could throw would let any
+/// agent inject unattributed text, which is the one property the envelope exists
+/// to provide.
+public enum EnvelopeDisposition: String, Codable, Sendable {
+    case attached
+    case suppressed
+
+    /// An unknown disposition from a newer client is as unusable as an absent
+    /// one, and must not fail the whole payload's decode: it resolves to the
+    /// conservative reading, which is to attach.
+    public init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = EnvelopeDisposition(rawValue: raw) ?? .attached
+    }
+}
+
 /// One `terminal.send` request. Exactly one payload kind per call — `text` or
 /// `keys`, never both and never neither (design §3, "Payloads, not verbs").
 ///
@@ -2397,7 +2468,7 @@ public struct TerminalSendParams: Codable, Sendable {
     /// An empty string keeps its existing meaning: nothing is pasted, and a
     /// bare `--submit` still presses Enter.
     public let text: String?
-    /// Whitespace-separated tmux key names — `"Escape"`, `"C-c"`,
+    /// Whitespace-separated key names — `"Escape"`, `"C-c"`,
     /// `"Escape Enter"` — sent one at a time, paced. Mutually exclusive with
     /// `text`. Carries no envelope (a key sequence has nowhere to put a line of
     /// text) and cannot be verified (keys reach no transcript).
@@ -2410,15 +2481,39 @@ public struct TerminalSendParams: Codable, Sendable {
     /// transcript) and is incompatible with `keys`. Refused, never silently
     /// downgraded, while `delivery_verification_enabled` is off.
     public let verify: Bool?
+    /// An ordered list of pieces, delivered one bracketed paste each, then one
+    /// Enter. Mutually exclusive with both `text` and `keys`; empty text parts
+    /// are skipped. Absent on every request written before the composer existed,
+    /// which is what makes this additive.
+    public let parts: [SendPart]?
+    /// Whether the `<tbd-dispatch/>` envelope rides ahead of the body. Absent
+    /// means `.attached`, which is what every existing caller gets. Suppression
+    /// is a REQUEST, honored only on a connection the daemon has authenticated
+    /// as the app's — never on the strength of this field or of the declared
+    /// actor. See `EnvelopeDisposition`.
+    public let envelope: EnvelopeDisposition?
+    /// Opt in to the awaiting-input gate: refuse this send when the session has a
+    /// prompt on screen or an unrecognized awaiting-input reason.
+    ///
+    /// **Opt-in rather than daemon-wide, deliberately.** Agents use this verb to
+    /// answer permission dialogs on purpose, and a blanket gate would refuse
+    /// exactly those sends. The composer always opts in; existing CLI sends do
+    /// not, and absent means not gated.
+    public let gateOnAwaitingInput: Bool?
     public init(
         terminalID: UUID, text: String? = nil, keys: String? = nil,
-        submit: Bool? = nil, verify: Bool? = nil
+        submit: Bool? = nil, verify: Bool? = nil,
+        parts: [SendPart]? = nil, envelope: EnvelopeDisposition? = nil,
+        gateOnAwaitingInput: Bool? = nil
     ) {
         self.terminalID = terminalID
         self.text = text
         self.keys = keys
         self.submit = submit
         self.verify = verify
+        self.parts = parts
+        self.envelope = envelope
+        self.gateOnAwaitingInput = gateOnAwaitingInput
     }
 }
 
@@ -2667,7 +2762,130 @@ public struct TerminalWakeResult: Codable, Sendable {
     /// false — idempotent no-op (already awake, or another wake in flight).
     /// A `prompt` param is delivered only when true.
     public let woken: Bool
-    public init(woken: Bool) { self.woken = woken }
+    /// The session incarnation this respawn minted, planted in the spawned
+    /// process's environment as `TBD_TERMINAL_INCARNATION_ID` and echoed back on
+    /// that process's hooks.
+    ///
+    /// Populated **only** on the `woken: true` path, where a spawn actually
+    /// happened. Nil on every no-op, because there is no spawn to name — and a
+    /// caller that scoped a wait to this id would otherwise wait on somebody
+    /// else's session.
+    ///
+    /// Optional for wire compatibility in both directions: an older daemon sends
+    /// no field, and a caller that does not know about one ignores it.
+    public let sessionIncarnationID: UUID?
+    public init(woken: Bool, sessionIncarnationID: UUID? = nil) {
+        self.woken = woken
+        self.sessionIncarnationID = sessionIncarnationID
+    }
+}
+
+/// Params for `terminal.completions` — what slash commands, skills and subagents
+/// this terminal's Claude session knows about.
+///
+/// A terminal id and nothing else: the daemon already holds that session's
+/// profile config directory, spawn environment, working directory and child pid,
+/// and the app does not link the daemon library. Asking the app to supply any of
+/// them would move a daemon fact into a client that would then get it wrong.
+public struct TerminalCompletionsParams: Codable, Sendable, Equatable {
+    public let terminalID: UUID
+    public init(terminalID: UUID) { self.terminalID = terminalID }
+}
+
+/// One completable command, skill or plugin item, as the composer's menu shows
+/// it.
+///
+/// Named the way Claude Code's own control protocol names them — the probe's
+/// `initialize` response returns `name`, `description`, `argumentHint` and an
+/// optional `aliases` — so nothing has to be translated on the way through, and
+/// the filesystem scan fills the same shape from frontmatter.
+public struct CompletionCommand: Codable, Sendable, Equatable {
+    /// Fully qualified, including any `plugin:name` namespace, exactly as the
+    /// user must type it.
+    public let name: String
+    /// The one-line description the menu row shows. May be empty.
+    public let description: String
+    /// What arguments the command takes, shown as an inline placeholder once a
+    /// space follows the token. Absent for a command that takes none.
+    public let argumentHint: String?
+    /// Alternate names that select the same command. Empty rather than nil so
+    /// every consumer iterates one shape.
+    public let aliases: [String]
+
+    public init(
+        name: String, description: String,
+        argumentHint: String? = nil, aliases: [String] = []
+    ) {
+        self.name = name
+        self.description = description
+        self.argumentHint = argumentHint
+        self.aliases = aliases
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        argumentHint = try c.decodeIfPresent(String.self, forKey: .argumentHint)
+        aliases = try c.decodeIfPresent([String].self, forKey: .aliases) ?? []
+    }
+}
+
+/// One subagent, offered under the at-sign.
+public struct CompletionAgent: Codable, Sendable, Equatable {
+    public let name: String
+    public let description: String
+    public init(name: String, description: String) {
+        self.name = name
+        self.description = description
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+    }
+}
+
+/// How current the inventory is.
+///
+/// Reported so a caller can tell a served cache from a re-probe, and a probe
+/// from the degraded answer — never so the UI can render three different menus.
+/// The app treats every shape identically.
+public enum CompletionFreshness: String, Codable, Sendable {
+    /// Produced by this request.
+    case fresh
+    /// Served from cache; the fingerprint said nothing had changed.
+    case stale
+    /// The probe failed or timed out and the filesystem scan answered instead.
+    case fallback
+}
+
+/// Which mechanism produced the inventory.
+public enum CompletionSource: String, Codable, Sendable {
+    /// The session's own Claude Code answered an `initialize` control request.
+    case probe
+    /// A filesystem scan of the same directories. Lists everything except
+    /// built-ins, because only the binary knows those.
+    case scan
+}
+
+/// Result of `terminal.completions`.
+public struct TerminalCompletionsResult: Codable, Sendable, Equatable {
+    public let commands: [CompletionCommand]
+    public let agents: [CompletionAgent]
+    public let freshness: CompletionFreshness
+    public let source: CompletionSource
+
+    public init(
+        commands: [CompletionCommand], agents: [CompletionAgent],
+        freshness: CompletionFreshness, source: CompletionSource
+    ) {
+        self.commands = commands
+        self.agents = agents
+        self.freshness = freshness
+        self.source = source
+    }
 }
 
 /// Params for `terminal.setKeepWarm` — pin/unpin a terminal against
@@ -3198,37 +3416,6 @@ public struct ConfigSetGCProfileDirsEnabledParams: Codable, Sendable {
     public init(enabled: Bool) { self.enabled = enabled }
 }
 
-/// Params for `config.setGCHolderRendezvousEnabled` — the gate for the sweep
-/// that unlinks holder rendezvous files (socket, lock, log) whose holder is
-/// gone (default OFF during soak, on top of the GC master switch). Design:
-/// `docs/specs/2026-08-30-pty-holder-session-transport-design.md`.
-public struct ConfigSetGCHolderRendezvousEnabledParams: Codable, Sendable {
-    public var enabled: Bool
-    public init(enabled: Bool) { self.enabled = enabled }
-}
-
-/// Params for `config.setGCRowlessHoldersEnabled` — the gate for the sweep that
-/// **kills** a pty holder this installation owns which no session row claims
-/// (default OFF during soak, on top of the GC master switch). A separate opt-in
-/// from the rendezvous-file sweep because it signals processes rather than
-/// unlinking files. Design:
-/// `docs/specs/2026-08-30-pty-holder-session-transport-design.md`.
-public struct ConfigSetGCRowlessHoldersEnabledParams: Codable, Sendable {
-    public var enabled: Bool
-    public init(enabled: Bool) { self.enabled = enabled }
-}
-
-/// Params for `config.setReapHolderChildrenEnabled` — the gate on the
-/// `AgentReaper` leg that kills the surviving job of a dead pty holder (default
-/// OFF during soak). This is how the soak is turned on: the leg signals
-/// processes without a user gesture, so leaving it reachable only by editing
-/// the database by hand would make it un-soakable. Design:
-/// `docs/specs/2026-08-30-pty-holder-session-transport-design.md`.
-public struct ConfigSetReapHolderChildrenEnabledParams: Codable, Sendable {
-    public var enabled: Bool
-    public init(enabled: Bool) { self.enabled = enabled }
-}
-
 /// Params for `config.setGCRetainedTranscriptsEnabled` — the gate on the
 /// `OrphanGC` leg that reclaims retained-transcript residue: files under
 /// `~/tbd/transcripts/` that no row references, and rows whose `expires_at` has
@@ -3252,22 +3439,22 @@ public struct ConfigSetRemoteDeleteEnabledParams: Codable, Sendable {
     public init(enabled: Bool) { self.enabled = enabled }
 }
 
-/// Params for `config.setHolderRowReconcileEnabled` — the gate on the reconcile
-/// arm that judges holder-backed session rows and deletes the ones nothing can
-/// reach any more (default OFF during soak). This is how the soak is turned on:
-/// the arm destroys database rows without a user gesture, so leaving it
-/// reachable only by editing the database by hand would make it un-soakable.
-/// Design: `docs/specs/2026-08-30-pty-holder-session-transport-design.md`.
-public struct ConfigSetHolderRowReconcileEnabledParams: Codable, Sendable {
-    public var enabled: Bool
-    public init(enabled: Bool) { self.enabled = enabled }
-}
-
 /// Params for `config.setGCOrphanProcessesEnabled` — the gate for the
 /// orphaned-process collector, which reclaims processes that outlived the
 /// worktree they were rooted in (default OFF during soak, on top of the GC
 /// master switch). Design: `docs/specs/2026-08-18-orphan-process-gc-design.md`.
 public struct ConfigSetGCOrphanProcessesEnabledParams: Codable, Sendable {
+    public var enabled: Bool
+    public init(enabled: Bool) { self.enabled = enabled }
+}
+
+/// Params for `config.setGCHangStacksEnabled` — the gate for the hang-stack
+/// reclaimer, which bounds `~/Library/Logs/TBD/hang-stacks/` by age and by
+/// count (default OFF during soak, on top of the GC master switch). The same
+/// flag also governs the app-side write-time cap, so one switch answers "is the
+/// reclaimer on?". Design:
+/// `docs/specs/2026-08-29-hang-stack-reclaimer-design.md`.
+public struct ConfigSetGCHangStacksEnabledParams: Codable, Sendable {
     public var enabled: Bool
     public init(enabled: Bool) { self.enabled = enabled }
 }
@@ -3571,6 +3758,45 @@ public struct DaemonCapabilitiesResult: Codable, Sendable {
     /// tmux — so Settings disables the toggle and says why rather than offering
     /// a switch that would change nothing.
     public let ptyHolderSupported: Bool
+    /// Whether the live transcript's message composer is enabled
+    /// (`transcript_composer_enabled`). Default OFF while it soaks. The app gates
+    /// the whole composer — the field, the completions request, attachment
+    /// writes — on this, so with it false the transcript pane behaves exactly as
+    /// it did before. Resolved through `Config.transcriptComposerEnabledDefault`,
+    /// so an install that never touched the toggle reports the shipped default.
+    public let transcriptComposerEnabled: Bool
+    /// Whether the model-proxy gate (`model_proxy_enabled`) is set. Default OFF
+    /// while it soaks. Read at spawn time, so the Settings toggle reads it back
+    /// from here rather than from a local guess — and a session already running
+    /// keeps the base URL fixed in its environment either way.
+    ///
+    /// `var` rather than `let` deliberately: this type's memberwise initializer
+    /// is at the type-checker's expression budget, so a caller may have to
+    /// construct with the older arguments and assign the newer fields after.
+    public var modelProxyEnabled: Bool
+    /// Whether this daemon could actually route a session through a proxy — a
+    /// live supervisor with a bound port. Computed daemon-side, exactly as
+    /// `ptyHolderSupported` is, so the app never probes loopback itself.
+    ///
+    /// With the flag on and this false, every spawn proceeds unproxied — so
+    /// Settings disables the streaming toggle and says why rather than offering
+    /// a switch that would change nothing.
+    public var modelProxySupported: Bool
+    /// The loopback port the proxy is listening on, or nil when there is none.
+    /// Diagnostic: it is what Settings shows so an operator can curl the
+    /// proxy's own `/tbd/status` without going into `~/tbd/state.db`.
+    public var modelProxyPort: Int?
+    /// The running proxy's build version, or nil when there is none. The
+    /// supervisor retires a proxy whose version differs from the daemon's own
+    /// binary, so a value here that disagrees with the app's version is the
+    /// visible form of "a retire is due".
+    public var modelProxyVersion: String?
+    /// Whether transcript streaming is effective — the *conjunction* of
+    /// `transcript_streaming_enabled` and `model_proxy_enabled`, resolved
+    /// daemon-side. A hand-edited row holding streaming on with the proxy off
+    /// streams nothing, and this field says so rather than making the app
+    /// re-derive the pair.
+    public var transcriptStreamingEnabled: Bool
 
     public init(controlModeEnabled: Bool,
                 tmuxVersion: String? = nil,
@@ -3588,7 +3814,13 @@ public struct DaemonCapabilitiesResult: Codable, Sendable {
                 remoteDeleteEnabled: Bool = Config.remoteDeleteEnabledDefault,
                 updateMode: UpdateMode = Config.updateModeDefault,
                 ptyHolderEnabled: Bool = Config.ptyHolderDefault,
-                ptyHolderSupported: Bool = false) {
+                ptyHolderSupported: Bool = false,
+                transcriptComposerEnabled: Bool = Config.transcriptComposerEnabledDefault,
+                modelProxyEnabled: Bool = Config.modelProxyDefault,
+                modelProxySupported: Bool = false,
+                modelProxyPort: Int? = nil,
+                modelProxyVersion: String? = nil,
+                transcriptStreamingEnabled: Bool = Config.transcriptStreamingDefault) {
         self.controlModeEnabled = controlModeEnabled
         self.tmuxVersion = tmuxVersion
         self.controlModeSupported = controlModeSupported
@@ -3606,6 +3838,12 @@ public struct DaemonCapabilitiesResult: Codable, Sendable {
         self.updateMode = updateMode
         self.ptyHolderEnabled = ptyHolderEnabled
         self.ptyHolderSupported = ptyHolderSupported
+        self.transcriptComposerEnabled = transcriptComposerEnabled
+        self.modelProxyEnabled = modelProxyEnabled
+        self.modelProxySupported = modelProxySupported
+        self.modelProxyPort = modelProxyPort
+        self.modelProxyVersion = modelProxyVersion
+        self.transcriptStreamingEnabled = transcriptStreamingEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -3664,6 +3902,27 @@ public struct DaemonCapabilitiesResult: Codable, Sendable {
             Bool.self, forKey: .ptyHolderEnabled) ?? Config.ptyHolderDefault
         ptyHolderSupported = try c.decodeIfPresent(
             Bool.self, forKey: .ptyHolderSupported) ?? false
+        // New field for the composer gate. A daemon that does not send it has no
+        // `terminal.completions` either, so fall through to the shipped default
+        // rather than showing a composer nothing can serve.
+        transcriptComposerEnabled = try c.decodeIfPresent(
+            Bool.self, forKey: .transcriptComposerEnabled)
+            ?? Config.transcriptComposerEnabledDefault
+        // New fields for the model proxy. A daemon that does not send
+        // `modelProxyEnabled` runs no proxy at all, so fall through to the
+        // shipped defaults rather than assuming the route is live. `supported`,
+        // `port` and `version` are facts about THIS daemon's running proxy, so
+        // absent values are honestly false/nil — which greys the toggles out on
+        // an older daemon instead of offering switches it would ignore.
+        modelProxyEnabled = try c.decodeIfPresent(
+            Bool.self, forKey: .modelProxyEnabled) ?? Config.modelProxyDefault
+        modelProxySupported = try c.decodeIfPresent(
+            Bool.self, forKey: .modelProxySupported) ?? false
+        modelProxyPort = try c.decodeIfPresent(Int.self, forKey: .modelProxyPort)
+        modelProxyVersion = try c.decodeIfPresent(String.self, forKey: .modelProxyVersion)
+        transcriptStreamingEnabled = try c.decodeIfPresent(
+            Bool.self, forKey: .transcriptStreamingEnabled)
+            ?? Config.transcriptStreamingDefault
     }
 }
 
@@ -3805,9 +4064,42 @@ public struct TerminalOutputParams: Codable, Sendable {
     }
 }
 
+/// The answer to `terminal.output`, on both transports.
+///
+/// `output` is the string every existing consumer already reads, and it is
+/// always the same string they read before — the CLI prints it, scripts match
+/// on it, and nothing about it changed when `screen` appeared beside it. That
+/// is what let the typed screen land in place rather than as a sibling method:
+/// a second method would have left this one answering wrongly for every
+/// attached session until the last consumer migrated.
+///
+/// **`screen` is present on the holder transport and absent on tmux**, and the
+/// asymmetry is honest rather than an omission. The screen contract is the
+/// holder transport's: `source` names which of that transport's two stores
+/// answered, `modes` come from the emulator that produced the lines, and
+/// `ageMilliseconds` is measured on the daemon's monotonic clock against that
+/// emulator's last byte. `capture-pane` supplies none of them — it returns text
+/// from a server that keeps no such record — so a `screen` on the tmux arm
+/// could only be fabricated, and a fabricated `source` is worse than an absent
+/// one, because a consumer's policy is keyed on exactly that field.
 public struct TerminalOutputResult: Codable, Sendable {
     public let output: String
-    public init(output: String) { self.output = output }
+    public let screen: TerminalScreen?
+
+    /// The tmux arm: text and nothing else.
+    public init(output: String) {
+        self.output = output
+        self.screen = nil
+    }
+
+    /// The holder arm. `output` is derived from the screen, so the two can
+    /// never disagree — and this is the only place the joined string crosses
+    /// the wire, since `TerminalScreen` encodes its `lines` and no copy of
+    /// them.
+    public init(screen: TerminalScreen) {
+        self.output = screen.output
+        self.screen = screen
+    }
 }
 
 // MARK: - Terminal Conversation
@@ -4042,9 +4334,20 @@ public struct TerminalSessionEndedParams: Codable, Sendable, Equatable {
     /// Process incarnation planted by TBD before a managed replacement starts.
     /// Optional so older clients' payloads continue to decode unchanged.
     public let sessionIncarnationID: UUID?
-    public init(terminalID: UUID, sessionIncarnationID: UUID? = nil) {
+    /// Claude Code's `SessionEnd` hook `reason`, verbatim and unclassified —
+    /// `logout`, `clear`, `prompt_input_exit`, `other`, or a value this build has
+    /// never heard of. Carried, never parsed for meaning; the daemon files it
+    /// through `SessionEndReason.parksTheTerminal(_:)`, whose vocabulary is one
+    /// edit rather than a rule spread across three processes.
+    ///
+    /// Optional because `~/.local/bin/tbd` is routinely stale relative to a
+    /// running daemon: an older CLI sends no `reason`, which reads as "we do not
+    /// know" and parks nothing.
+    public let reason: String?
+    public init(terminalID: UUID, sessionIncarnationID: UUID? = nil, reason: String? = nil) {
         self.terminalID = terminalID
         self.sessionIncarnationID = sessionIncarnationID
+        self.reason = reason
     }
 }
 

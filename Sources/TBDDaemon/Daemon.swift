@@ -204,6 +204,18 @@ public final class Daemon: Sendable {
     /// Internal rather than public because the holder types are: nothing
     /// outside `TBDDaemonLib` has any business holding a pty master.
     nonisolated(unsafe) var holderRegistry: HolderRegistry?
+    /// The one `ModelProxySupervisor` for this TBD home. Owned here so
+    /// shutdown can take the watch away, and so the config RPC that flips
+    /// `model_proxy_enabled` can reach the same instance the lifecycle, the
+    /// hibernation coordinator and the router route sessions through — a
+    /// second supervisor on one home would be a second daemon as far as
+    /// `proxy.lock` is concerned.
+    ///
+    /// Constructed at every boot outside mock mode, whatever the flag says, and
+    /// **started** only when the flag is on: construction opens nothing and
+    /// spawns nothing, while the runtime flip needs something to call.
+    /// `nil` in mock mode, like every other rail.
+    nonisolated(unsafe) var modelProxySupervisor: ModelProxySupervisor?
     /// The registry a live `ShadowPeerManager` registers itself with, so
     /// `ShadowPeerReconciler` can tell a live shadow from an orphan. Owned here
     /// because the two have opposite lifetimes: the reconciler runs for the
@@ -267,8 +279,18 @@ public final class Daemon: Sendable {
         self.startTime = Date()
     }
 
-    /// Remove inherited agent-routing environment variables from the daemon's
+    /// Remove the identity of whatever launched the daemon from the daemon's
     /// own process environment. Called at startup before any tmux server is spawned.
+    ///
+    /// This is the daemon-level layer of the scrub `SpawnBaseEnvironment`
+    /// defines — one list, two layers. Here, `unsetenv` covers every child the
+    /// daemon ever spawns through plain inheritance (git, hooks, one-shot tmux
+    /// clients): a name that is no longer in the daemon's environment cannot
+    /// reach any of them. `SpawnBaseEnvironment.inheriting` covers the two
+    /// long-lived spawn seams explicitly — the holder job and the tmux server —
+    /// so they stay correct even when handed an environment that was injected
+    /// rather than inherited, and can be tested without touching the test
+    /// process's environment.
     ///
     /// Rationale: tmux servers persist the env they were spawned with as their
     /// global environment, and that env is then injected into every new window
@@ -282,13 +304,22 @@ public final class Daemon: Sendable {
     /// it later creates, so a variable left set would be handed to every pane
     /// and to whatever those panes launch — including another daemon.
     public static func scrubInheritedTBDEnv() {
-        unsetenv(handoverFromPIDEnvVar)
-        unsetenv("TBD_WORKTREE_ID")
-        unsetenv("TBD_PROMPT_CONTEXT")
-        unsetenv("TBD_PROMPT_INSTRUCTIONS")
-        unsetenv("TBD_PROMPT_RENAME")
-        unsetenv("CODEX_CI")
-        unsetenv("CODEX_THREAD_ID")
+        // Sorted so the sequence of calls is determined by the set's contents
+        // rather than by a hash ordering that varies run to run.
+        for name in SpawnBaseEnvironment.enclosingSessionMarkers.sorted() {
+            unsetenv(name)
+        }
+        // `CLAUDE_CONFIG_DIR` is the one name judged by value: a directory under
+        // this installation's profiles root is one TBD minted for a single
+        // profile-bound spawn, while any other value is the user's own
+        // configuration and must survive. An empty value is dropped too, same
+        // as `SpawnBaseEnvironment.inheriting` — every reader of the name
+        // treats the empty string as unset.
+        let environment = ProcessInfo.processInfo.environment
+        if let configDir = environment["CLAUDE_CONFIG_DIR"],
+           configDir.isEmpty || SpawnBaseEnvironment.isTBDMintedProfileDir(configDir, base: environment) {
+            unsetenv("CLAUDE_CONFIG_DIR")
+        }
     }
 
     /// Raise the process's `RLIMIT_NOFILE` soft limit so every tmux server the
@@ -433,16 +464,6 @@ public final class Daemon: Sendable {
         } catch {
             reconcileLogger.warning("Failed to reconcile scratch terminals during orphan maintenance: \(error.localizedDescription, privacy: .public)")
         }
-        // The recurring driver for `tbd-ext-*` external-attach reclamation.
-        // Its other callers — startup, `repo.add`, the `cleanup` RPC — are all
-        // one-shot, so without this a session left behind by a failed attach
-        // would survive until the daemon restarted. Deliberately NOT folded
-        // into the `reapOrphanTmuxResources` pass above: that flag gates the
-        // destructive window/server reclamation, which hourly maintenance
-        // stays out of on purpose. This kills only sessions TBD itself minted
-        // under its own prefix, and only when tmux confirms at kill time that
-        // nobody is attached.
-        await lifecycle.reclaimExternalAttachSessions()
     }
 
     /// Wire the delivery verifier and perform the startup replay, gated on
@@ -875,6 +896,41 @@ public final class Daemon: Sendable {
             : nil
         self.holderRegistry = holderRegistry
 
+        // The model proxy's supervisor, built beside the registry it routes
+        // for. Construction locates the sibling `TBDModelProxy` and computes
+        // its build identity, and does nothing else — no directory, no lock, no
+        // process — so it is safe on every boot regardless of the flag. It is
+        // started later (step 8c-proxy), after the database is migrated and
+        // before terminals are reconciled, and only when the flag is on.
+        //
+        // `nil` in mock mode, like every other rail: with no supervisor a spawn
+        // is never routed and `daemon.capabilities` answers "unsupported, no
+        // port, no version", which is the honest reading of a daemon that
+        // cannot route.
+        let modelProxySupervisor: ModelProxySupervisor? = mockMode == nil
+            ? ModelProxySupervisor.production(
+                config: database.config,
+                home: TBDConstants.configDir,
+                // The one question a boot with the flag off asks: is anything
+                // still routed? A session spawned while the flag was on keeps
+                // the proxy's port in its environment for life, so a daemon
+                // that restarts after the flag went off still has to keep that
+                // port answering — and an install that never turned the flag on
+                // must run nothing at all.
+                //
+                // The read is handed over **unfolded**. Its other caller is the
+                // supervisor's port wait, and the two want opposite answers to
+                // an unreadable terminal table: a drain-only boot must start
+                // nothing, while the wait must assume a session is routed and
+                // keep the port. Folding a failure to `false` here would pick
+                // the first for both, and the second is where that strands live
+                // sessions — see `routedSessionsAlive` on the supervisor.
+                routedSessionsAlive: { [database] in
+                    try await database.terminals.hasLiveRoutedSession()
+                })
+            : nil
+        self.modelProxySupervisor = modelProxySupervisor
+
         // Input for a holder-backed session, routed by who is reading its pty.
         // Built from the registry (which knows who owns each pty and holds the
         // daemon's own reader) and the fd sidecar (the one channel to the app),
@@ -890,8 +946,23 @@ public final class Daemon: Sendable {
                     await registry.viewerAttachment(for: terminalID)
                 },
                 writeDirectly: { terminalID, bytes in
-                    // The daemon's own reader is the only descriptor it has,
-                    // and it has one only while nobody else owns the pty.
+                    // The daemon's own reader is the only descriptor it has —
+                    // but it keeps that reader across an attach, suspended
+                    // rather than stopped, so this fallback has a target in
+                    // every attached state. No reader means the session is gone
+                    // or was never adopted, which is the one case with nothing
+                    // to write to.
+                    //
+                    // Deliberately NOT recorded as input activity. The veto's
+                    // fact source is the app's keystroke stream, and a write
+                    // that starts here is the daemon's own — an auto-resume, a
+                    // peer's `terminal.send` — never something a person typed
+                    // and has not sent. Recording it would leave the merge
+                    // rail's `activityStateObservedAt` anchor behind a
+                    // "keystroke" that will never be consumed, vetoing every
+                    // park of that row forever. See `InputActivityTracker`'s
+                    // holder key for why the veto is vacuous on this transport
+                    // anyway.
                     guard let reader = await registry.reader(for: terminalID) else {
                         throw HolderInjectionCourier.Error.noDaemonDescriptor(
                             terminalID: terminalID)
@@ -908,6 +979,7 @@ public final class Daemon: Sendable {
         )
         lifecycle.controlMode = controlModeBridge
         lifecycle.holderRegistry = holderRegistry
+        lifecycle.modelProxySupervisor = modelProxySupervisor
 
         // Queued prompt on worktree creation (design 2026-08-10). Constructed
         // here — before `lifecycle` is copied by value into the RPC router
@@ -930,10 +1002,21 @@ public final class Daemon: Sendable {
         // periodic sweep task itself is started later, alongside the reaper,
         // inside the main `if mockMode == nil` block.
         if mockMode == nil {
-            let gc = OrphanGC(db: database, git: git, broadcast: { [subs] delta in subs.broadcast(delta: delta) })
+            // The proxy's rendezvous and the stream files are named
+            // explicitly, out of the same `TBDConstants` the supervisor and the
+            // proxy compose their paths from, rather than left to the
+            // collector's own defaults: the two must sweep the home this daemon
+            // actually serves, and naming them here is what makes that
+            // agreement visible at the wiring site.
+            let gc = OrphanGC(
+                db: database, git: git,
+                broadcast: { [subs] delta in subs.broadcast(delta: delta) },
+                modelProxyBase: TBDConstants.modelProxyDir(),
+                streamsBase: TBDConstants.streamsDir())
             self.orphanGC = gc
-            lifecycle.onWorktreeRemoved = { [gc] path, repoPath in
-                await gc.scratchpadCleanup(forRemovedWorktreePath: path, repoPath: repoPath)
+            lifecycle.onWorktreeRemoved = { [gc] worktreeID, path, repoPath in
+                await gc.removedWorktreeCleanup(
+                    worktreeID: worktreeID, worktreePath: path, repoPath: repoPath)
             }
         }
 
@@ -1023,10 +1106,20 @@ public final class Daemon: Sendable {
             pendingQuestions: pendingQuestions,
             remoteManager: remoteManager,
             claudeCloudLive: claudeCloudLive,
+            // Envelope suppression is authenticated against the sidecar's
+            // recorded client — the app — and against nothing the request says
+            // about itself. See `authenticatesEnvelopeSuppression`.
+            recordedAppIdentity: { [fdVendingServer] in
+                await fdVendingServer.currentClientIdentity()
+            },
             actuationLog: actuationLog
         )
         // Wire the shared input activity tracker to the coordinator
         await rpcRouter.hibernationCoordinator.setInputActivity(inputActivity)
+        // And the holder registry, for the same reason and on the same terms:
+        // the park path reads a holder session's screen through the reader the
+        // spawn path registered, so all three must hold ONE registry.
+        await rpcRouter.hibernationCoordinator.setHolderRegistry(holderRegistry)
         // Queued prompt, second half: route the parking RPC and the readiness
         // and confirmation hooks to the coordinator, and give it the paste
         // path's send seam.
@@ -1040,6 +1133,12 @@ public final class Daemon: Sendable {
         // pty master and quietly steal bytes from each other.
         rpcRouter.holderRegistry = holderRegistry
         rpcRouter.holderInjectionCourier = holderInjectionCourier
+        // One supervisor across the router, the lifecycle and the coordinator,
+        // for the registry's reason: two would each try to own one home's
+        // `proxy.lock`, and `daemon.capabilities` would report a proxy no
+        // spawn was routed through.
+        rpcRouter.modelProxySupervisor = modelProxySupervisor
+        await rpcRouter.hibernationCoordinator.setModelProxySupervisor(modelProxySupervisor)
         // The wake path recreates a terminal's tmux server/window when the
         // window is gone (e.g. post-reboot); give the recreated server the
         // same gated control-mode connection as every other ensureServer
@@ -1164,6 +1263,38 @@ public final class Daemon: Sendable {
         // migration or marker is needed. Best-effort, never blocks startup.
         await database.notes.exportContentColumnToFiles()
 
+        // 8c-proxy. Adopt or spawn this home's model proxy, gated on
+        // `model_proxy_enabled` — the supervisor re-reads the column itself, so
+        // the gate has one spelling rather than one per caller. With the flag
+        // off it starts only to drain, and only when a session spawned against
+        // the proxy is still alive.
+        //
+        // Here, and not later: a terminal reconciled or woken below can be
+        // spawned, and a spawn asks the supervisor for a route. With no proxy
+        // yet current those sessions would start unproxied and keep that for
+        // their life, because `ANTHROPIC_BASE_URL` is fixed in a session's
+        // environment at spawn. It never throws: a proxy that could not be
+        // started is a streaming nicety that is unavailable, not a daemon that
+        // failed to boot.
+        //
+        // Awaited, and this step precedes the RPC socket bind (step 9), so its
+        // cost is startup latency the CLI and the app can see. Bounded, and
+        // milliseconds in the normal case: the worst case is the control
+        // client's 2-second status probe plus the spawner's 10-second bind
+        // budget, on a machine where the proxy binds pathologically slowly. It
+        // is also flag-gated, so nobody running the shipped default pays any of
+        // it.
+        //
+        // One case costs more, deliberately. When a session is still routed
+        // against the persisted port and something transient holds it, the
+        // supervisor's port wait adds up to 30 seconds
+        // (`ModelProxySupervisor.defaultPortRetryAttempts` ×
+        // `defaultPortRetryInterval`) trying to keep that port. It is paid in
+        // exactly the case where minting a fresh one would strand a live
+        // session, and in no other.
+
+        await modelProxySupervisor?.startIfEnabled()
+
         // 8d. Reconcile parked state and durable tmux ownership before any
         // listener accepts an RPC. Full startup recovery may destructively
         // reap shared scratch servers; once serving begins, a terminal-create
@@ -1211,7 +1342,8 @@ public final class Daemon: Sendable {
         // stopped accepting — independent of how badly any one of them is.
         // Binding first would instead open a window in which the socket answers while holder
         // sessions have no readers — `terminal.output` fails a live session
-        // with "its session is gone or was never adopted", a sentence no caller
+        // with "its session is gone, was never adopted, or is mid-transition", a
+        // sentence no caller
         // can tell apart from the truth about a genuinely dead one, and the
         // app's `attach.request` throws `noLiveReader` for the same session —
         // and it would not even make the daemon answerable, because steps 8b-8d
@@ -1345,7 +1477,15 @@ public final class Daemon: Sendable {
                         terminalID: terminal.id,
                         holderPID: terminal.holderPID,
                         childPID: childPID,
-                        createdAt: terminal.createdAt)
+                        // The identity anchor, not the row's birthday. A row
+                        // woken from a park carries a child younger than
+                        // itself, and anchoring on `createdAt` there would make
+                        // every such session read as `.startTimeMismatch` —
+                        // which this leg spells "keep", so the orphan it exists
+                        // to reclaim would survive every sweep. NULL means the
+                        // row has never been parked, and there the two are the
+                        // same instant.
+                        createdAt: terminal.holderChildStartedAt ?? terminal.createdAt)
                 }
             }
             let reaper = AgentReaper(
@@ -1355,23 +1495,16 @@ public final class Daemon: Sendable {
                 guard let repos = try? await database.repos.list() else { return [] }
                 return Array(Set(repos.map { TmuxManager.serverName(forRepoPath: $0.path) }))
             }
-            // Read once per sweep rather than captured once at startup, so
-            // flipping the toggle takes effect on the next pass instead of the
-            // next daemon restart. A config read that fails leaves the leg OFF:
-            // the flag's whole job is that nothing kills until somebody says so.
-            let holderLegEnabled: @Sendable () async -> Bool = { [database] in
-                (try? await database.config.get().reapHolderChildrenEnabled) ?? false
-            }
             self.reaperTask = Task {
                 // Sweep once immediately (cold recovery), then every 60s.
                 await reaper.sweep(servers: await ownedServers())
-                await reaper.sweepHolderChildren(enabled: await holderLegEnabled())
+                await reaper.sweepHolderChildren()
                 while !Task.isCancelled {
                     // swiftlint:disable:next no_raw_task_sleep - legacy sleep, see docs/specs/2026-07-24-test-hardening-design.md
                     try? await Task.sleep(for: .seconds(60))
                     guard !Task.isCancelled else { break }
                     await reaper.sweep(servers: await ownedServers())
-                    await reaper.sweepHolderChildren(enabled: await holderLegEnabled())
+                    await reaper.sweepHolderChildren()
                 }
             }
 
@@ -1653,7 +1786,51 @@ public final class Daemon: Sendable {
                 },
                 // swiftlint:disable:next no_raw_task_sleep - already seamed: this closure IS the production value of `LimitResumeActuator`'s non-defaulted `waiter:` parameter (the seam itself), exercised by Tests/TBDDaemonTests/LimitResumeActuatorTests.swift which injects `waiter: { _ in }` at 5 construction sites; see docs/specs/2026-07-24-test-hardening-design.md
                 waiter: { duration in _ = try? await Task.sleep(for: duration) },
-                actuationLog: actuationLog
+                actuationLog: actuationLog,
+                // The rail's input path for a holder-backed row: the same
+                // courier `terminal.send` writes through, so an auto-resume is
+                // routed by who owns the pty exactly as a human's send is, and
+                // reduced to the yes/no this rail acts on. Both write answers
+                // are a delivery — `daemonWrote` names a fallback route, not a
+                // failure. Nil with no courier (mock mode, or no holder
+                // registry to build one on): the actuator then refuses a holder
+                // row by name instead of typing at coordinates it does not have.
+                //
+                // **`.daemonWrote(.ackDeadlineElapsed)` is counted as delivered
+                // with its eyes open.** It is the one branch that can duplicate:
+                // the app was holding the pty, never answered inside the ack
+                // deadline, and may yet write the bytes it was given — so the
+                // daemon's own write can land a second "continue". That trade is
+                // made deliberately in this direction. A doubled continue lands
+                // in a session that is working again, as a stray message the
+                // user can see and undo; a missed resume is the silent failure
+                // this whole rail exists to prevent, and it is discovered hours
+                // later by a limit screen nobody continued.
+                holderSend: holderInjectionCourier.map { courier in
+                    let send: @Sendable (UUID, Data) async -> Bool = { terminalID, bytes in
+                        switch await courier.deliver(terminalID: terminalID, bytes: bytes) {
+                        case .viewerWrote, .daemonWrote: return true
+                        case .notDelivered: return false
+                        }
+                    }
+                    return send
+                },
+                // The rail's liveness answer for a holder-backed row, and this
+                // transport's counterpart to `windowExists`. A positive exit
+                // report from the holder is the only evidence admitted: the
+                // absence of a daemon reader says nothing about the child, since
+                // the registry keeps its reader across an attach and hands out
+                // none while a slot is mid-adoption or mid-release — so a rail
+                // keyed on it would cancel the auto-resume of live sessions.
+                holderSessionEnded: holderRegistry.map { registry in
+                    let ended: @Sendable (UUID) async -> Bool = { terminalID in
+                        switch await registry.lastKnownStatus(for: terminalID) {
+                        case .exited, .exitedStatusUnknown: return true
+                        case .alive, nil: return false
+                        }
+                    }
+                    return ended
+                }
             )
             let resumeScheduler = LimitResumeScheduler(
                 store: database.scheduledResumes,
@@ -1871,6 +2048,14 @@ public final class Daemon: Sendable {
         // thread and the pty descriptor it owns, because after end of file that
         // thread parks on its wake pipe rather than exiting.
         await holderRegistry?.releaseAll()
+
+        // Take the watch away, and leave the proxy running. That is deliberate
+        // and it is not the same gesture as turning the feature off: a proxy
+        // outliving its daemon is the point of a separate process, sessions
+        // already spawned still have its port in their environment, and the
+        // next daemon adopts it back through the port in the config row.
+        // `beginDraining` is what the flag's off-flip calls; shutdown must not.
+        await modelProxySupervisor?.stop()
 
         if let questionSweep = pendingQuestionExpirySweep {
             await questionSweep.stop()

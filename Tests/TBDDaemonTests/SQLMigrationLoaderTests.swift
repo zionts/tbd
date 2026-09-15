@@ -492,6 +492,7 @@ import Testing
             "20260825060216_terminal_session_incarnation",
             "20260829210843_pending_terminal_incarnation",
             "20260830003851_config_remote_peer_messaging",
+            "20260830021944_config_gc_hang_stacks",
             "20260830022625_shadow_peer_artifacts",
             "20260831055718_config_pty_holder",
             "20260831055719_terminal_transport",
@@ -504,6 +505,13 @@ import Testing
             "20260902140000_config_gc_retained_transcripts",
             "20260903193500_config_holder_row_reconcile",
             "20260904172536_config_update_mode",
+            "20260905120000_config_transcript_composer",
+            "20260905213000_config_holder_hibernation",
+            "20260905220000_terminal_holder_child_started_at",
+            "20260907215724_config_model_proxy",
+            "20260907215725_config_transcript_streaming",
+            "20260907215726_config_model_proxy_port",
+            "20260907215727_terminal_transcript_stream_path",
         ]
         let found = try SQLMigrationLoader.bundled.get()
         #expect(found.files.map(\.identifier) == expected)

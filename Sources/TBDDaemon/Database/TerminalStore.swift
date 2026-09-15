@@ -63,6 +63,15 @@ struct TerminalRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
     var holder_pid: Int32?
     /// PID of the job the holder `forkpty()`d, for holder-transport rows only.
     var child_pid: Int32?
+    /// When the job named by `child_pid` was started. NULL on a row that has
+    /// never been through a park/wake cycle, where `createdAt` is still the
+    /// right identity anchor — see `Terminal.holderChildStartedAt`.
+    var holder_child_started_at: Date?
+    /// Absolute path of the model proxy's transcript stream file for this
+    /// session. NULL on every row spawned without a proxy route, which is
+    /// every row written before the column existed — see
+    /// `Terminal.transcriptStreamPath`.
+    var transcript_stream_path: String?
 
     init(from terminal: Terminal) {
         self.id = terminal.id.uuidString
@@ -96,6 +105,8 @@ struct TerminalRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
         self.transport = terminal.transport.rawValue
         self.holder_pid = terminal.holderPID
         self.child_pid = terminal.childPID
+        self.holder_child_started_at = terminal.holderChildStartedAt
+        self.transcript_stream_path = terminal.transcriptStreamPath
     }
 
     /// Failable decode: skips (returns nil after a logged warning) rather than
@@ -145,7 +156,9 @@ struct TerminalRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
             // a newer daemon both degrade to tmux rather than throwing.
             transport: transport.flatMap(TerminalTransport.init(rawValue:)) ?? .tmux,
             holderPID: holder_pid,
-            childPID: child_pid
+            childPID: child_pid,
+            holderChildStartedAt: holder_child_started_at,
+            transcriptStreamPath: transcript_stream_path
         )
     }
 }
@@ -298,6 +311,10 @@ struct TerminalReplacementSnapshot: Sendable {
     let kind: TerminalKind?
     let claudeSessionID: String?
     let transcriptPath: String?
+    /// The proxy route the observed process was launched on. Stamped at spawn
+    /// and never changed, so a mismatch here says the row's session was
+    /// replaced under the caller — exactly what the rest of the snapshot says.
+    let transcriptStreamPath: String?
     let profileID: UUID?
     let suspendedAt: Date?
     let hibernatedAt: Date?
@@ -308,6 +325,7 @@ struct TerminalReplacementSnapshot: Sendable {
         kind = terminal.kind
         claudeSessionID = terminal.claudeSessionID
         transcriptPath = terminal.transcriptPath
+        transcriptStreamPath = terminal.transcriptStreamPath
         profileID = terminal.profileID
         suspendedAt = terminal.suspendedAt
         hibernatedAt = terminal.hibernatedAt
@@ -319,6 +337,7 @@ struct TerminalReplacementSnapshot: Sendable {
             && record.kind == kind?.rawValue
             && record.claudeSessionID == claudeSessionID
             && record.transcriptPath == transcriptPath
+            && record.transcript_stream_path == transcriptStreamPath
             && record.profile_id == profileID?.uuidString
             && record.suspendedAt == suspendedAt
             && record.hibernatedAt == hibernatedAt
@@ -330,6 +349,7 @@ struct TerminalReplacementSnapshot: Sendable {
             && terminal.kind == kind
             && terminal.claudeSessionID == claudeSessionID
             && terminal.transcriptPath == transcriptPath
+            && terminal.transcriptStreamPath == transcriptStreamPath
             && terminal.profileID == profileID
             && terminal.suspendedAt == suspendedAt
             && terminal.hibernatedAt == hibernatedAt
@@ -399,6 +419,13 @@ private func resetAgentProcessLifecycle(
     let incarnationID = UUID()
     record.claudeSessionID = sessionID
     record.transcriptPath = transcriptPath
+    // The proxy route is stamped per PROCESS, not per session: it names the
+    // stream file the job about to be replaced was launched against, and the
+    // replacement gets a route of its own or none at all. Leaving it would
+    // point the app's tail at a file the retired route's proxy has unlinked,
+    // and would make every `TerminalReplacementSnapshot` taken afterwards
+    // compare against a path no live process is writing.
+    record.transcript_stream_path = nil
     record.sessionOrderObservedAt = nil
     record.codexTranscriptBoundaryOffset = nil
     record.sessionIncarnationID = incarnationID.uuidString
@@ -674,9 +701,18 @@ public struct TerminalStore: Sendable {
         watchDeskRole: WatchDeskRole? = nil,
         transport: TerminalTransport = .tmux,
         holderPID: Int32? = nil,
-        childPID: Int32? = nil
+        childPID: Int32? = nil,
+        holderChildStartedAt: Date? = nil,
+        // The model proxy stream file this row's session was launched
+        // against, or nil for an unproxied spawn. Taken at creation rather than
+        // written by a follow-up `UPDATE` because
+        // `TerminalReplacementSnapshot` compares this column: a row that exists
+        // for even one `await` without it can be snapshotted by a concurrent
+        // caller, and the stamp that arrives afterwards then makes every
+        // replacement that snapshot authorized reject.
+        transcriptStreamPath: String? = nil
     ) async throws -> Terminal {
-        let terminal = Terminal(
+        var terminal = Terminal(
             id: id,
             worktreeID: worktreeID,
             tmuxWindowID: tmuxWindowID,
@@ -688,8 +724,12 @@ public struct TerminalStore: Sendable {
             watchDeskRole: watchDeskRole,
             transport: transport,
             holderPID: holderPID,
-            childPID: childPID
+            childPID: childPID,
+            holderChildStartedAt: holderChildStartedAt
         )
+        // Assigned rather than passed: `Terminal`'s memberwise initializer is
+        // already at the Swift type-checker's expression budget here.
+        terminal.transcriptStreamPath = transcriptStreamPath
         let record = TerminalRecord(from: terminal)
         try await writer.write { db in
             if let worktree = try WorktreeRecord.fetchOne(db, key: worktreeID.uuidString),
@@ -711,6 +751,37 @@ public struct TerminalStore: Sendable {
             }
             request = request.order(Column("createdAt").asc, Column("id").asc)
             return try request.fetchAll(db).compactMap { $0.toModel() }
+        }
+    }
+
+    /// Whether any session that was spawned through the model proxy is still
+    /// alive.
+    ///
+    /// The one question the supervisor's drain asks the database, and it asks
+    /// it once, at daemon start with `model_proxy_enabled` off: a proxy is kept
+    /// alive for sessions that are already routed through it, and an install
+    /// that has none must run nothing at all (spec, "Supervisor" → Gate).
+    ///
+    /// "Routed" is `transcriptStreamPath`, which is stamped at spawn and
+    /// cleared when the process it named is replaced, so a row still carrying
+    /// one names a job whose `ANTHROPIC_BASE_URL` points at the proxy. "Alive"
+    /// is the negation of `Terminal.isExitStamped` rather than a second
+    /// spelling of it in SQL: a parked session is woken by a gesture and its
+    /// next turn goes through the proxy, so only a row whose agent process has
+    /// actually left is finished with the port.
+    ///
+    /// Filtered in SQL and judged in Swift on purpose. The filter is the cheap,
+    /// unambiguous half — one indexed-in-practice column, and every install
+    /// that never enabled the proxy answers it with an empty set — while the
+    /// judgment is the model's own property, so it cannot drift from the one
+    /// every other reader uses.
+    public func hasLiveRoutedSession() async throws -> Bool {
+        try await writer.read { db in
+            try TerminalRecord
+                .filter(Column("transcript_stream_path") != nil)
+                .fetchAll(db)
+                .compactMap { $0.toModel() }
+                .contains { !$0.isExitStamped }
         }
     }
 
@@ -1733,6 +1804,84 @@ public struct TerminalStore: Sendable {
         }
     }
 
+    /// Park a row because Claude's own process left, reported by its `SessionEnd`
+    /// hook. Returns whether the row actually changed.
+    ///
+    /// **Deliberately narrower than `setHibernated`.** That writer mints a new
+    /// session incarnation, cancels pending scheduled resumes and rewrites the
+    /// activity triple, because it describes a park TBD performed and a process
+    /// TBD is about to replace. A hook only *reports* that the process is gone:
+    /// nothing was replaced, nothing was interrupted, and the resume this row
+    /// already points at is still the right one. So exactly two columns move.
+    ///
+    /// It refuses on an already-parked row for the same reason the awaiting-input
+    /// rail refuses an uninformative overwrite: `hibernateReason` is the record of
+    /// WHO parked a session, `HibernationCoordinator`'s wake-on-focus sweep reads
+    /// it, and a late `SessionEnd` from the process TBD itself killed would
+    /// otherwise rewrite a deliberate `.manual` park into `.exited`.
+    ///
+    /// `reportedIncarnationID` is the hook's own process-incarnation nonce,
+    /// checked by exact equality against the record's — the same reading
+    /// `applySessionStart`, `applyActivityObservation` and
+    /// `updateSessionIDIfIncarnationMatches` each give it. A mismatch means the
+    /// hook describes a process TBD has already replaced, so stamping would
+    /// park a live successor. A `nil` report matches only a record that still
+    /// carries no incarnation of its own — once TBD mints one (a replacement
+    /// launch, via `updateTmuxIDs`), a delayed `SessionEnd` from the
+    /// pre-incarnation predecessor process reads as a mismatch too, not as an
+    /// unchecked report.
+    ///
+    /// The stamp is tmux-only. On a holder-backed row the Claude process IS the
+    /// holder's whole job: there is no shell left in the pane for a send to
+    /// mis-execute, and the hibernation coordinator's wake respawns into a tmux
+    /// window, which cannot bring a holder session back. Parking such a row
+    /// would leave a park nothing can wake and no reconciler reclaims, so the
+    /// row stays unstamped and the holder path answers for its own liveness.
+    ///
+    /// `date` follows the one-shot stamp seam (CLAUDE.md, "Duration is behavior,
+    /// Date is data").
+    @discardableResult
+    public func stampSessionExited(
+        id: UUID, reportedIncarnationID: UUID?, at date: Date = Date()
+    ) async throws -> Bool {
+        try await writer.write { db in
+            guard var record = try TerminalRecord.fetchOne(db, key: id.uuidString) else {
+                return false
+            }
+            guard record.transport != TerminalTransport.holder.rawValue else { return false }
+            guard record.hibernatedAt == nil else { return false }
+            guard record.sessionIncarnationID == reportedIncarnationID?.uuidString else {
+                return false
+            }
+            record.hibernatedAt = date
+            record.hibernateReason = HibernateReason.exited.rawValue
+            try record.update(db)
+            return true
+        }
+    }
+
+    /// Retract an exit stamp because the session came back — the `SessionStart`
+    /// hook. Returns whether the row actually changed.
+    ///
+    /// Scoped to `.exited` on purpose. `SessionStart` also fires on `/clear` and
+    /// `/compact` inside a live process, and on a resume; a blanket un-park there
+    /// would undo an operator's deliberate `.manual` hibernate. `clearHibernated`
+    /// stays the wake path's writer — it also clears `suspendedAt` and the pending
+    /// incarnation, which belong to a respawn this never performs.
+    @discardableResult
+    public func clearSessionExitStamp(id: UUID) async throws -> Bool {
+        try await writer.write { db in
+            guard var record = try TerminalRecord.fetchOne(db, key: id.uuidString) else {
+                return false
+            }
+            guard record.hibernateReason == HibernateReason.exited.rawValue else { return false }
+            record.hibernatedAt = nil
+            record.hibernateReason = nil
+            try record.update(db)
+            return true
+        }
+    }
+
     /// Prepare a parked shell for a fresh agent before launch. Preserve the
     /// captured session identity and transcript needed for a failed launch to
     /// retry, while clearing process-local ordering/activity and rotating the
@@ -1766,6 +1915,53 @@ public struct TerminalStore: Sendable {
                 at: date)
             try record.update(db)
             return incarnationID
+        }
+    }
+
+    /// Record — or clear — which processes carry a holder-transport row, in one
+    /// write.
+    ///
+    /// The three facts move together on purpose. A pid without the start time
+    /// that identifies it is a pid nothing may signal (`ProcessIdentityCheck`
+    /// reads a missing start time as "not the same process"), and a start time
+    /// without a pid names nothing at all, so a caller that could set one and
+    /// forget another would leave the row saying something no reader can act
+    /// on. Wake passes all three; park passes `nil` for all three, which is
+    /// what a parked row means — no holder, no job, no anchor.
+    public func setHolderProcess(
+        id: UUID, holderPID: Int32?, childPID: Int32?, startedAt: Date?
+    ) async throws {
+        try await writer.write { db in
+            guard var record = try TerminalRecord.fetchOne(db, key: id.uuidString) else {
+                throw DatabaseError(message: "Terminal not found")
+            }
+            record.holder_pid = holderPID
+            record.child_pid = childPID
+            record.holder_child_started_at = startedAt
+            try record.update(db)
+        }
+    }
+
+    /// Record — or clear — the model proxy stream file this terminal's session
+    /// was launched against.
+    ///
+    /// Written once, at spawn, right after the row exists and before the app is
+    /// told about it; `nil` clears the route when a session is spawned without
+    /// one. A single-column `UPDATE` rather than a read-modify-write of the
+    /// whole record on purpose: spawn runs concurrently with the first hooks
+    /// from the process it just started, and rewriting every column here would
+    /// let this write reinstate the session and activity columns those hooks
+    /// had already moved.
+    ///
+    /// A row that has since vanished is a no-op, matching `setProfileID`: the
+    /// terminal this route belonged to is gone, and so is anything that could
+    /// read the route.
+    public func setTranscriptStreamPath(terminalID: UUID, path: String?) async throws {
+        try await writer.write { db in
+            try db.execute(
+                sql: "UPDATE terminal SET transcript_stream_path = ? WHERE id = ?",
+                arguments: [path, terminalID.uuidString]
+            )
         }
     }
 

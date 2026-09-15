@@ -752,25 +752,6 @@ actor DaemonClient {
             resultType: TerminalContinueInCodexResult.self)
     }
 
-    /// Compose the shell command that attaches an external terminal emulator
-    /// to one terminal's tmux window.
-    ///
-    /// The daemon is the composer, not the caller: the socket path has to come
-    /// from the environment that created the tmux server, and the pane's
-    /// `@tbd_terminal_id` is verified before the window is named, so a stale
-    /// coordinate cannot yield a command aimed at another session's window.
-    /// Throws rather than returning a partial command — a caller must not put
-    /// a half-formed script on the pasteboard.
-    func terminalAttachCommand(worktreeID: UUID, terminalID: UUID) async throws
-        -> TerminalAttachCommandResult {
-        return try await callAsync(
-            method: RPCMethod.terminalAttachCommand,
-            params: TerminalAttachCommandParams(
-                worktreeID: worktreeID, terminalID: terminalID),
-            resultType: TerminalAttachCommandResult.self
-        )
-    }
-
     /// List terminals, optionally filtered by worktree.
     func listTerminals(worktreeID: UUID? = nil) async throws -> [Terminal] {
         return try await callAsync(
@@ -823,6 +804,20 @@ actor DaemonClient {
             method: RPCMethod.terminalSend,
             params: TerminalSendParams(terminalID: terminalID, text: text)
         )
+    }
+
+    /// Send a composed message: an ordered parts list, the dispatch envelope
+    /// suppressed, and the awaiting-input gate opted in. Distinct from
+    /// `sendToTerminal` so the composer's contract is one call site rather than
+    /// five defaulted arguments spread across every caller of a shared verb.
+    ///
+    /// Note what asking for suppression does and does not do. The daemon honors
+    /// it only on a connection it has authenticated as this app's — the peer pid
+    /// the kernel reports for the socket, matched against the pid the FD-vending
+    /// sidecar recorded and then re-verified. Nothing about this call asserts
+    /// anything; it asks, on a socket that already belongs to us.
+    func sendComposerMessage(_ params: TerminalSendParams) async throws {
+        try await callVoidAsync(method: RPCMethod.terminalSend, params: params)
     }
 
     /// Publish an explicit terminal activity state transition.
@@ -1188,6 +1183,48 @@ actor DaemonClient {
         try await callVoidAsync(
             method: RPCMethod.configSetPtyHolderEnabled,
             params: ConfigSetPtyHolderEnabledParams(enabled: enabled)
+        )
+    }
+
+    /// Persist the transcript-composer gate (default OFF). Read per request by
+    /// the daemon, so no restart is needed; the app re-reads capabilities right
+    /// after writing so the toggle reflects the daemon's persisted state.
+    func setTranscriptComposerEnabled(enabled: Bool) async throws {
+        try await callVoidAsync(
+            method: RPCMethod.configSetTranscriptComposerEnabled,
+            params: ConfigSetTranscriptComposerEnabledParams(enabled: enabled)
+        )
+    }
+
+    /// Persist the model-proxy gate (default OFF). Read fresh at spawn time, so
+    /// no daemon restart is needed — but it applies only to sessions started
+    /// after the call: a session's Messages API base URL is fixed in the
+    /// environment it was spawned with. Sending either value is an explicit
+    /// gesture that survives a later change to the shipped default.
+    ///
+    /// Turning it off also clears the transcript-streaming flag; the daemon
+    /// does that itself, in one transaction, so the app writes one value and
+    /// re-reads capabilities to learn what landed.
+    func setModelProxyEnabled(enabled: Bool) async throws {
+        try await callVoidAsync(
+            method: RPCMethod.configSetModelProxyEnabled,
+            params: ConfigSetModelProxyEnabledParams(enabled: enabled)
+        )
+    }
+
+    /// Persist the transcript-streaming gate (default OFF), which decides
+    /// whether the transcript renders a provisional assistant row from the
+    /// proxy's stream file. Applies to sessions started after the call, for the
+    /// same reason as the proxy gate.
+    ///
+    /// Turning it on also sets the model-proxy flag — the daemon couples them,
+    /// because the file this reads does not exist without the proxy — so the
+    /// app sends this one value even while the proxy is off and reads the
+    /// coupled result back out of capabilities.
+    func setTranscriptStreamingEnabled(enabled: Bool) async throws {
+        try await callVoidAsync(
+            method: RPCMethod.configSetTranscriptStreamingEnabled,
+            params: ConfigSetTranscriptStreamingParams(enabled: enabled)
         )
     }
 
@@ -1621,10 +1658,38 @@ actor DaemonClient {
 
     /// Wake a hibernated terminal: respawn `claude --resume` in its window.
     /// Idempotent — a double-call collapses to one respawn daemon-side.
-    func terminalWake(terminalID: UUID, cols: Int? = nil, rows: Int? = nil, fallbackToDefaultProfile: Bool = false) async throws {
+    ///
+    /// `prompt` is delivered as a trailing argv on `claude --resume`, atomic with
+    /// the respawn, so it reaches ONLY a session this call actually woke. On the
+    /// idempotent no-op paths (already awake, wake already in flight) the daemon
+    /// returns `woken: false` and delivers nothing — which is what makes the
+    /// parameter safe to pass from a UI that may be racing a background wake.
+    func terminalWake(
+        terminalID: UUID, cols: Int? = nil, rows: Int? = nil,
+        fallbackToDefaultProfile: Bool = false, prompt: String? = nil
+    ) async throws {
         try await callVoidAsync(
             method: RPCMethod.terminalWake,
-            params: TerminalWakeParams(terminalID: terminalID, cols: cols, rows: rows, fallbackToDefaultProfile: fallbackToDefaultProfile)
+            params: TerminalWakeParams(
+                terminalID: terminalID, cols: cols, rows: rows,
+                fallbackToDefaultProfile: fallbackToDefaultProfile, prompt: prompt)
+        )
+    }
+
+    /// Wake a terminal and read back what the daemon answered.
+    ///
+    /// The same RPC `terminalWake` calls. A separate method only because that
+    /// one is `callVoidAsync` and its existing callers all want it to stay that
+    /// way — the composer is the only caller that needs the result, because it
+    /// is the only one that scopes a wait to the spawn this call made.
+    func terminalWakeReporting(
+        terminalID: UUID, cols: Int? = nil, rows: Int? = nil, prompt: String
+    ) async throws -> TerminalWakeResult {
+        try await callAsync(
+            method: RPCMethod.terminalWake,
+            params: TerminalWakeParams(
+                terminalID: terminalID, cols: cols, rows: rows, prompt: prompt),
+            resultType: TerminalWakeResult.self
         )
     }
 
@@ -2172,6 +2237,16 @@ actor DaemonClient {
             method: RPCMethod.terminalAskUserQuestionSatisfied,
             params: TerminalAskUserQuestionSatisfiedParams(
                 terminalID: terminalID, toolUseIDs: toolUseIDs)
+        )
+    }
+
+    /// What slash commands, skills and subagents this terminal's session knows.
+    /// Refused by the daemon when the composer flag is off.
+    func terminalCompletions(terminalID: UUID) async throws -> TerminalCompletionsResult {
+        try await callAsync(
+            method: RPCMethod.terminalCompletions,
+            params: TerminalCompletionsParams(terminalID: terminalID),
+            resultType: TerminalCompletionsResult.self
         )
     }
 

@@ -80,8 +80,8 @@ extension RPCRouter {
             return RPCResponse(
                 error: "This session was pinned to an account profile (\(profileID.uuidString)) that no longer exists. It stays parked and resumable — wake it on your default account, or restore the profile and retry.",
                 code: RPCErrorCode.profileMissing.rawValue)
-        case .holderTransport:
-            return RPCResponse(error: HibernationCoordinator.holderTransportRefusal)
+        case .paneBusy(let pid):
+            return RPCResponse(error: HibernationCoordinator.paneBusyRefusal(pid: pid))
         }
     }
 
@@ -102,7 +102,7 @@ extension RPCRouter {
         }
         await limitResumeScheduler?.wake()
 
-        let eligible = terminals.filter { $0.isManuallyHibernatable }
+        let eligible = terminals.filter { $0.isManuallyHibernatable() }
 
         // Fire in background — RPC returns immediately so the app can show
         // the parking overlay while the daemon does its work.

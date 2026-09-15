@@ -7,8 +7,8 @@ import TBDShared
 /// safety rails plus the idle-duration check — is unit-testable without an
 /// actor, a tmux server, or a database. The rails themselves (running turn,
 /// permission prompt, keep-warm, already-hibernated/suspended, resumable
-/// Claude) live on `Terminal.isAutoHibernationEligible`; this adds the two
-/// inputs that pure property can't see: whether the feature is enabled and how
+/// Claude) live on `Terminal.isAutoHibernationEligible()`; this adds the two
+/// inputs that pure method can't see: whether the feature is enabled and how
 /// long the terminal has been idle relative to the configured timeout.
 public enum HibernationGate {
     /// Why a terminal was or wasn't selected for auto-hibernation. `.eligible`
@@ -18,10 +18,6 @@ public enum HibernationGate {
     public enum Decision: Equatable, Sendable {
         case eligible
         case featureDisabled
-        /// The session's pty is owned by a `TBDHolder`, not a tmux pane, so the
-        /// respawn-window park mechanic has no coordinate to act on. Refused
-        /// outright rather than parked against an empty window id.
-        case holderTransport
         case notClaudeResumable
         case alreadyHibernated
         case suspended
@@ -80,14 +76,13 @@ public enum HibernationGate {
     /// on this exact precedence (e.g. an already-hibernated running terminal
     /// reports `.alreadyHibernated`, not `.running`). Kept identical to the cascade
     /// that used to be inlined in `decide` so existing behavior is preserved.
+    ///
+    /// Transport does not appear here. Park and wake exist on every transport,
+    /// so a holder-backed row passes or fails these rails on exactly the facts
+    /// a tmux-backed one does. Mirrors `Terminal.isManuallyHibernatable`, which
+    /// this cascade deliberately re-implements rather than calls (it needs
+    /// per-rail reasons).
     static func blockingRail(terminal: Terminal) -> Decision? {
-        // First, and ahead of `isClaudeResumable`: a holder-backed session is
-        // refused for a reason that has nothing to do with the Claude rails,
-        // and naming it precisely is what keeps a future reader from "fixing"
-        // the resumable check. Mirrors the same guard on
-        // `Terminal.isManuallyHibernatable`, which this cascade deliberately
-        // re-implements rather than calls (it needs per-rail reasons).
-        guard terminal.transport != .holder else { return .holderTransport }
         guard terminal.isClaudeResumable else { return .notClaudeResumable }
         guard terminal.hibernatedAt == nil else { return .alreadyHibernated }
         guard terminal.suspendedAt == nil else { return .suspended }

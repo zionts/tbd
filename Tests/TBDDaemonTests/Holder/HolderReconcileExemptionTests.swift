@@ -95,6 +95,9 @@ struct HolderReconcileExemptionTests {
             "the sweep deleted a holder-backed shell row")
     }
 
+    /// The tmux arm is unchanged by the holder exemption above: a tmux row
+    /// whose window is gone is still parked (resumable Claude) or deleted
+    /// (everything else).
     @Test("a tmux-backed row whose window is gone is still parked or deleted")
     func tmuxRowStillReconciledNormally() async throws {
         let (tempDir, repoDir) = try await createTestRepoResolvingSymlinks()

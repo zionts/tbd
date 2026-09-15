@@ -270,8 +270,11 @@ private actor HangingRecheck {
     func release() { released = true }
 
     /// Whether the recheck was reached within `timeout`. Polled, because it is
-    /// issued from a detached task whose scheduling no test owns.
-    func wasEntered(within timeout: Duration = .seconds(10)) async -> Bool {
+    /// issued from a detached task whose scheduling no test owns — SE-0417
+    /// carries no executor preference across that hop, so the deadline is the
+    /// shared saturated-pass budget rather than a literal (`gateHoldingTask` in
+    /// `Tests/TestSupport/BoundedGateSupport.swift`).
+    func wasEntered(within timeout: Duration = TestDeadlines.saturatedPass) async -> Bool {
         let deadline = ContinuousClock.now.advanced(by: timeout)
         while !entered && ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(5))
@@ -299,8 +302,9 @@ private actor CancellableRecheck {
 
     /// Polled, because the recheck is issued from a detached task whose
     /// scheduling no test owns. The bound under test is virtual time; these
-    /// waits only cover that scheduling.
-    func wasEntered(within timeout: Duration = .seconds(10)) async -> Bool {
+    /// waits only cover that scheduling, so they take the shared saturated-pass
+    /// budget rather than a literal.
+    func wasEntered(within timeout: Duration = TestDeadlines.saturatedPass) async -> Bool {
         let deadline = ContinuousClock.now.advanced(by: timeout)
         while !entered && ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(5))
@@ -308,7 +312,7 @@ private actor CancellableRecheck {
         return entered
     }
 
-    func wasCancelled(within timeout: Duration = .seconds(10)) async -> Bool {
+    func wasCancelled(within timeout: Duration = TestDeadlines.saturatedPass) async -> Bool {
         let deadline = ContinuousClock.now.advanced(by: timeout)
         while !cancelled && ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(5))
@@ -325,7 +329,7 @@ private actor OneShot<Value: Sendable> {
 
     func fulfil(_ value: Value) { stored = value }
 
-    func value(within timeout: Duration = .seconds(10)) async -> Value? {
+    func value(within timeout: Duration = TestDeadlines.saturatedPass) async -> Value? {
         let deadline = ContinuousClock.now.advanced(by: timeout)
         while stored == nil && ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(5))
@@ -989,7 +993,20 @@ struct PRStatusManagerBindingTests {
         // and the recheck task plus that project's single-flight gate stay
         // wedged for as long as it lives — well past the 60 s the design leans
         // on to argue no reconciler is needed.
-        let clock = TestClock()
+        //
+        // **On `EventDrivenTestClock`, because the second sleep is armed
+        // somewhere the test cannot reach.** The deadline's expiry cancels the
+        // runner task, whose cancellation handler sends SIGTERM and then hands
+        // the escalation to a `Task.detached` that sleeps `childKillGrace` —
+        // three or four scheduling hops from this body. On `TestClock` the only
+        // way to see that arming is to poll `checkSuspension()`, whose
+        // `megaYield` is 20 serially-awaited background-QoS tasks, and under
+        // the saturated fast pass that probe competes with the very hops it is
+        // waiting on. `EventDrivenTestClock` signals the arming from inside the
+        // critical section that registers the sleeper, so the second advance
+        // lands on a sleeper that is provably in the ledger. The grace sleep
+        // fires once and is never re-armed, so the count here is exactly two.
+        let clock = EventDrivenTestClock()
         let gl = GitLabFake()
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("tbd-glab-kill-\(UUID().uuidString)")
@@ -1033,9 +1050,19 @@ struct PRStatusManagerBindingTests {
         #expect(kill(childPID, 0) == 0, "the child was not running for the deadline to end")
 
         // Virtual time: the deadline fires, then the grace after SIGTERM.
-        await clock.advanceWhenSuspended(by: PRStatusManager.recheckTimeout)
-        let died = await clock.advanceUntil(
-            "the SIGTERM-immune recheck child to be killed", by: PRStatusManager.childKillGrace
+        try await clock.requireAdvanceWhenArmed(by: PRStatusManager.recheckTimeout)
+        // `TestDeadlines.saturatedPass` rather than the 45 s default: the
+        // arming this waits for is several hops from here (see above), and 45 s
+        // sits inside the fast pass's own per-test latency, so the default
+        // would measure the runner.
+        try await clock.requireAdvanceWhenArmed(
+            by: PRStatusManager.childKillGrace, timeout: TestDeadlines.saturatedPass)
+        // The SIGKILL and the kernel's reap are real, so the verdict is a
+        // bounded wait on the observable rather than a read taken the instant
+        // virtual time moved.
+        let died = try await waitFor(
+            "the SIGTERM-immune recheck child to be killed",
+            observed: { kill(childPID, 0) == 0 ? "pid \(childPID) still alive" : "pid \(childPID) gone" }
         ) { kill(childPID, 0) != 0 && errno == ESRCH }
 
         #expect(died, "the child outlived its deadline: SIGTERM alone cannot end it")
