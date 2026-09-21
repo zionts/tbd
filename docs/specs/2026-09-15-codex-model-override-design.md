@@ -22,18 +22,18 @@ would conflate two agents with different configuration mechanisms.
 - Let `tbd worktree create --codex-model <id>` select the model for the fresh
   primary terminal when that worktree's resolved primary agent is Codex.
 - Preserve every existing command byte-for-byte when no override is supplied.
-- Keep the choice one-shot. It must not change a profile, a repository, global
-  Codex configuration, or later resume behavior.
+- Persist the requested model on the terminal row and show it as requested
+  state in the UI; observed runtime remains hook/process evidence.
+- Permit an explicit in-place live switch that preserves the terminal row,
+  tmux window, and Codex thread, or fails closed before touching the pane.
 
 ## Non-goals
 
 - Selecting Codex as the primary worktree agent. `--codex-model` modifies a
   Codex primary selected by the existing preference; it does not select the
   agent kind.
-- Applying an override to `terminal.continueInCodex`, imported conversations,
-  or any other Codex resume path.
-- Adding a persistent per-terminal model field or displaying the override in
-  the app.
+- Changing the model of `terminal.continueInCodex` unless the user explicitly
+  chooses it in that action's picker.
 - Validating model identifiers against a TBD-owned allowlist. Codex owns that
   vocabulary and reports unsupported values.
 - Changing Claude model selection.
@@ -64,13 +64,17 @@ The CLI sends the terminal option as an optional `model` field on
 `codexModel` field on `WorktreeCreateParams`; the distinct name preserves the
 existing Claude-only `model` field.
 
-The terminal handler passes `params.model` only to its fresh `.codex` spawn.
+The terminal handler passes `params.model` only to its fresh `.codex` spawn and
+stores it on the terminal row. The live model action uses the same row's
+recorded Codex thread identity and a staged in-place respawn; a missing
+identity, parked row, holder transport, stale snapshot, or failed preparation
+is a refusal with the old pane untouched.
 The worktree handler carries `params.codexModel` through
 `completeCreateWorktree` and the existing pre-session phase, if present, to
 the primary-terminal spawn. `spawnPrimaryTerminals` passes it only from the
 `.codex` switch arm.
 
-Both RPC fields are optional and default to `nil` in their public
+Both create RPC fields are optional and default to `nil` in their public
 initializers. Older clients omit them, and newer daemons decode omission as
 the current behavior. Older daemons ignore the additional JSON keys. No field
 is written to the terminal, worktree, repository, profile, or config tables.
@@ -97,9 +101,11 @@ exact string it emits today, including executable quoting, detected profile
 flag, argument order, and prompt placement.
 
 Fresh `terminal create` and fresh Codex-primary `worktree create` call sites
-pass the override. `terminal.continueInCodex` and every resume call site keep
-calling the builder without one, so resumed threads continue to resolve their
-model from Codex's normal configuration.
+pass the override. A live model switch passes the persisted thread ID to
+`codex resume` and the selected model in the same command, then replaces the
+existing tmux window in place. The row's requested model is updated before
+launch under the replacement-incarnation fence; an RPC response is not
+treated as observed runtime until the new process's hook evidence arrives.
 
 ### Documentation
 
@@ -135,7 +141,10 @@ CLI tests parse `TerminalCreate` and verify that `--model` is accepted with
 missing `--type` is refused by the same validation rule.
 
 Implementation verification runs `scripts/swift-safe build` and the full
-`scripts/test.sh` suite. It does not restart the daemon or app.
+`scripts/test.sh` suite. The supported installed updater is separate: it must
+build a clean released-source checkout, hand over the daemon, and prove one
+daemon/app plus unchanged terminal row/window/thread identity. The updater
+must not install this unmerged feature branch.
 
 ## Placement and rollout
 

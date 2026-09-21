@@ -295,7 +295,8 @@ extension RPCRouter {
                         workingDirectory: currentWorktree.path,
                         command: CodexSpawnCommandBuilder.build(
                             initialPrompt: params.prompt,
-                            executablePath: codexPreparation.executablePath),
+                            executablePath: codexPreparation.executablePath,
+                            model: params.model),
                         env: codexSpawnEnv,
                         sensitiveEnv: codexEnvOverrides,
                         cols: resolvedCols,
@@ -303,6 +304,7 @@ extension RPCRouter {
                         label: TerminalLabel.codex,
                         claudeSessionID: nil,
                         profileID: nil,
+                        codexModel: params.model,
                         kind: .codex,
                         transport: decidedTransport,
                         attachment: nil,
@@ -2079,6 +2081,86 @@ extension RPCRouter {
         guard let oldTerminal = try await db.terminals.get(id: params.terminalID) else {
             return RPCResponse(error: "Terminal not found: \(params.terminalID)")
         }
+        if oldTerminal.isCodexTerminal {
+            guard params.resolvedMode == .inPlace else {
+                return RPCResponse(error: "Codex model changes are in-place only")
+            }
+            guard let model = params.codexModel?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !model.isEmpty else {
+                return RPCResponse(error: "A Codex model is required")
+            }
+            guard let sessionID = oldTerminal.claudeSessionID, !sessionID.isEmpty else {
+                return RPCResponse(error: "Codex terminal has no recorded thread identity; refusing to switch")
+            }
+            guard !oldTerminal.isParked, oldTerminal.transport == .tmux else {
+                return RPCResponse(error: "Codex model switch requires a live tmux terminal")
+            }
+            guard let worktree = try await db.worktrees.getLocal(id: oldTerminal.worktreeID) else {
+                return RPCResponse(error: "Worktree not found for terminal: \(params.terminalID)")
+            }
+            let preparation = try CodexLaunchPreparation.prepare(
+                executableResolver: codexExecutableResolver,
+                homeEnsurer: codexHomeEnsurer)
+            let actuationID = try await beginActuation(
+                .terminalSwapProfile, actor: actor,
+                target: .local(worktree: worktree.id, terminal: oldTerminal.id),
+                agent: TerminalKind.codex.rawValue)
+            let repo: Repo?
+            if let repoID = worktree.repoID {
+                repo = try? await db.repos.get(id: repoID)
+            } else {
+                repo = nil
+            }
+            var env = SystemPromptBuilder.promptLayers(
+                repo: repo,
+                worktree: worktree.worktree,
+                scratchInstructions: nil,
+                scratchRenamePrompt: nil)
+            env["TBD_WORKTREE_ID"] = worktree.id.uuidString
+            env["TBD_TERMINAL_ID"] = oldTerminal.id.uuidString
+            env["CODEX_HOME"] = preparation.codexHome.path
+            let replacementEnvironment = env
+            let command = CodexSpawnCommandBuilder.build(
+                initialPrompt: nil,
+                resumeThreadID: sessionID,
+                executablePath: preparation.executablePath,
+                model: model)
+            do {
+                let expected = TerminalReplacementSnapshot(terminal: oldTerminal)
+                let outcome = try await tmux.withWorktreeServerLock(
+                    db: db, worktreeID: worktree.id,
+                    allowedStatuses: [worktree.status]
+                ) { currentWorktree in
+                    guard let current = try await self.db.terminals.get(id: oldTerminal.id),
+                          expected.matches(current), !current.isParked,
+                          current.transport == .tmux else {
+                        throw StaleTerminalReplacementError()
+                    }
+                    return try await self.inPlaceSwapRespawn(
+                        oldTerminal: current,
+                        worktree: currentWorktree.worktree,
+                        spawnCommand: command,
+                        env: replacementEnvironment,
+                        sensitiveEnv: [:],
+                        storedSessionID: sessionID,
+                        newProfileID: nil,
+                        newCodexModel: model,
+                        scheduleRecapture: false,
+                        cols: params.cols ?? TmuxManager.defaultCols,
+                        rows: params.rows ?? TmuxManager.defaultRows)
+                }
+                if let error = outcome.respawnError {
+                    await finishActuation(actuationID, .transportFailed, error: error)
+                } else {
+                    await finishActuation(
+                        actuationID, response: outcome.response, refusedAs: .notFound)
+                }
+                return outcome.response
+            } catch {
+                await finishActuation(actuationID, .transportFailed, error: "\(error)")
+                throw error
+            }
+        }
         guard let sessionID = oldTerminal.claudeSessionID else {
             return RPCResponse(error: "Terminal \(params.terminalID) is not a Claude terminal")
         }
@@ -2589,6 +2671,7 @@ extension RPCRouter {
         sensitiveEnv: [String: String],
         storedSessionID: String,
         newProfileID: UUID?,
+        newCodexModel: String? = nil,
         scheduleRecapture: Bool,
         cols: Int,
         rows: Int
@@ -2608,13 +2691,24 @@ extension RPCRouter {
         //    so old-process hooks are stale and new-process hooks can attach
         //    immediately without a launch gate.
         let replacementObservedAt = now()
-        guard let incarnationID = try await db.terminals.prepareProfileAgentRespawn(
-            id: oldTerminal.id,
-            expectedState: TerminalReplacementSnapshot(terminal: oldTerminal),
-            sessionID: storedSessionID,
-            transcriptPath: oldTerminal.transcriptPath,
-            profileID: newProfileID,
-            at: replacementObservedAt) else {
+        let incarnationID: UUID?
+        if let newCodexModel {
+            incarnationID = try await db.terminals.prepareCodexModelRespawn(
+                id: oldTerminal.id,
+                expectedState: TerminalReplacementSnapshot(terminal: oldTerminal),
+                sessionID: storedSessionID,
+                model: newCodexModel,
+                at: replacementObservedAt)
+        } else {
+            incarnationID = try await db.terminals.prepareProfileAgentRespawn(
+                id: oldTerminal.id,
+                expectedState: TerminalReplacementSnapshot(terminal: oldTerminal),
+                sessionID: storedSessionID,
+                transcriptPath: oldTerminal.transcriptPath,
+                profileID: newProfileID,
+                at: replacementObservedAt)
+        }
+        guard let incarnationID else {
             throw StaleTerminalReplacementError()
         }
         guard let prepared = try await db.terminals.get(id: oldTerminal.id) else {
@@ -2675,12 +2769,14 @@ extension RPCRouter {
                 sessionOrderObservedAt: updated.sessionOrderObservedAt
             )))
         }
-        // Update the row's account chip in place — same terminal id, new profile.
-        subscriptions.broadcast(delta: .terminalProfileChanged(TerminalProfileDelta(
-            terminalID: updated.id,
-            worktreeID: updated.worktreeID,
-            newProfileID: updated.profileID
-        )))
+        if newCodexModel == nil {
+            // Update the row's account chip in place — same terminal id, new profile.
+            subscriptions.broadcast(delta: .terminalProfileChanged(TerminalProfileDelta(
+                terminalID: updated.id,
+                worktreeID: updated.worktreeID,
+                newProfileID: updated.profileID
+            )))
+        }
 
         if scheduleRecapture, respawnError == nil {
             scheduleSessionRecapture(

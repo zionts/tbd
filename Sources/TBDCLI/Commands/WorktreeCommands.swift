@@ -50,6 +50,9 @@ struct WorktreeCreate: AsyncParsableCommand {
     @Option(name: .long, help: "Initial prompt for the auto-created primary agent session")
     var prompt: String?
 
+    @Option(name: .long, help: "One-shot Codex model override for a Codex-primary worktree")
+    var codexModel: String?
+
     @Option(name: .long, help: "Read initial prompt from a file (use - for stdin)")
     var promptFile: String?
 
@@ -133,7 +136,8 @@ struct WorktreeCreate: AsyncParsableCommand {
                 callerWorktreeID: parentingFields.callerWorktreeID,
                 suppressAutoParent: parentingFields.suppressAutoParent,
                 claudeSettingsOverlay: claudeSettings,
-                autoArchiveOnMerge: archiveOnMerge ? true : nil
+                autoArchiveOnMerge: archiveOnMerge ? true : nil,
+                codexModel: codexModel
             ),
             resultType: Worktree.self
         )

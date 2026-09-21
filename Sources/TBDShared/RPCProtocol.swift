@@ -651,18 +651,23 @@ public struct TerminalSwapProfileParams: Codable, Sendable {
     /// clients still decode; a missing value defaults to `.inPlace` (seamless
     /// same-tab switch) — the common "Switch account" path.
     public let mode: TerminalSwapMode?
+    /// One-shot target model for Codex in-place switches. Claude profile
+    /// swaps leave this nil.
+    public let codexModel: String?
     public init(
         terminalID: UUID,
         newProfileID: UUID?,
         cols: Int? = nil,
         rows: Int? = nil,
-        mode: TerminalSwapMode? = nil
+        mode: TerminalSwapMode? = nil,
+        codexModel: String? = nil
     ) {
         self.terminalID = terminalID
         self.newProfileID = newProfileID
         self.cols = cols
         self.rows = rows
         self.mode = mode
+        self.codexModel = codexModel
     }
 
     /// Resolved mode with the default applied — `.inPlace` when the field is
@@ -1384,7 +1389,10 @@ public struct WorktreeCreateParams: Codable, Sendable {
     /// Optional/defaulted for backward compatibility (old daemons ignore the
     /// unknown key; old clients omit it).
     public let autoArchiveOnMerge: Bool?
-    public init(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, prompt: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, siblingOfWorktreeID: UUID? = nil, callerWorktreeID: UUID? = nil, suppressAutoParent: Bool? = nil, useExistingBranch: Bool? = nil, profileID: UUID? = nil, model: String? = nil, primaryAgentPreference: PrimaryAgentPreference? = nil, claudeSettingsOverlay: String? = nil, prNumber: Int? = nil, checkoutPRHead: Bool? = nil, autoArchiveOnMerge: Bool? = nil) {
+    /// Explicit one-shot model for a Codex primary spawn. Claude's `model`
+    /// field remains separate and is consumed only by the Claude arm.
+    public let codexModel: String?
+    public init(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, prompt: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, siblingOfWorktreeID: UUID? = nil, callerWorktreeID: UUID? = nil, suppressAutoParent: Bool? = nil, useExistingBranch: Bool? = nil, profileID: UUID? = nil, model: String? = nil, primaryAgentPreference: PrimaryAgentPreference? = nil, claudeSettingsOverlay: String? = nil, prNumber: Int? = nil, checkoutPRHead: Bool? = nil, autoArchiveOnMerge: Bool? = nil, codexModel: String? = nil) {
         self.repoID = repoID; self.folder = folder; self.branch = branch; self.displayName = displayName; self.prompt = prompt
         self.cols = cols; self.rows = rows
         self.parentWorktreeID = parentWorktreeID
@@ -1399,6 +1407,7 @@ public struct WorktreeCreateParams: Codable, Sendable {
         self.prNumber = prNumber
         self.checkoutPRHead = checkoutPRHead
         self.autoArchiveOnMerge = autoArchiveOnMerge
+        self.codexModel = codexModel
     }
 }
 
@@ -2328,11 +2337,14 @@ public struct TerminalCreateParams: Codable, Sendable {
     /// passthrough — TBD does not interpret the contents. Optional/defaulted for
     /// backward compatibility (old daemons ignore the unknown key; old clients omit it).
     public let claudeSettingsOverlay: String?
-    public init(worktreeID: UUID, cmd: String? = nil, type: TerminalCreateType? = nil, resumeSessionID: String? = nil, prompt: String? = nil, overrideProfileID: UUID? = nil, loginSession: Bool? = nil, cols: Int? = nil, rows: Int? = nil, colorFgBg: String? = nil, claudeSettingsOverlay: String? = nil) {
+    /// One-shot model override for a fresh Codex terminal.
+    public let model: String?
+    public init(worktreeID: UUID, cmd: String? = nil, type: TerminalCreateType? = nil, resumeSessionID: String? = nil, prompt: String? = nil, overrideProfileID: UUID? = nil, loginSession: Bool? = nil, cols: Int? = nil, rows: Int? = nil, colorFgBg: String? = nil, claudeSettingsOverlay: String? = nil, model: String? = nil) {
         self.worktreeID = worktreeID; self.cmd = cmd; self.type = type; self.resumeSessionID = resumeSessionID; self.prompt = prompt; self.overrideProfileID = overrideProfileID
         self.loginSession = loginSession
         self.cols = cols; self.rows = rows; self.colorFgBg = colorFgBg
         self.claudeSettingsOverlay = claudeSettingsOverlay
+        self.model = model
     }
 }
 

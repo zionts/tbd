@@ -32,6 +32,7 @@ struct TerminalRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
     var suspendedAt: Date?
     var suspendedSnapshot: String?
     var profile_id: String?
+    var codex_model: String?
     var transcriptPath: String?
     var sessionOrderObservedAt: Date?
     var codexTranscriptBoundaryOffset: Int64?
@@ -85,6 +86,7 @@ struct TerminalRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
         self.suspendedAt = terminal.suspendedAt
         self.suspendedSnapshot = terminal.suspendedSnapshot
         self.profile_id = terminal.profileID?.uuidString
+        self.codex_model = terminal.codexModel
         self.transcriptPath = terminal.transcriptPath
         self.sessionOrderObservedAt = terminal.sessionOrderObservedAt
         self.codexTranscriptBoundaryOffset = terminal.codexTranscriptBoundaryOffset
@@ -133,6 +135,7 @@ struct TerminalRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
             suspendedAt: suspendedAt,
             suspendedSnapshot: suspendedSnapshot,
             profileID: profile_id.flatMap(UUID.init(uuidString:)),
+            codexModel: codex_model,
             transcriptPath: transcriptPath,
             sessionOrderObservedAt: sessionOrderObservedAt,
             codexTranscriptBoundaryOffset: codexTranscriptBoundaryOffset,
@@ -697,6 +700,7 @@ public struct TerminalStore: Sendable {
         label: String? = nil,
         claudeSessionID: String? = nil,
         profileID: UUID? = nil,
+        codexModel: String? = nil,
         kind: TerminalKind? = nil,
         watchDeskRole: WatchDeskRole? = nil,
         transport: TerminalTransport = .tmux,
@@ -720,6 +724,7 @@ public struct TerminalStore: Sendable {
             label: label,
             claudeSessionID: claudeSessionID,
             profileID: profileID,
+            codexModel: codexModel,
             kind: kind,
             watchDeskRole: watchDeskRole,
             transport: transport,
@@ -1138,6 +1143,35 @@ public struct TerminalStore: Sendable {
                 record: &record,
                 sessionID: sessionID,
                 transcriptPath: transcriptPath,
+                at: date)
+            try record.update(db)
+            return incarnationID
+        }
+    }
+
+    /// Commit a Codex model replacement before launching the new process.
+    /// The Codex thread identity remains unchanged; the incarnation token
+    /// fences hooks from the outgoing process while the same tmux window is
+    /// respawned.
+    func prepareCodexModelRespawn(
+        id: UUID,
+        expectedState: TerminalReplacementSnapshot,
+        sessionID: String,
+        model: String,
+        at date: Date
+    ) async throws -> UUID? {
+        try await writer.write { db in
+            guard var record = try TerminalRecord.fetchOne(db, key: id.uuidString) else {
+                throw DatabaseError(message: "Terminal not found")
+            }
+            guard expectedState.matches(record),
+                  record.kind == TerminalKind.codex.rawValue
+                    || record.label == TerminalLabel.codex else { return nil }
+            record.codex_model = model
+            let incarnationID = resetAgentProcessLifecycle(
+                record: &record,
+                sessionID: sessionID,
+                transcriptPath: record.transcriptPath,
                 at: date)
             try record.update(db)
             return incarnationID

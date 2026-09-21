@@ -209,6 +209,8 @@ struct WorktreeProfilePickerView: View {
                         && highlightDefaultProfile
                 ) {
                     pick(profileID: nil, agent: .codex)
+                } onSelectModel: { model in
+                    pick(profileID: nil, codexModel: model, agent: .codex)
                 }
             }
         }
@@ -566,6 +568,7 @@ struct WorktreeProfilePickerView: View {
     private func pick(
         profileID: UUID?,
         model: String? = nil,
+        codexModel: String? = nil,
         agent: PrimaryAgentPreference
     ) {
         dismiss()
@@ -575,6 +578,7 @@ struct WorktreeProfilePickerView: View {
             parentWorktreeID: parentWorktreeID,
             profileID: profileID,
             model: model,
+            codexModel: codexModel,
             primaryAgentPreference: agent
         )
     }
@@ -690,6 +694,9 @@ private struct CodexPickerRow: View {
     let isLoading: Bool
     var highlighted = false
     let onSelect: () -> Void
+    var onSelectModel: (String) -> Void = { _ in }
+
+    private static let models = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"]
 
     @State private var isHovered = false
 
@@ -742,6 +749,12 @@ private struct CodexPickerRow: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
+        .contextMenu {
+            Text("Codex model")
+            ForEach(Self.models, id: \.self) { model in
+                Button(model) { onSelectModel(model) }
+            }
+        }
     }
 }
 

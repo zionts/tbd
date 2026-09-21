@@ -664,18 +664,22 @@ extension AppState {
     func swapTerminalProfile(
         terminalID: UUID,
         newProfileID: UUID?,
-        mode: TerminalSwapMode = .inPlace
+        mode: TerminalSwapMode = .inPlace,
+        codexModel: String? = nil
     ) async {
         do {
             let size = mainAreaTerminalSize()
             let resultTerminal = try await daemonClient.swapTerminalProfile(
                 terminalID: terminalID, newProfileID: newProfileID,
-                mode: mode, cols: size.cols, rows: size.rows
+                mode: mode, cols: size.cols, rows: size.rows,
+                codexModel: codexModel
             )
             guard mode == .fork else {
                 // In-place: same tab/row. The `terminalProfileChanged` +
                 // `terminalSessionUpdated` deltas already reconciled the row;
-                // nothing to add or re-select here.
+                // merge the authoritative result too so Codex's requested
+                // model is immediately visible without waiting for a hook.
+                mergeCreatedTerminal(resultTerminal)
                 return
             }
             mergeCreatedTerminalAndSelect(resultTerminal)

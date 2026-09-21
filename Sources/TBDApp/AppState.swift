@@ -1605,6 +1605,7 @@ final class AppState {
                 useExistingBranch: request.useExistingBranch,
                 profileID: request.profileID,
                 model: request.model,
+                codexModel: request.codexModel,
                 primaryAgentPreference: request.primaryAgentPreference,
                 prNumber: request.prNumber,
                 checkoutPRHead: request.checkoutPRHead

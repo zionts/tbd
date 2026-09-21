@@ -947,6 +947,26 @@ private struct TabBarItem: View {
 
         Divider()
 
+        if isCodexTerminal {
+            Menu("Change Codex model") {
+                ForEach(["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"], id: \.self) { model in
+                    Button {
+                        guard let terminalID = terminal?.id else { return }
+                        Task {
+                            await appState.swapTerminalProfile(
+                                terminalID: terminalID,
+                                newProfileID: nil,
+                                codexModel: model)
+                        }
+                    } label: {
+                        let prefix = terminal?.codexModel == model ? "● " : "  "
+                        Text("\(prefix)\(model)")
+                    }
+                }
+            }
+            Divider()
+        }
+
         if isClaudeTerminal {
             Button(formatProfileHeader(terminal?.profileID)) {}
                 .disabled(true)

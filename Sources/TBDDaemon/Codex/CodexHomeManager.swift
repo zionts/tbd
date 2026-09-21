@@ -484,8 +484,8 @@ enum CodexSpawnCommandBuilder {
         baseCommand(profileFlag: detectedProfileFlag)
     }
 
-    static func build(initialPrompt: String?) -> String {
-        build(initialPrompt: initialPrompt, profileFlag: detectedProfileFlag)
+    static func build(initialPrompt: String?, model: String? = nil) -> String {
+        build(initialPrompt: initialPrompt, model: model, profileFlag: detectedProfileFlag)
     }
 
     static func command(executablePath: String) -> String {
@@ -498,7 +498,8 @@ enum CodexSpawnCommandBuilder {
     static func build(
         initialPrompt: String?,
         resumeThreadID: String? = nil,
-        executablePath: String
+        executablePath: String,
+        model: String? = nil
     ) -> String {
         let profileFlag = detectProfileFlag(executablePath: executablePath) { arguments in
             commandOutput(arguments: arguments, timeout: 3)
@@ -507,7 +508,8 @@ enum CodexSpawnCommandBuilder {
             initialPrompt: initialPrompt,
             resumeThreadID: resumeThreadID,
             executablePath: executablePath,
-            profileFlag: profileFlag
+            profileFlag: profileFlag,
+            model: model
         )
     }
 
@@ -516,18 +518,20 @@ enum CodexSpawnCommandBuilder {
         codexHelpOutput: String? = nil,
         codexVersionOutput: String? = nil,
         resumeThreadID: String? = nil,
-        executablePath: String = "codex"
+        executablePath: String = "codex",
+        model: String? = nil
     ) -> String {
         build(
             initialPrompt: initialPrompt,
             resumeThreadID: resumeThreadID,
             executablePath: executablePath,
-            profileFlag: profileFlag(codexHelpOutput: codexHelpOutput, codexVersionOutput: codexVersionOutput)
+            profileFlag: profileFlag(codexHelpOutput: codexHelpOutput, codexVersionOutput: codexVersionOutput),
+            model: model
         )
     }
 
-    private static func build(initialPrompt: String?, profileFlag: String) -> String {
-        let command = baseCommand(profileFlag: profileFlag)
+    private static func build(initialPrompt: String?, model: String? = nil, profileFlag: String) -> String {
+        let command = baseCommand(profileFlag: profileFlag, model: model)
         guard let initialPrompt, !initialPrompt.isEmpty else {
             return command
         }
@@ -538,29 +542,40 @@ enum CodexSpawnCommandBuilder {
         initialPrompt: String?,
         resumeThreadID: String?,
         executablePath: String,
-        profileFlag: String
+        profileFlag: String,
+        model: String? = nil
     ) -> String {
         let command = baseCommand(
             executablePath: executablePath,
             profileFlag: profileFlag,
-            resumeThreadID: resumeThreadID)
+            resumeThreadID: resumeThreadID,
+            model: model)
         guard let initialPrompt, !initialPrompt.isEmpty else {
             return command
         }
         return "\(command) \(SystemPromptBuilder.shellEscape(initialPrompt))"
     }
 
-    private static func baseCommand(profileFlag: String) -> String {
-        return "unset CODEX_CI CODEX_THREAD_ID; codex \(profileFlag) tbd --dangerously-bypass-approvals-and-sandbox"
+    private static func baseCommand(profileFlag: String, model: String? = nil) -> String {
+        let modelArgument = model.map {
+            let setting = "model=\($0)"
+            return " -c \(SystemPromptBuilder.shellEscape(setting))"
+        } ?? ""
+        return "unset CODEX_CI CODEX_THREAD_ID; codex \(profileFlag) tbd\(modelArgument) --dangerously-bypass-approvals-and-sandbox"
     }
 
     private static func baseCommand(
         executablePath: String,
         profileFlag: String,
-        resumeThreadID: String? = nil
+        resumeThreadID: String? = nil,
+        model: String? = nil
     ) -> String {
         let executable = SystemPromptBuilder.shellEscape(executablePath)
-        let base = "unset CODEX_CI CODEX_THREAD_ID; \(executable) \(profileFlag) tbd --dangerously-bypass-approvals-and-sandbox"
+        let modelArgument = model.map {
+            let setting = "model=\($0)"
+            return " -c \(SystemPromptBuilder.shellEscape(setting))"
+        } ?? ""
+        let base = "unset CODEX_CI CODEX_THREAD_ID; \(executable) \(profileFlag) tbd\(modelArgument) --dangerously-bypass-approvals-and-sandbox"
         guard let resumeThreadID, !resumeThreadID.isEmpty else { return base }
         return "\(base) resume \(SystemPromptBuilder.shellEscape(resumeThreadID))"
     }

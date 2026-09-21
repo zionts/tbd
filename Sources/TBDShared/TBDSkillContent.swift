@@ -47,10 +47,19 @@ EOF
 Use `--type codex` to spawn Codex instead of Claude:
 
 ```bash
-tbd terminal create "$TBD_WORKTREE_ID" --type codex --prompt-file - <<'EOF'
+tbd terminal create "$TBD_WORKTREE_ID" --type codex --model gpt-6-astra --prompt-file - <<'EOF'
 Goal, what you've ruled out, file paths/lines, enough surrounding context
 that the new session can make judgment calls rather than follow narrow steps.
 EOF
+```
+
+For a manual Codex replacement when the terminal is not managed by TBD, use
+the same profile and model explicitly. Clear inherited CI/thread variables so
+the process cannot accidentally attach to another conversation:
+
+```bash
+unset CODEX_CI CODEX_THREAD_ID
+exec codex --profile tbd --model gpt-6-astra --dangerously-bypass-approvals-and-sandbox
 ```
 
 ### Create a new worktree with an initial task

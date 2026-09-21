@@ -548,10 +548,10 @@ actor DaemonClient {
     /// When `useExistingBranch` is true, `branch` MUST be set to an existing
     /// ref name (local like `foo` or remote like `origin/foo`) — the daemon
     /// checks it out instead of creating a new `tbd/*` branch.
-    func createWorktree(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, useExistingBranch: Bool = false, profileID: UUID? = nil, model: String? = nil, primaryAgentPreference: PrimaryAgentPreference? = nil, prNumber: Int? = nil, checkoutPRHead: Bool? = nil) async throws -> Worktree {
+    func createWorktree(repoID: UUID, folder: String? = nil, branch: String? = nil, displayName: String? = nil, cols: Int? = nil, rows: Int? = nil, parentWorktreeID: UUID? = nil, useExistingBranch: Bool = false, profileID: UUID? = nil, model: String? = nil, codexModel: String? = nil, primaryAgentPreference: PrimaryAgentPreference? = nil, prNumber: Int? = nil, checkoutPRHead: Bool? = nil) async throws -> Worktree {
         return try await callAsync(
             method: RPCMethod.worktreeCreate,
-            params: WorktreeCreateParams(repoID: repoID, folder: folder, branch: branch, displayName: displayName, cols: cols, rows: rows, parentWorktreeID: parentWorktreeID, useExistingBranch: useExistingBranch, profileID: profileID, model: model, primaryAgentPreference: primaryAgentPreference, prNumber: prNumber, checkoutPRHead: checkoutPRHead),
+            params: WorktreeCreateParams(repoID: repoID, folder: folder, branch: branch, displayName: displayName, cols: cols, rows: rows, parentWorktreeID: parentWorktreeID, useExistingBranch: useExistingBranch, profileID: profileID, model: model, primaryAgentPreference: primaryAgentPreference, prNumber: prNumber, checkoutPRHead: checkoutPRHead, codexModel: codexModel),
             resultType: Worktree.self
         )
     }
@@ -734,10 +734,10 @@ actor DaemonClient {
     }
 
     /// Create a terminal in a worktree.
-    func createTerminal(worktreeID: UUID, cmd: String? = nil, type: TerminalCreateType? = nil, resumeSessionID: String? = nil, overrideProfileID: UUID? = nil, loginSession: Bool? = nil, cols: Int? = nil, rows: Int? = nil, colorFgBg: String? = nil) async throws -> Terminal {
+    func createTerminal(worktreeID: UUID, cmd: String? = nil, type: TerminalCreateType? = nil, resumeSessionID: String? = nil, overrideProfileID: UUID? = nil, loginSession: Bool? = nil, cols: Int? = nil, rows: Int? = nil, colorFgBg: String? = nil, model: String? = nil) async throws -> Terminal {
         return try await callAsync(
             method: RPCMethod.terminalCreate,
-            params: TerminalCreateParams(worktreeID: worktreeID, cmd: cmd, type: type, resumeSessionID: resumeSessionID, overrideProfileID: overrideProfileID, loginSession: loginSession, cols: cols, rows: rows, colorFgBg: colorFgBg),
+            params: TerminalCreateParams(worktreeID: worktreeID, cmd: cmd, type: type, resumeSessionID: resumeSessionID, overrideProfileID: overrideProfileID, loginSession: loginSession, cols: cols, rows: rows, colorFgBg: colorFgBg, model: model),
             resultType: Terminal.self
         )
     }
@@ -2106,13 +2106,14 @@ actor DaemonClient {
         newProfileID: UUID?,
         mode: TerminalSwapMode = .inPlace,
         cols: Int? = nil,
-        rows: Int? = nil
+        rows: Int? = nil,
+        codexModel: String? = nil
     ) async throws -> Terminal {
         return try await callAsync(
             method: RPCMethod.terminalSwapProfile,
             params: TerminalSwapProfileParams(
                 terminalID: terminalID, newProfileID: newProfileID,
-                cols: cols, rows: rows, mode: mode
+                cols: cols, rows: rows, mode: mode, codexModel: codexModel
             ),
             resultType: Terminal.self
         )

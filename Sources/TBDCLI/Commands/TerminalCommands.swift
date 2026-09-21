@@ -31,6 +31,9 @@ struct TerminalCreate: AsyncParsableCommand {
     @Option(name: .long, help: "Terminal type (shell, claude, or codex)")
     var type: TerminalCreateType?
 
+    @Option(name: .long, help: "One-shot Codex model override (requires --type codex)")
+    var model: String?
+
     @Option(name: .long, help: "Initial prompt to send to the spawned agent session (requires --type claude or --type codex)")
     var prompt: String?
 
@@ -44,12 +47,15 @@ struct TerminalCreate: AsyncParsableCommand {
     var json = false
 
     mutating func run() async throws {
+        if model != nil, type != .codex {
+            throw ValidationError("--model requires --type codex; Claude models come from TBD profiles")
+        }
         let client = SocketClient()
         let worktreeID = try resolveWorktreeArg(worktree, client: client)
 
         let terminal: Terminal = try client.call(
             method: RPCMethod.terminalCreate,
-            params: TerminalCreateParams(worktreeID: worktreeID, cmd: cmd, type: type, prompt: try resolvePrompt(inline: prompt, file: promptFile), claudeSettingsOverlay: claudeSettings),
+            params: TerminalCreateParams(worktreeID: worktreeID, cmd: cmd, type: type, prompt: try resolvePrompt(inline: prompt, file: promptFile), claudeSettingsOverlay: claudeSettings, model: model),
             resultType: Terminal.self
         )
 

@@ -654,6 +654,9 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
     public var suspendedAt: Date?
     public var suspendedSnapshot: String?
     public var profileID: UUID?
+    /// Requested Codex model for this terminal's current process. Nil means
+    /// Codex configuration selected the model, or this is not a Codex row.
+    public var codexModel: String?
     /// Absolute path to the JSONL file Claude is writing for the current
     /// session, captured via the SessionStart hook. Persisted so the
     /// transcript handler can re-target accurately across `/clear` and
@@ -804,6 +807,7 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
                 pinnedAt: Date? = nil, claudeSessionID: String? = nil,
                 suspendedAt: Date? = nil, suspendedSnapshot: String? = nil,
                 profileID: UUID? = nil,
+                codexModel: String? = nil,
                 transcriptPath: String? = nil,
                 sessionOrderObservedAt: Date? = nil,
                 codexTranscriptBoundaryOffset: Int64? = nil,
@@ -839,6 +843,7 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
         self.suspendedAt = suspendedAt
         self.suspendedSnapshot = suspendedSnapshot
         self.profileID = profileID
+        self.codexModel = codexModel
         self.transcriptPath = transcriptPath
         self.sessionOrderObservedAt = sessionOrderObservedAt
         self.codexTranscriptBoundaryOffset = codexTranscriptBoundaryOffset
@@ -867,7 +872,7 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case id, worktreeID, tmuxWindowID, tmuxPaneID, label, createdAt
-        case pinnedAt, claudeSessionID, suspendedAt, suspendedSnapshot, profileID, transcriptPath
+        case pinnedAt, claudeSessionID, suspendedAt, suspendedSnapshot, profileID, codexModel, transcriptPath
         case sessionOrderObservedAt, codexTranscriptBoundaryOffset, sessionIncarnationID
         case pendingSessionIncarnationID, kind
         case activityState, presentationActivityState, presentationActivityObservedAt
@@ -891,6 +896,7 @@ public struct Terminal: Codable, Sendable, Identifiable, Equatable {
         suspendedAt = try c.decodeIfPresent(Date.self, forKey: .suspendedAt)
         suspendedSnapshot = try c.decodeIfPresent(String.self, forKey: .suspendedSnapshot)
         profileID = try c.decodeIfPresent(UUID.self, forKey: .profileID)
+        codexModel = try c.decodeIfPresent(String.self, forKey: .codexModel)
         transcriptPath = try c.decodeIfPresent(String.self, forKey: .transcriptPath)
         sessionOrderObservedAt = try c.decodeIfPresent(Date.self, forKey: .sessionOrderObservedAt)
         codexTranscriptBoundaryOffset = try c.decodeIfPresent(
