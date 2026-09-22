@@ -420,7 +420,7 @@ struct HookTabTransportGateTests {
 
         await lifecycle.closeHookTerminal(
             worktree: fx.worktree, tmuxServer: "tbd-test",
-            terminalID: terminal.id, windowID: "")
+            terminalID: terminal.id, windowID: "", paneID: "")
 
         #expect(
             captureCalls.count == 0,
@@ -476,7 +476,7 @@ struct HookTabTransportGateTests {
 
         await lifecycle.closeHookTerminal(
             worktree: fx.worktree, tmuxServer: "tbd-test",
-            terminalID: terminal.id, windowID: "")
+            terminalID: terminal.id, windowID: "", paneID: "")
 
         #expect(signaller.killed.isEmpty, "a recycled pid was force-killed by the hook teardown")
         #expect(signaller.terminated.isEmpty, "a recycled pid was signalled by the hook teardown")
@@ -521,7 +521,7 @@ struct HookTabTransportGateTests {
 
         await lifecycle.closeHookTerminal(
             worktree: fx.worktree, tmuxServer: "tbd-test",
-            terminalID: terminal.id, windowID: "")
+            terminalID: terminal.id, windowID: "", paneID: "")
 
         #expect(signaller.killed == [Self.jobPID])
         #expect(captureCalls.count == 0)
@@ -548,7 +548,7 @@ struct HookTabTransportGateTests {
 
         await lifecycle.closeHookTerminal(
             worktree: fx.worktree, tmuxServer: "tbd-test",
-            terminalID: terminal.id, windowID: "@hook")
+            terminalID: terminal.id, windowID: "@hook", paneID: "%hook")
 
         #expect(captureCalls.count == 1)
         #expect(recorder.snapshot().contains {
