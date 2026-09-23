@@ -63,3 +63,4 @@ Build slot queue: 728 (holding now) -> tbd-update diagnosis build -> 626-desk te
 - 19:55Z 728 4th REJECT (pin heuristic limits; narrow claim) -> 39cdb5b8 tests/docs, queued after 731. Stop rule: next heuristic gap -> Adam decides (a) keep closing / (b) accept stated limits / (c) simplify argv display (lean c).
 - 19:58Z VP pre-decided: next heuristic gap on 728 -> (c) show command + first arg only, redact rest, heuristic removed; trade stated in PR body; Adam can object before merge.
 - 20:0xZ 915 REJECT: budget reset even when archive throws -> fix 41c8b9f7 (+trigger test, him->them). Build queue: 731 (running) -> 728 (39cdb5b8) -> 915 (41c8b9f7).
+- 20:17Z #731 GREEN at e0f7b54e (628 passed; all checks + claude-review pass; CLEAN). No ps-veto follow-up (needs spec). Slot -> 728, then 915.
