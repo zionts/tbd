@@ -25,3 +25,8 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 GREEN (all checks + claude-review APPROVE, MERGEABLE, APPROVED): 866 be9812f6, 891 d3ecb91b, 728 d69076b9, 902 119acec7, 787 6180156d. 868 needed nothing.
 PARKED on Adam: 731 (539f733f untouched; local conveyor/731 = commit 1 rebased at 387fa5f7) and 626 (ebaf1b9b untouched): both collide with #804's TmuxPresence; lean C = split unique parts into new PRs. 626 also needs Adam to confirm the cap of 3.
 Worktrees left on disk: ~/Desktop/proj/tbd-conveyor-{731,866,891,728,787,902}.
+
+## Round 2 — Adam 17:00Z: "C for 731 and 626, cap is three"
+- 731: worker shrinking to commit 1 (pane .absent/.unreachable) on current main, rewriting body; assessing ps-veto follow-up (open only if still valuable AND a bug fix, else explain in body). Overlaps open #902 in paneSendProbe.
+- 626: worker opening new PR `tbd/watch-desk-recovery-bound` (Desk dup-spawn fix + bound of 3 on main's TmuxPresence; spec says Adam confirmed three 2026-09-23). Pane split NOT duplicated (lives in 731). 626 parked with body note, not closed.
+- 728: fell out of green (CONFLICTING after #912); worker re-rebasing + looping CI.
