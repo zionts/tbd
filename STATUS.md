@@ -7,10 +7,10 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 ## Progress
 - [!] 731 — PARKED 03:1xZ: main #804 landed a competing TmuxPresence design; needs Adam: A adopt main type, B +ps veto, C split (push commit 1 only; lean). Local conveyor/731 = 387fa5f7 (commit 1 rebased). Upstream untouched 539f733f (APPROVED).
 - [x] 866 — GREEN 03:55Z at be9812f6 (all checks pass, MERGEABLE, APPROVED).
-- [~] 891 — 03:55Z pushed d3ecb91b fixing all 3 review findings (bash 3.2 runs pass locally, CI moved to /bin/bash on macOS lint job); CI pending.
+- [x] 891 — GREEN 04:12Z at d3ecb91b (all checks incl. claude-review pass).
 - [!] 626 — PARKED 03:40Z: design collision w/ #804 (TmuxTargetExistence vs TmuxPresence). Unique on main: Desk dup-spawn fix + recovery bound; PaneSendTarget.unverifiable. Options A re-express / B force (no) / C split into 2 new PRs (lean). HIGH still needs Adam (cap of 3). Prose fix drafted: delete spec lines 90-96. Upstream untouched ebaf1b9b.
 - [~] 728 — d18db49f: claude-review REJECT round 2 (HIGH glued short flag -tSECRET; MED record heuristic in spec). 03:57Z worker fixing.
-- [~] 787 — 04:1xZ pushed 9540f0fe (stderr drained to EOF before exit reported, 1s grandchild fallback on injected clock; real /bin/sh test x20); 23 passed, lint clean; CI pending.
+- [~] 787 — 9540f0fe: claude-review failed on infra (reviewer emitted invalid JSON, fail-closed); rerun 04:12Z. test pending.
 - [~] 902 — 04:1xZ pushed 2565ad62 (paneOwnership tri-state; .unverifiable keeps at all 9 kill sites; refusal logs refused(target-mismatch)); 90 passed, lint clean; CI pending.
 - [x] 868 — nothing to do (current-head checks green)
 
