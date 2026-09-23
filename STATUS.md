@@ -10,7 +10,7 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 - [x] 891 — GREEN 04:12Z at d3ecb91b (all checks incl. claude-review pass).
 - [!] 626 — PARKED 03:40Z: design collision w/ #804 (TmuxTargetExistence vs TmuxPresence). Unique on main: Desk dup-spawn fix + recovery bound; PaneSendTarget.unverifiable. Options A re-express / B force (no) / C split into 2 new PRs (lean). HIGH still needs Adam (cap of 3). Prose fix drafted: delete spec lines 90-96. Upstream untouched ebaf1b9b.
 - [x] 728 — GREEN 05:50Z at d69076b9 (claude-review APPROVE, all checks pass).
-- [~] 787 — 05:5xZ pushed 6180156d (grace-path real grandchild test on EventDrivenTestClock; 3-way finish outcome; constants rationale); 25 passed, lint clean; CI pending.
+- [x] 787 — GREEN 05:57Z at 6180156d (claude-review APPROVE; 2 MINOR noted: RPCRouter render test, UTF-8-unaware 8KiB trim).
 - [x] 902 — GREEN 05:50Z at 119acec7 (claude-review APPROVE, all checks pass).
 - [x] 868 — nothing to do (current-head checks green)
 
@@ -20,3 +20,8 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 - 728: review HIGH redactArguments leak on adjacent secret flags (RemoteProviderIdentity.swift:216). test fail = HolderLifecycleTests.theJobDoesNotInheritTheCreationLock alreadyHeld (likely flake/unrelated).
 - 787: review MEDIUM stderr tail race in CodexSessionImporter finish(status:) (+MINOR: PR body omits stderr surfacing & cwd anchor). test fail = ArchivedWorktreeSearchTests debounce timeout (unrelated flake; run is from 09-14).
 - 902: review MEDIUM paneStillBelongsTo fails open on probe timeout (TmuxManager.swift:1340) vs reconcile's keep-on-unknown; MINOR refusal logged as transportFailed.
+
+## End state 05:57Z
+GREEN (all checks + claude-review APPROVE, MERGEABLE, APPROVED): 866 be9812f6, 891 d3ecb91b, 728 d69076b9, 902 119acec7, 787 6180156d. 868 needed nothing.
+PARKED on Adam: 731 (539f733f untouched; local conveyor/731 = commit 1 rebased at 387fa5f7) and 626 (ebaf1b9b untouched): both collide with #804's TmuxPresence; lean C = split unique parts into new PRs. 626 also needs Adam to confirm the cap of 3.
+Worktrees left on disk: ~/Desktop/proj/tbd-conveyor-{731,866,891,728,787,902}.
