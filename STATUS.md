@@ -38,3 +38,9 @@ Worktrees left on disk: ~/Desktop/proj/tbd-conveyor-{731,866,891,728,787,902}.
   Resume: VP sends "resume".
 - 731 worker (paused): build + lint pass at e0f7b54e, tests not run. NO ps-veto follow-up: a global `ps` check can't target a per-repo server, so it would turn nearly every real .absent into unknown and stall reclaim — that revises #804's theory (needs spec: pin TMUX_TMPDIR or match the server by socket path). Draft 731 body at scratchpad/pr731-body.md explains the deferral + the #902 overlap. The TMUX_TMPDIR drift bug is still live on main (the classifier reads "No such file" as .absent).
 - CORRECTION 728: pushed ae102196 (tested, 1375 passed) just before pause; MERGEABLE. claude-review REJECT: HIGH `-Token` case-sensitive miss; MED looksLikeSecret misses all-alpha/<20/>500. After resume: fix HIGH + test, document MED limits in spec. #912 removed session-header provider caption (dropped hunk; toolbar provider name = design choice, not done).
+
+## Resume 17:56Z (10:56 PT): ONE build at a time, globally
+Build slot queue: 728 (holding now) -> tbd-update diagnosis build -> 626-desk tests -> 731 tests.
+- 728: fixing -Token case-insensitivity + documenting looksLikeSecret limits in spec.
+- tbd update diagnosis: agent investigating (no builds until granted). Lead: #891 (unmerged) is the sqlite3.h fix; Sendable on global Logger maybe SDK-version.
+- Release pipeline: per CLAUDE.md, a new feature needs brainstormed spec w/ Adam answering Qs. Agent drafting spec + open questions (no code, no PR, no build) at ~/Desktop/proj/tbd-release-pipeline.
