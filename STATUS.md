@@ -67,3 +67,8 @@ Build slot queue: 728 (holding now) -> tbd-update diagnosis build -> 626-desk te
 - 20:34Z 728 on 39cdb5b8 (1378 passed) REJECT HIGH non-heuristic: withFreshestAgentAxis drops pendingQuestion -> fix 9ff8cd0d local. Slot -> 915 (41c8b9f7), then 728.
 - 21:00Z 915 41c8b9f7 passed locally (53 tests), pushing. Slot -> 728 (9ff8cd0d).
 - 21:15Z 915 REJECT on 41c8b9f7: HIGH hibernated replacement wedges gate 2 -> fix e7134488 (+ fail-closed tests), queued after 728. MEDIUM attribution: asked VP for Adam's one-line comment on #915; fallback drop attribution.
+
+## 23:04Z (16:04 PT) after the 2:25–4:00 PM usage wall
+MERGED 21:53Z: #731 e0f7b54e, #891 d3ecb91b, #787 6180156d.
+CONFLICTING now: #866 be9812f6, #902 119acec7 (vs #731 paneSendProbe), #914 f1548822 (also REVIEW_REQUIRED), #915 41c8b9f7 (local fix 48c63367 untested). #728 39cdb5b8 mergeable, local fix 9ff8cd0d untested. No workers alive, no builds.
+Next: 902 rebase -> 915 rebase+test -> 728 rebase+test; 866 + 914 mechanical rebases between.
