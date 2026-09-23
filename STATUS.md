@@ -10,8 +10,8 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 - [x] 891 — GREEN 04:12Z at d3ecb91b (all checks incl. claude-review pass).
 - [!] 626 — PARKED 03:40Z: design collision w/ #804 (TmuxTargetExistence vs TmuxPresence). Unique on main: Desk dup-spawn fix + recovery bound; PaneSendTarget.unverifiable. Options A re-express / B force (no) / C split into 2 new PRs (lean). HIGH still needs Adam (cap of 3). Prose fix drafted: delete spec lines 90-96. Upstream untouched ebaf1b9b.
 - [~] 728 — 05:2xZ pushed 7a020738 (alias -X=... covered; 76-case table; 201 passed); CI pending.
-- [~] 787 — 9540f0fe: tests green; claude-review failed twice on gate infra (correctness findings file invalid JSON at ~char 622-624, deterministic?). 2nd rerun 04:42Z.
-- [~] 902 — 04:5xZ pushed 0d4564a8 (doc comment: unverifiable leaves window until next Reconcile pass, verified reconcile reprobes) + PR body corrected; build clean; CI pending.
+- [~] 787 — 9540f0fe: tests green; claude-review failed 3x on gate infra (2x invalid JSON, 1x schema: disposition action no_change_needed). 3rd rerun 05:08Z; if it fails again = gate bug, park.
+- [~] 902 — 0d4564a8: review round 3 MEDIUM: tmux spawn failure (status 127) collapses to .missing -> .owned (fail-open). 05:08Z worker fixing + real-path test.
 - [x] 868 — nothing to do (current-head checks green)
 
 ## Recon (02:20Z)
