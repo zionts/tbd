@@ -30,3 +30,9 @@ Worktrees left on disk: ~/Desktop/proj/tbd-conveyor-{731,866,891,728,787,902}.
 - 731: worker shrinking to commit 1 (pane .absent/.unreachable) on current main, rewriting body; assessing ps-veto follow-up (open only if still valuable AND a bug fix, else explain in body). Overlaps open #902 in paneSendProbe.
 - 626: worker opening new PR `tbd/watch-desk-recovery-bound` (Desk dup-spawn fix + bound of 3 on main's TmuxPresence; spec says Adam confirmed three 2026-09-23). Pane split NOT duplicated (lives in 731). 626 parked with body note, not closed.
 - 728: fell out of green (CONFLICTING after #912); worker re-rebasing + looping CI.
+- 17:52Z PAUSED on VP order (laptop swapping during TBD update). All conveyor swift processes killed; nothing pushed.
+  - 731 local e0f7b54e (838e4eac commit 1 on main df0f384a + wake-switch classify fix), UNTESTED; upstream still 539f733f. ArchiveTombstoneTests restored from git after the kill.
+  - new Desk PR branch tbd/watch-desk-recovery-bound local 4bbd69cc: build + lint pass, DeskSession tests NOT run; not pushed, no PR.
+  - 626 untouched ebaf1b9b; body note pending until new PR exists.
+  - 728 local rebased (see VP msg), UNTESTED; upstream still d69076b9 (CONFLICTING).
+  Resume: VP sends "resume".
