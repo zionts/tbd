@@ -6,8 +6,8 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 
 ## Progress
 - [!] 731 — PARKED 03:1xZ: main #804 landed a competing TmuxPresence design; needs Adam: A adopt main type, B +ps veto, C split (push commit 1 only; lean). Local conveyor/731 = 387fa5f7 (commit 1 rebased). Upstream untouched 539f733f (APPROVED).
-- [ ] 866
-- [ ] 891
+- [~] 866 — 03:35Z pushed be9812f6 (rebased, 8 test calls got tab: .attach); local Remote filter 1298 passed; CI pending. VP told.
+- [~] 891 — 03:36Z worker rebasing (fork branch, push to origin)
 - [ ] 626
 - [ ] 728
 - [ ] 787
