@@ -5,7 +5,7 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 728 claude-review+test; 626 claude-review. 868 has 5 cancelled runs (re-run). 867/862/859/809 clean.
 
 ## Progress
-- [~] 731 — 03:05Z resumed: prior worker stopped mid-rebase (1/4 commits, 5 conflicts) in ~/Desktop/proj/tbd-conveyor-731; fresh worker finishing. Not pushed.
+- [!] 731 — PARKED 03:1xZ: main #804 landed a competing TmuxPresence design; needs Adam: A adopt main type, B +ps veto, C split (push commit 1 only; lean). Local conveyor/731 = 387fa5f7 (commit 1 rebased). Upstream untouched 539f733f (APPROVED).
 - [ ] 866
 - [ ] 891
 - [ ] 626
