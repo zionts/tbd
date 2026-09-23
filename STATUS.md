@@ -11,7 +11,7 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 - [!] 626 — PARKED 03:40Z: design collision w/ #804 (TmuxTargetExistence vs TmuxPresence). Unique on main: Desk dup-spawn fix + recovery bound; PaneSendTarget.unverifiable. Options A re-express / B force (no) / C split into 2 new PRs (lean). HIGH still needs Adam (cap of 3). Prose fix drafted: delete spec lines 90-96. Upstream untouched ebaf1b9b.
 - [~] 728 — d18db49f: claude-review REJECT round 2 (HIGH glued short flag -tSECRET; MED record heuristic in spec). 03:57Z worker fixing.
 - [~] 787 — 03:50Z worker fixing stderr drain race + rebase
-- [ ] 902
+- [~] 902 — 03:58Z worker fixing fail-open probe (keep on unknown) + refusal log outcome + rebase
 - [x] 868 — nothing to do (current-head checks green)
 
 ## Recon (02:20Z)
