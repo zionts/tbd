@@ -36,3 +36,4 @@ Worktrees left on disk: ~/Desktop/proj/tbd-conveyor-{731,866,891,728,787,902}.
   - 626 untouched ebaf1b9b; body note pending until new PR exists.
   - 728 local rebased (see VP msg), UNTESTED; upstream still d69076b9 (CONFLICTING).
   Resume: VP sends "resume".
+- 731 worker (paused): build + lint pass at e0f7b54e, tests not run. NO ps-veto follow-up: a global `ps` check can't target a per-repo server, so it would turn nearly every real .absent into unknown and stall reclaim — that revises #804's theory (needs spec: pin TMUX_TMPDIR or match the server by socket path). Draft 731 body at scratchpad/pr731-body.md explains the deferral + the #902 overlap. The TMUX_TMPDIR drift bug is still live on main (the classifier reads "No such file" as .absent).
