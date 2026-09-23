@@ -49,3 +49,5 @@ Build slot queue: 728 (holding now) -> tbd-update diagnosis build -> 626-desk te
 - 18:07Z release-pipeline spec draft: ~/Desktop/proj/tbd-release-pipeline, branch tbd/release-pipeline 01c3c676 (local only). 8 Qs sent to VP for Adam (recs: 1a opt-in default-off, 2b tested-only, 3a rolling prerelease N=20, 4c auto/4b manual attestation, 5a arm64, 6b, 7b, 8a). Key facts: TBD.app must be assembled + signed locally; ship 6 products + resource bundles; update clone stays checked out. Waiting on Adam's answers.
 - 18:24Z sent 'slot free' to VP; conveyor holding for 'update done'.
 - 728 local 7b93c35e (-Token case-insensitive; spec limits) broke gluedNonAlias test via Go-style over-redaction; chose (a) accept over-redaction + spec sentence. Awaiting go after update.
+- 19:06Z (12:06 PT) update done (VP: 1eadc926 -> df0f384a). Adam accepted all release recs (1a,2b,3a,4c/4b,5a,6b,7b,8a|8c). Build queue: 728 (go) -> 626-desk -> 731; release-pipeline tiny SwiftPM symlink check needs a slot too.
+- #914 (update.sh keeps build log + first errors, 75 = slot timeout) GREEN at f1548822, claude-review APPROVE.
