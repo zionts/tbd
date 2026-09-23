@@ -62,3 +62,4 @@ Build slot queue: 728 (holding now) -> tbd-update diagnosis build -> 626-desk te
 - 19:47Z 728 pushed 15324cb2 (tested), CI pending. 915 at 3cff9a81 (wording fixes), CI pending. Slot -> 731.
 - 19:55Z 728 4th REJECT (pin heuristic limits; narrow claim) -> 39cdb5b8 tests/docs, queued after 731. Stop rule: next heuristic gap -> Adam decides (a) keep closing / (b) accept stated limits / (c) simplify argv display (lean c).
 - 19:58Z VP pre-decided: next heuristic gap on 728 -> (c) show command + first arg only, redact rest, heuristic removed; trade stated in PR body; Adam can object before merge.
+- 20:0xZ 915 REJECT: budget reset even when archive throws -> fix 41c8b9f7 (+trigger test, him->them). Build queue: 731 (running) -> 728 (39cdb5b8) -> 915 (41c8b9f7).
