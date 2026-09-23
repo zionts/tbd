@@ -6,10 +6,10 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 
 ## Progress
 - [!] 731 — PARKED 03:1xZ: main #804 landed a competing TmuxPresence design; needs Adam: A adopt main type, B +ps veto, C split (push commit 1 only; lean). Local conveyor/731 = 387fa5f7 (commit 1 rebased). Upstream untouched 539f733f (APPROVED).
-- [~] 866 — be9812f6: claude-review PASS, lint pass; test pending.
-- [~] 891 — c934a5dd: test+lint green but claude-review REJECT (HIGH: bash-3.2 claim false, CI uses ubuntu/plain bash; MED ${!name+x}; MED Xcode prefix match). 03:50Z worker fixing.
+- [x] 866 — GREEN 03:55Z at be9812f6 (all checks pass, MERGEABLE, APPROVED).
+- [~] 891 — 03:55Z pushed d3ecb91b fixing all 3 review findings (bash 3.2 runs pass locally, CI moved to /bin/bash on macOS lint job); CI pending.
 - [!] 626 — PARKED 03:40Z: design collision w/ #804 (TmuxTargetExistence vs TmuxPresence). Unique on main: Desk dup-spawn fix + recovery bound; PaneSendTarget.unverifiable. Options A re-express / B force (no) / C split into 2 new PRs (lean). HIGH still needs Adam (cap of 3). Prose fix drafted: delete spec lines 90-96. Upstream untouched ebaf1b9b.
-- [~] 728 — 03:49Z pushed d18db49f (redaction fix + 3 tests, clean rebase); local 190 passed, HolderLifecycle passed; CI pending.
+- [~] 728 — d18db49f: claude-review REJECT round 2 (HIGH glued short flag -tSECRET; MED record heuristic in spec). 03:57Z worker fixing.
 - [~] 787 — 03:50Z worker fixing stderr drain race + rebase
 - [ ] 902
 - [x] 868 — nothing to do (current-head checks green)
