@@ -10,7 +10,7 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 - [x] 891 — GREEN 04:12Z at d3ecb91b (all checks incl. claude-review pass).
 - [!] 626 — PARKED 03:40Z: design collision w/ #804 (TmuxTargetExistence vs TmuxPresence). Unique on main: Desk dup-spawn fix + recovery bound; PaneSendTarget.unverifiable. Options A re-express / B force (no) / C split into 2 new PRs (lean). HIGH still needs Adam (cap of 3). Prose fix drafted: delete spec lines 90-96. Upstream untouched ebaf1b9b.
 - [~] 728 — 05:3xZ pushed d69076b9 (contract doc "What TBD shows" for pending_question; body points at spec); CI pending.
-- [~] 787 — 9540f0fe: review finally ran 05:14Z: MEDIUM grace/force fallback untested; MINOR throwaway grace Task; MINOR constants rationale. 05:16Z worker fixing.
+- [~] 787 — 05:5xZ pushed 6180156d (grace-path real grandchild test on EventDrivenTestClock; 3-way finish outcome; constants rationale); 25 passed, lint clean; CI pending.
 - [~] 902 — 05:4xZ pushed 119acec7 (status-127 spawn failure now throws -> .unverifiable; tmuxPathOverride seam; 3 real-path tests); 56 passed, lint clean; CI pending.
 - [x] 868 — nothing to do (current-head checks green)
 
