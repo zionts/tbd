@@ -55,3 +55,4 @@ Build slot queue: 728 (holding now) -> tbd-update diagnosis build -> 626-desk te
 - 19:15Z VP: B, D out; plan C now (ship non-app products; TBDApp builds locally), A as follow-up, unless Adam objects. Worker preparing the C-scoped PR (not opened) + A sketch on a separate branch.
 - 19:27Z 728 pushed 078c288b (tested); CI looping. Slot -> release symlink check (tiny), then 626-desk, then 731. Release C-scope ready locally at 1106318e (harness 282 ok, shellcheck/actionlint/swiftlint clean); A sketch 20bb5974 on tbd/bundle-module-relocatable.
 - 19:3xZ symlink check: 8a holds (SwiftPM replaces foreign .build/release link, writes nothing into target; cold + warm). Slot -> 626-desk tests.
+- 19:4xZ 728 on upstream 078c288b (1376 passed) REJECT round: bare KEY=value not key-checked; fix 15324cb2 local, queued after 626-desk. Queue: 626-desk (running) -> 728 -> 731.
