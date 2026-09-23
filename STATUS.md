@@ -57,3 +57,4 @@ Build slot queue: 728 (holding now) -> tbd-update diagnosis build -> 626-desk te
 - 19:3xZ symlink check: 8a holds (SwiftPM replaces foreign .build/release link, writes nothing into target; cold + warm). Slot -> 626-desk tests.
 - 19:4xZ 728 on upstream 078c288b (1376 passed) REJECT round: bare KEY=value not key-checked; fix 15324cb2 local, queued after 626-desk. Queue: 626-desk (running) -> 728 -> 731.
 - 19:5xZ 626-desk tests PASSED (52 tests, 4bbd69cc); worker pushing + opening PR. Slot -> 728 (15324cb2).
+- 19:34Z #915 opened (Desk fix + bound of 3) head 4bbd69cc, CI pending; #626 parked w/ note -> #915 + #731.
