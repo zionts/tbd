@@ -77,3 +77,4 @@ Next: 902 rebase -> 915 rebase+test -> 728 rebase+test; 866 + 914 mechanical reb
 - Wed Sep 23 23:30:34 UTC 2026: #916 marked ready (fleet rule: never draft; hold = BLOCKED BY line + no auto-merge). Stamps must be literal date -u.
 - Wed Sep 23 23:34:45 UTC 2026: #914 GREEN at bfb8862e (claude-review APPROVE after adding --auto test); needs human approval.
 - Wed Sep 23 23:39:51 UTC 2026: #916 REJECT: HIGH prebuilt trees leak on dry-run/failed-build/failed-handover exits; MED RELEASE_WALKBACK=10 no rationale. Worker fixing (shell/docs only).
+- Wed Sep 23 23:45:49 UTC 2026: #902 GREEN at 7d4a2a77 (rebased over #731: status!=127 catch kept, .unreachable->.unverifiable; 348 passed; claude-review APPROVE). Slot -> 915 (fresh worker: drop attribution + rebase + test 48c63367).
