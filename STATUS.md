@@ -66,3 +66,4 @@ Build slot queue: 728 (holding now) -> tbd-update diagnosis build -> 626-desk te
 - 20:17Z #731 GREEN at e0f7b54e (628 passed; all checks + claude-review pass; CLEAN). No ps-veto follow-up (needs spec). Slot -> 728, then 915.
 - 20:34Z 728 on 39cdb5b8 (1378 passed) REJECT HIGH non-heuristic: withFreshestAgentAxis drops pendingQuestion -> fix 9ff8cd0d local. Slot -> 915 (41c8b9f7), then 728.
 - 21:00Z 915 41c8b9f7 passed locally (53 tests), pushing. Slot -> 728 (9ff8cd0d).
+- 21:15Z 915 REJECT on 41c8b9f7: HIGH hibernated replacement wedges gate 2 -> fix e7134488 (+ fail-closed tests), queued after 728. MEDIUM attribution: asked VP for Adam's one-line comment on #915; fallback drop attribution.
