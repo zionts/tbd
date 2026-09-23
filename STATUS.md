@@ -13,3 +13,10 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 - [ ] 787
 - [ ] 902
 - [ ] 868 re-run cancelled
+
+## Recon (02:20Z)
+- 868: current-head checks all pass; the 5 cancelled runs are superseded older runs. Nothing to re-run. DONE.
+- 626: claude-review REJECT (re-asserted, diff unchanged). HIGH = spec claims "Adam chose three on 2026-08-17" for the recovery cap; reviewer wants a human to confirm. NEEDS ADAM: did he choose 3? Also MEDIUM: spec narrates commit revision history (lines 91-96) -> rewrite; MEDIUM wakeTmuxSection fail-open (pre-existing, disclosed). Also now CONFLICTING.
+- 728: review HIGH redactArguments leak on adjacent secret flags (RemoteProviderIdentity.swift:216). test fail = HolderLifecycleTests.theJobDoesNotInheritTheCreationLock alreadyHeld (likely flake/unrelated).
+- 787: review MEDIUM stderr tail race in CodexSessionImporter finish(status:) (+MINOR: PR body omits stderr surfacing & cwd anchor). test fail = ArchivedWorktreeSearchTests debounce timeout (unrelated flake; run is from 09-14).
+- 902: review MEDIUM paneStillBelongsTo fails open on probe timeout (TmuxManager.swift:1340) vs reconcile's keep-on-unknown; MINOR refusal logged as transportFailed.
