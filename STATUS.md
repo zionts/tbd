@@ -5,14 +5,14 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 728 claude-review+test; 626 claude-review. 868 has 5 cancelled runs (re-run). 867/862/859/809 clean.
 
 ## Progress
-- [ ] 731
+- [~] 731 — 03:05Z resumed: prior worker stopped mid-rebase (1/4 commits, 5 conflicts) in ~/Desktop/proj/tbd-conveyor-731; fresh worker finishing. Not pushed.
 - [ ] 866
 - [ ] 891
 - [ ] 626
 - [ ] 728
 - [ ] 787
 - [ ] 902
-- [ ] 868 re-run cancelled
+- [x] 868 — nothing to do (current-head checks green)
 
 ## Recon (02:20Z)
 - 868: current-head checks all pass; the 5 cancelled runs are superseded older runs. Nothing to re-run. DONE.
