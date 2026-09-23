@@ -8,8 +8,8 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 - [!] 731 — PARKED 03:1xZ: main #804 landed a competing TmuxPresence design; needs Adam: A adopt main type, B +ps veto, C split (push commit 1 only; lean). Local conveyor/731 = 387fa5f7 (commit 1 rebased). Upstream untouched 539f733f (APPROVED).
 - [~] 866 — 03:35Z pushed be9812f6 (rebased, 8 test calls got tab: .attach); local Remote filter 1298 passed; CI pending. VP told.
 - [~] 891 — 03:37Z pushed c934a5dd (test-list conflict w/ #900 kept both); update/restart-build-lib/test-fence harnesses ALL PASSED; CI pending. VP told.
-- [~] 626 — 03:39Z worker assessing #804 overlap before any rebase; HIGH still needs Adam (cap of 3).
-- [ ] 728
+- [!] 626 — PARKED 03:40Z: design collision w/ #804 (TmuxTargetExistence vs TmuxPresence). Unique on main: Desk dup-spawn fix + recovery bound; PaneSendTarget.unverifiable. Options A re-express / B force (no) / C split into 2 new PRs (lean). HIGH still needs Adam (cap of 3). Prose fix drafted: delete spec lines 90-96. Upstream untouched ebaf1b9b.
+- [~] 728 — 03:40Z worker fixing redactArguments HIGH + rebase
 - [ ] 787
 - [ ] 902
 - [x] 868 — nothing to do (current-head checks green)
