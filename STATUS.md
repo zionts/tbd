@@ -44,3 +44,4 @@ Build slot queue: 728 (holding now) -> tbd-update diagnosis build -> 626-desk te
 - 728: fixing -Token case-insensitivity + documenting looksLikeSecret limits in spec.
 - tbd update diagnosis: agent investigating (no builds until granted). Lead: #891 (unmerged) is the sqlite3.h fix; Sendable on global Logger maybe SDK-version.
 - Release pipeline: per CLAUDE.md, a new feature needs brainstormed spec w/ Adam answering Qs. Agent drafting spec + open questions (no code, no PR, no build) at ~/Desktop/proj/tbd-release-pipeline.
+- 18:00Z tbd update ROOT CAUSE: nix dev-shell SDKROOT leak -> nix MacOSX14.4.sdk (no sqlite3.h; Logger not Sendable there). #891 fixes both. First failure was swift-safe 1800s slot timeout (our builds). Proposed: real update from clean login shell = the verification; offered slot after 728.
