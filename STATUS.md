@@ -11,7 +11,7 @@ Snapshot 02:11Z: 626 is now also CONFLICTING. Failing checks: 902 claude-review;
 - [!] 626 — PARKED 03:40Z: design collision w/ #804 (TmuxTargetExistence vs TmuxPresence). Unique on main: Desk dup-spawn fix + recovery bound; PaneSendTarget.unverifiable. Options A re-express / B force (no) / C split into 2 new PRs (lean). HIGH still needs Adam (cap of 3). Prose fix drafted: delete spec lines 90-96. Upstream untouched ebaf1b9b.
 - [~] 728 — 9aad791b: tests green; claude-review REJECT round 3 (glued non-alias flag -oMyApiToken123 leaks + redacts next arg). 04:42Z worker closing the glued-flag class.
 - [~] 787 — 9540f0fe: tests green; claude-review failed twice on gate infra (correctness findings file invalid JSON at ~char 622-624, deterministic?). 2nd rerun 04:42Z.
-- [~] 902 — 2565ad62: tests green; claude-review REJECT only on PR-body misstatement (unreadable probe now refuses, not falls back). Gate re-asserts on unchanged patch-id, so 04:42Z worker adds doc-comment on consequence + fixes body.
+- [~] 902 — 04:5xZ pushed 0d4564a8 (doc comment: unverifiable leaves window until next Reconcile pass, verified reconcile reprobes) + PR body corrected; build clean; CI pending.
 - [x] 868 — nothing to do (current-head checks green)
 
 ## Recon (02:20Z)
