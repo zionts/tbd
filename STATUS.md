@@ -73,3 +73,4 @@ MERGED 21:53Z: #731 e0f7b54e, #891 d3ecb91b, #787 6180156d.
 CONFLICTING now: #866 be9812f6, #902 119acec7 (vs #731 paneSendProbe), #914 f1548822 (also REVIEW_REQUIRED), #915 41c8b9f7 (local fix 48c63367 untested). #728 39cdb5b8 mergeable, local fix 9ff8cd0d untested. No workers alive, no builds.
 Next: 902 rebase -> 915 rebase+test -> 728 rebase+test; 866 + 914 mechanical rebases between.
 - 23:1xZ VP decisions: open release PR now as held DRAFT (BLOCKED BY Adam's app-bundle choice; C then A) — agent rebasing onto main (post-#891) + opening, no local swift; 915: drop attribution (fallback), state 3 as design's choice. Running: 902 rebase+build (slot), 914 shell rebase.
+- 23:30Z #916 release pipeline opened as held DRAFT, head a0df122c, CI green (claude-review skipped while draft).
