@@ -74,3 +74,4 @@ CONFLICTING now: #866 be9812f6, #902 119acec7 (vs #731 paneSendProbe), #914 f154
 Next: 902 rebase -> 915 rebase+test -> 728 rebase+test; 866 + 914 mechanical rebases between.
 - 23:1xZ VP decisions: open release PR now as held DRAFT (BLOCKED BY Adam's app-bundle choice; C then A) — agent rebasing onto main (post-#891) + opening, no local swift; 915: drop attribution (fallback), state 3 as design's choice. Running: 902 rebase+build (slot), 914 shell rebase.
 - 23:30Z #916 release pipeline opened as held DRAFT, head a0df122c, CI green (claude-review skipped while draft).
+- Wed Sep 23 23:30:34 UTC 2026: #916 marked ready (fleet rule: never draft; hold = BLOCKED BY line + no auto-merge). Stamps must be literal date -u.
