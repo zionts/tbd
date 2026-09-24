@@ -81,3 +81,4 @@ Next: 902 rebase -> 915 rebase+test -> 728 rebase+test; 866 + 914 mechanical reb
 - Thu Sep 24 00:03:12 UTC 2026: #915 pushed aed02047 (attribution dropped, rebased, tested), CI polling. Slot -> 728 (fresh worker; rebase + test 9ff8cd0d; (c) pre-decided).
 - Thu Sep 24 00:05:41 UTC 2026: #916 GREEN at 946cf9ab (reconcile_prebuilt on start + every exit; WALKBACK rationale; claude-review APPROVE; 2 MINOR left). Held by BLOCKED BY line.
 - Thu Sep 24 00:29:48 UTC 2026: #728 pushed 95940695 (rebased + pendingQuestion fix, tested), CI pending. #915 at f9e3b1da (docs-only review rounds). Slot -> #866 rebase.
+- Thu Sep 24 00:53:33 UTC 2026: #915 GREEN at 1ebda4de (attribution dropped; 57 passed; claude-review APPROVE). Open: MINOR CandidateClassification.merge drops rowsUnreadable (needs build); untracked follow-up = reconciler for proven-absent desk replacements.
