@@ -82,3 +82,4 @@ Next: 902 rebase -> 915 rebase+test -> 728 rebase+test; 866 + 914 mechanical reb
 - Thu Sep 24 00:05:41 UTC 2026: #916 GREEN at 946cf9ab (reconcile_prebuilt on start + every exit; WALKBACK rationale; claude-review APPROVE; 2 MINOR left). Held by BLOCKED BY line.
 - Thu Sep 24 00:29:48 UTC 2026: #728 pushed 95940695 (rebased + pendingQuestion fix, tested), CI pending. #915 at f9e3b1da (docs-only review rounds). Slot -> #866 rebase.
 - Thu Sep 24 00:53:33 UTC 2026: #915 GREEN at 1ebda4de (attribution dropped; 57 passed; claude-review APPROVE). Open: MINOR CandidateClassification.merge drops rowsUnreadable (needs build); untracked follow-up = reconciler for proven-absent desk replacements.
+- Thu Sep 24 01:01:15 UTC 2026: #866 GREEN be85bed9; #862 force-pushed 85031daa->5be0beb6 (patch-identical rebase) so #866 = 1 commit/11 files. Watcher on 862/866 CI + 866 body fix.
