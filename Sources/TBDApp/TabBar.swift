@@ -588,6 +588,9 @@ enum ContinueInCodexMenu {
 /// before it interrupts the source process.
 enum ContinueInClaudeMenu {
     static let busyCaption = "Finish the current Codex turn before continuing."
+    /// The first choice: let the daemon pick the account as it would for a
+    /// new Claude session, balancing included.
+    static let automaticLabel = "Same account as a new session"
 
     static func isVisible(for terminal: Terminal?) -> Bool {
         terminal?.isCodexTerminal == true
@@ -940,6 +943,19 @@ private struct TabBarItem: View {
     @ViewBuilder
     private func continueInClaudeMenuItems() -> some View {
         let enabled = ContinueInClaudeMenu.isEnabled(for: terminal)
+
+        // The daemon picks, exactly as for a new Claude tab in this worktree:
+        // repo override, then the balanced pick or the global default.
+        Button(ContinueInClaudeMenu.automaticLabel) {
+            guard let terminalID = terminal?.id else { return }
+            Task {
+                await appState.continueInClaude(
+                    sourceTerminalID: terminalID,
+                    profileID: nil,
+                    automaticProfile: true)
+            }
+        }
+        .disabled(!enabled)
 
         Button("Default (logged in)") {
             guard let terminalID = terminal?.id else { return }

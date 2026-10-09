@@ -753,10 +753,13 @@ actor DaemonClient {
     }
 
     /// Replace one idle Codex process with a fresh Claude session in the same
-    /// terminal row and tmux window. A nil profile selects the ambient login.
+    /// terminal row and tmux window. A nil profile selects the ambient login,
+    /// unless `automaticProfile` asks the daemon to choose as it would for a
+    /// new session.
     func continueInClaude(
         sourceTerminalID: UUID,
         profileID: UUID?,
+        automaticProfile: Bool = false,
         cols: Int?,
         rows: Int?
     ) async throws -> Terminal {
@@ -766,7 +769,8 @@ actor DaemonClient {
                 sourceTerminalID: sourceTerminalID,
                 profileID: profileID,
                 cols: cols,
-                rows: rows),
+                rows: rows,
+                automaticProfile: automaticProfile),
             resultType: Terminal.self)
     }
 

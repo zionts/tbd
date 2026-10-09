@@ -18,15 +18,59 @@ struct TerminalContinueInClaudeCommandTests {
         }
     }
 
-    @Test("accepts an ambient-account request")
-    func parsesAmbientRequest() throws {
+    @Test("accepts a request that names no account")
+    func parsesAutomaticRequest() throws {
         let command = try TerminalContinueInClaude.parse([
             "--terminal", terminalID,
         ])
 
         #expect(command.terminal == terminalID)
         #expect(command.profile == nil)
+        #expect(!command.ambient)
         #expect(!command.json)
+    }
+
+    @Test("accepts an explicit ambient-login request")
+    func parsesAmbientRequest() throws {
+        let command = try TerminalContinueInClaude.parse([
+            "--terminal", terminalID, "--ambient",
+        ])
+
+        #expect(command.ambient)
+        #expect(command.profile == nil)
+    }
+
+    @Test("refuses a profile and the ambient login together")
+    func refusesProfileWithAmbient() {
+        #expect(throws: (any Error).self) {
+            _ = try TerminalContinueInClaude.parse([
+                "--terminal", terminalID, "--profile", "Work", "--ambient",
+            ])
+        }
+    }
+
+    /// Naming no account asks the daemon to choose as it would for a new
+    /// session — balancing included — so the CLI no longer lands on the
+    /// ambient login unless asked to.
+    @Test("no account named routes through the daemon's choice")
+    func paramsRouteThroughTheDaemonsChoice() throws {
+        let id = try #require(UUID(uuidString: terminalID))
+        let profileID = UUID()
+
+        let automatic = TerminalContinueInClaude.params(
+            terminalID: id, profileID: nil, ambient: false)
+        #expect(automatic.profileID == nil)
+        #expect(automatic.automaticProfile == true)
+
+        let ambient = TerminalContinueInClaude.params(
+            terminalID: id, profileID: nil, ambient: true)
+        #expect(ambient.profileID == nil)
+        #expect(ambient.automaticProfile == false)
+
+        let named = TerminalContinueInClaude.params(
+            terminalID: id, profileID: profileID, ambient: false)
+        #expect(named.profileID == profileID)
+        #expect(named.automaticProfile == false)
     }
 
     @Test("accepts profile selection and JSON output")

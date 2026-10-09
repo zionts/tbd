@@ -221,6 +221,106 @@ struct ContinueInClaudeTransactionTests {
         #expect(replacement == updated)
     }
 
+    /// Drives one Continue in Claude request through readiness and returns
+    /// the committed row.
+    private func completeContinue(
+        _ fixture: RPCFixture,
+        params: TerminalContinueInClaudeParams
+    ) async throws -> Terminal {
+        let request = try RPCRequest(
+            method: RPCMethod.terminalContinueInClaude, params: params)
+        let responseTask = Task { await fixture.router.handle(request) }
+        let pending = try await waitForPending(
+            terminalID: fixture.terminal.id, in: fixture.db)
+        let freshSessionID = try #require(await waitForFreshClaudeSessionID(
+            in: fixture.recorder))
+        let hook = try RPCRequest(
+            method: RPCMethod.terminalSessionEvent,
+            params: TerminalSessionEventParams(
+                terminalID: fixture.terminal.id,
+                sessionID: freshSessionID,
+                transcriptPath: fixture.root.appendingPathComponent("claude.jsonl").path,
+                source: "startup",
+                cwd: fixture.root.path,
+                sessionIncarnationID: pending))
+        #expect((await fixture.router.handle(hook)).success)
+        let response = await responseTask.value
+        #expect(response.success, "\(String(describing: response.error))")
+        return try response.decodeResult(Terminal.self)
+    }
+
+    private func freshSnapshot(percent: Double) -> ProfileUsageSnapshot {
+        ProfileUsageSnapshot(
+            buckets: [ClaudeUsageLimitBucket(kind: "session", group: "session", percent: percent)],
+            fetchedAt: Date(), lastAttemptAt: Date(), status: "ok", statusKind: .ok)
+    }
+
+    /// A request that names no account and asks for the automatic choice gets
+    /// the account a new Claude session would: here the global default. A
+    /// request that names nothing and does not ask keeps the ambient login, so
+    /// an older client's meaning is unchanged.
+    @Test("an automatic request takes the spawn chain; a bare one stays ambient",
+          arguments: [true, false])
+    func automaticRequestTakesTheSpawnChain(automatic: Bool) async throws {
+        let fixture = try await makeRPCFixture(ownsPane: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let work = try await fixture.db.modelProfiles.create(name: "Work", kind: .oauthToken)
+        try await fixture.db.config.setDefaultProfileID(work.id)
+
+        let updated = try await completeContinue(fixture, params: TerminalContinueInClaudeParams(
+            sourceTerminalID: fixture.terminal.id, automaticProfile: automatic))
+
+        #expect(updated.kind == .claude)
+        #expect(updated.profileID == (automatic ? work.id : nil))
+    }
+
+    /// The incident shape for this path: Continue in Claude used to bypass
+    /// balancing entirely. With balancing on, the automatic choice is the
+    /// balanced pick, not the default.
+    @Test("an automatic request is balanced when balancing is on")
+    func automaticRequestIsBalanced() async throws {
+        let fixture = try await makeRPCFixture(ownsPane: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let busy = try await fixture.db.modelProfiles.create(name: "Busy", kind: .oauthToken)
+        let roomy = try await fixture.db.modelProfiles.create(name: "Roomy", kind: .oauthToken)
+        try await fixture.db.oauthUsageSnapshots.upsert(
+            profileID: busy.id, snapshot: freshSnapshot(percent: 70))
+        try await fixture.db.oauthUsageSnapshots.upsert(
+            profileID: roomy.id, snapshot: freshSnapshot(percent: 10))
+        try await fixture.db.config.setDefaultProfileID(busy.id)
+        try await fixture.db.config.setProfileBalancingEnabled(true)
+
+        let updated = try await completeContinue(fixture, params: TerminalContinueInClaudeParams(
+            sourceTerminalID: fixture.terminal.id, automaticProfile: true))
+
+        #expect(updated.profileID == roomy.id)
+    }
+
+    /// An explicit profile still wins over the automatic choice.
+    @Test("an explicit profile wins over an automatic request")
+    func explicitProfileWinsOverAutomatic() async throws {
+        let fixture = try await makeRPCFixture(ownsPane: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let picked = try await fixture.db.modelProfiles.create(name: "Picked", kind: .oauthToken)
+        let other = try await fixture.db.modelProfiles.create(name: "Other", kind: .oauthToken)
+        try await fixture.db.config.setDefaultProfileID(other.id)
+
+        let updated = try await completeContinue(fixture, params: TerminalContinueInClaudeParams(
+            sourceTerminalID: fixture.terminal.id, profileID: picked.id, automaticProfile: true))
+
+        #expect(updated.profileID == picked.id)
+    }
+
+    @Test("params from an older client decode with no automatic choice")
+    func olderClientParamsStayAmbient() throws {
+        let id = UUID()
+        let json = #"{"sourceTerminalID":"\#(id.uuidString)"}"#
+        let params = try JSONDecoder().decode(
+            TerminalContinueInClaudeParams.self, from: Data(json.utf8))
+        #expect(params.automaticProfile == nil)
+        #expect(params.profileID == nil)
+    }
+
     @Test("a packet far over tmux's command limit travels as a file and is reclaimed")
     func largePacketTravelsAsFile() async throws {
         // tmux rejects a respawn-window command over about 16 KiB ("command

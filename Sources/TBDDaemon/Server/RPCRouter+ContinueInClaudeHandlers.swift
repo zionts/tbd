@@ -123,6 +123,9 @@ private struct PreparedContinueInClaude: Sendable {
     let rolloutFingerprint: CodexRolloutFingerprint
     let worktree: LocalWorktree
     let profileID: UUID?
+    /// The balanced pick's reservation when the account was resolved
+    /// automatically; settled once the transaction ends either way.
+    let reservationID: UUID?
     let freshClaudeSessionID: String
     let claudeCommand: String
     /// The staged continuation packet `claudeCommand` reads at launch; removed
@@ -157,14 +160,20 @@ extension RPCRouter {
         // the Claude shell is being replaced by the Codex rollback.
         defer { ContinuationPacketFile.remove(path: prepared.packetFilePath) }
 
-        let actuationID = try await beginActuation(
-            .terminalContinueInClaude,
-            actor: actor,
-            target: .local(
-                worktree: prepared.source.worktreeID,
-                terminal: prepared.source.id),
-            agent: TerminalKind.claude.rawValue,
-            profile: prepared.profileID?.uuidString)
+        let actuationID: String
+        do {
+            actuationID = try await beginActuation(
+                .terminalContinueInClaude,
+                actor: actor,
+                target: .local(
+                    worktree: prepared.source.worktreeID,
+                    terminal: prepared.source.id),
+                agent: TerminalKind.claude.rawValue,
+                profile: prepared.profileID?.uuidString)
+        } catch {
+            await modelProfileResolver.settleReservation(prepared.reservationID)
+            throw error
+        }
 
         let response: RPCResponse
         do {
@@ -182,6 +191,10 @@ extension RPCRouter {
             response = RPCResponse(error: "Continue in Claude failed: \(error.localizedDescription)")
         }
 
+        // A balanced pick's reservation stops counting either way: on success
+        // the finalized row now carries the session in the live counts, and on
+        // failure no session landed on that profile at all.
+        await modelProfileResolver.settleReservation(prepared.reservationID)
         if response.success {
             await finishActuation(actuationID, .dispatched)
         } else {
@@ -271,7 +284,7 @@ extension RPCRouter {
                 "Worktree directory is missing on disk: \(worktree.path)")
         }
 
-        let resolvedProfile: ResolvedModelProfile?
+        var resolvedProfile: ResolvedModelProfile?
         if let profileID = params.profileID {
             do {
                 resolvedProfile = try await modelProfileResolver.loadByID(profileID)
@@ -307,6 +320,23 @@ extension RPCRouter {
             nil
         }
         let config = try? await db.config.get()
+        if params.profileID == nil, params.automaticProfile == true {
+            // The account a new Claude session in this worktree would get, by
+            // the same chain `terminal.create` uses: this starts a fresh
+            // conversation, so it is balanced like one. Resolved here, after
+            // every step that can refuse, so only the packet write below can
+            // fail with a reservation held — and that path releases it. A
+            // resolution failure falls back to the ambient login, as a new
+            // terminal's does.
+            do {
+                resolvedProfile = try await modelProfileResolver.resolve(
+                    repoID: worktree.repoID, worktreeID: worktree.id)
+            } catch {
+                continueInClaudeLogger.warning(
+                    "Continue in Claude: automatic profile resolution failed; using the ambient login: \(error.localizedDescription, privacy: .public)")
+                resolvedProfile = nil
+            }
+        }
         let freshClaudeSessionID = UUID().uuidString
         let profileConfigDir = await configDirManager.resolveConfigDir(for: resolvedProfile)
         await ClaudeTrustSeeder.ensureTrusted(
@@ -335,6 +365,7 @@ extension RPCRouter {
             packetFilePath = try ContinuationPacketFile.write(
                 packet, terminalID: source.id)
         } catch {
+            await modelProfileResolver.settleReservation(resolvedProfile?.reservationID)
             throw ContinueInClaudeError(
                 "Could not stage the continuation packet: \(error.localizedDescription)")
         }
@@ -391,6 +422,7 @@ extension RPCRouter {
             rolloutFingerprint: rolloutFingerprint,
             worktree: worktree,
             profileID: resolvedProfile?.profileID,
+            reservationID: resolvedProfile?.reservationID,
             freshClaudeSessionID: freshClaudeSessionID,
             claudeCommand: claudeSpawn.command,
             packetFilePath: packetFilePath,

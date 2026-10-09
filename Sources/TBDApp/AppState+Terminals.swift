@@ -865,7 +865,9 @@ extension AppState {
     /// Replace an idle Codex process with Claude in the same terminal row and
     /// tmux window. The daemon owns eligibility and rollback; this layer keeps
     /// the UI on the existing tab and adopts the returned replacement row.
-    func continueInClaude(sourceTerminalID: UUID, profileID: UUID?) async {
+    func continueInClaude(
+        sourceTerminalID: UUID, profileID: UUID?, automaticProfile: Bool = false
+    ) async {
         guard let source = terminals.values
             .flatMap({ $0 })
             .first(where: { $0.id == sourceTerminalID }) else {
@@ -878,6 +880,7 @@ extension AppState {
             let updated = try await daemonClient.continueInClaude(
                 sourceTerminalID: sourceTerminalID,
                 profileID: profileID,
+                automaticProfile: automaticProfile,
                 cols: size.cols,
                 rows: size.rows)
             guard updated.id == source.id,

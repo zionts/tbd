@@ -749,11 +749,20 @@ struct TerminalContinueInClaude: AsyncParsableCommand {
     @Option(name: .long, help: "Codex terminal ID (UUID)")
     var terminal: String
 
-    @Option(name: .long, help: "Claude profile name or UUID (defaults to the logged-in account)")
+    @Option(name: .long, help: "Claude profile name or UUID (default: the account a new Claude session in this worktree would get — repo override, balanced pick or global default)")
     var profile: String?
+
+    @Flag(name: .long, help: "Use Claude's ambient login instead of a TBD profile")
+    var ambient = false
 
     @Flag(name: .long, help: "Output JSON")
     var json = false
+
+    mutating func validate() throws {
+        if profile != nil && ambient {
+            throw ValidationError("--profile and --ambient choose different accounts; pass one")
+        }
+    }
 
     mutating func run() async throws {
         guard let terminalID = UUID(uuidString: terminal) else {
@@ -775,18 +784,36 @@ struct TerminalContinueInClaude: AsyncParsableCommand {
 
         let updated: Terminal = try client.call(
             method: RPCMethod.terminalContinueInClaude,
-            params: TerminalContinueInClaudeParams(
-                sourceTerminalID: terminalID,
-                profileID: profileID,
-                cols: nil,
-                rows: nil),
+            params: Self.params(
+                terminalID: terminalID, profileID: profileID, ambient: ambient),
             resultType: Terminal.self)
+
+        // An automatic pick is the daemon's to make, so the label comes from
+        // the row it committed rather than from anything sent.
+        if profileID == nil, !ambient, let chosen = updated.profileID {
+            let list = try? client.call(
+                method: RPCMethod.modelProfileList,
+                resultType: ModelProfileListResult.self)
+            accountLabel = list?.profiles.first { $0.profile.id == chosen }?.profile.name
+                ?? chosen.uuidString
+        }
 
         if json {
             printJSON(updated)
         } else {
             print(Self.plainOutput(terminal: updated, accountLabel: accountLabel))
         }
+    }
+
+    /// No `--profile` asks the daemon to choose as it would for a new
+    /// session; `--ambient` asks for Claude's own login explicitly.
+    static func params(terminalID: UUID, profileID: UUID?, ambient: Bool) -> TerminalContinueInClaudeParams {
+        TerminalContinueInClaudeParams(
+            sourceTerminalID: terminalID,
+            profileID: profileID,
+            cols: nil,
+            rows: nil,
+            automaticProfile: profileID == nil && !ambient)
     }
 
     static func plainOutput(terminal: Terminal, accountLabel: String) -> String {

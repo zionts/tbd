@@ -2502,24 +2502,35 @@ public struct TerminalContinueInCodexResult: Codable, Sendable, Equatable {
 }
 
 /// Replace one tmux-backed Codex process with a fresh Claude process in the
-/// same durable terminal row and window. A nil profile selects Claude's
+/// same durable terminal row and window.
+///
+/// The account is, in order: `profileID` when set; otherwise, when
+/// `automaticProfile` is true, the one a new Claude session in this worktree
+/// would get — the repo's override, the scratch override, then the balanced
+/// pick or the global default, else the ambient login; otherwise Claude's
 /// ambient login.
 public struct TerminalContinueInClaudeParams: Codable, Sendable {
     public let sourceTerminalID: UUID
     public let profileID: UUID?
     public let cols: Int?
     public let rows: Int?
+    /// Resolve the account the way a new Claude session would. Ignored when
+    /// `profileID` is set. Absent (an older client) means false, the ambient
+    /// login, so an older caller keeps what it asked for.
+    public let automaticProfile: Bool?
 
     public init(
         sourceTerminalID: UUID,
         profileID: UUID? = nil,
         cols: Int? = nil,
-        rows: Int? = nil
+        rows: Int? = nil,
+        automaticProfile: Bool? = nil
     ) {
         self.sourceTerminalID = sourceTerminalID
         self.profileID = profileID
         self.cols = cols
         self.rows = rows
+        self.automaticProfile = automaticProfile
     }
 }
 

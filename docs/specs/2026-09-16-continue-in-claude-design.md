@@ -29,9 +29,19 @@ says the terminal is tmux-backed Codex and has a non-empty rollout path. The app
 establish filesystem readability; the daemon alone verifies that before acting. The
 submenu contains:
 
+- **Same account as a new session** — the daemon chooses, exactly as it would for a new
+  Claude tab in this worktree: the repo's profile override, the scratch override, then the
+  balanced pick when account balancing is on or the global default, else the ambient
+  login. Represented by a nil profile ID with `automaticProfile` set.
 - **Default (logged in)** — the ambient Claude login, represented by a nil profile ID.
 - Every configured Claude profile — in the same order and with the same compact usage
   labels as the existing **Swap profile** and **Fork Session** menus.
+
+The first choice exists because the destination is a fresh Claude conversation, which is
+precisely what account balancing places
+([`2026-09-05-account-load-balancing-design.md`](2026-09-05-account-load-balancing-design.md)
+§6). Without it, every continuation that named no account landed on the ambient login,
+outside the pool, however full that account was.
 
 The app enables the choices only when the transcript-derived presentation state is
 positively `idle`. A presentation state of `working` or no presentation observation disables
@@ -196,8 +206,14 @@ All fallible work that can finish while Codex remains live happens before interr
    watermark; awaiting-input reason and observation time; and a rollout fingerprint
    consisting of path, file identity, size, and modification time. This separate type is
    required because `TerminalReplacementSnapshot` deliberately excludes activity facts.
-4. Resolve the requested profile through `ModelProfileResolver`. Nil means the ambient
-   login. An explicit missing or unreadable profile returns `profileMissing`.
+4. Resolve the requested profile through `ModelProfileResolver`. An explicit missing or
+   unreadable profile returns `profileMissing`. A nil profile with `automaticProfile`
+   resolves through `resolve(repoID:worktreeID:)`, balanced, after every other
+   preparation step that can refuse; a failure there falls back to the ambient login as a
+   new terminal's does. A balanced pick's reservation is settled when the transaction
+   ends, whichever way it ends: on success the committed row carries the session, and on
+   failure no session landed. A nil profile without `automaticProfile` means the ambient
+   login.
 5. Build the continuation packet and git-status section.
 6. Allocate a fresh Claude session ID. Use `SystemPromptBuilder`,
    `ClaudeTrustSeeder`, `ClaudeHookOverlay`, `PluginDirWriter`,
@@ -343,8 +359,13 @@ public struct TerminalContinueInClaudeParams: Codable, Sendable {
     public let profileID: UUID?
     public let cols: Int?
     public let rows: Int?
+    /// With a nil `profileID`: choose as for a new session. Absent means false.
+    public let automaticProfile: Bool?
 }
 ```
+
+`automaticProfile` is optional on the wire so an older client, which never sends it,
+keeps the ambient login it asked for.
 
 The result is the updated `Terminal`, not a new-terminal wrapper. A second request after a
 successful continuation finds a Claude row, returns `terminalWrongProvider`, and spawns
@@ -358,12 +379,14 @@ nothing. Other machine-readable failures reuse or add these codes:
 The CLI command is:
 
 ```text
-tbd terminal continue-in-claude --terminal <uuid> [--profile <name-or-uuid>] [--json]
+tbd terminal continue-in-claude --terminal <uuid> [--profile <name-or-uuid> | --ambient] [--json]
 ```
 
 It reuses the existing exact-name, unique case-insensitive-name, or UUID profile resolver.
-Omitting `--profile` selects **Default (logged in)**. Plain output reports the unchanged
-terminal ID and selected account; `--json` prints the returned `Terminal`.
+Omitting `--profile` selects **Same account as a new session**; `--ambient` selects
+**Default (logged in)**, and the two together are refused. Plain output reports the
+unchanged terminal ID and the account the row committed — for an automatic choice, read
+back from the returned row; `--json` prints the returned `Terminal`.
 
 `DaemonClient.continueInClaude`, `AppState.continueInClaude`, and the tab menu call the
 same RPC. `StateDelta.terminalReplaced` carries the full terminal and atomically replaces
@@ -430,8 +453,13 @@ existing alert path.
 
 ### Client tests
 
-- CLI parsing requires named `--terminal`, accepts ambient omission, profile name or UUID,
-  and `--json`, and plain output reports the unchanged terminal ID and account label.
+- CLI parsing requires named `--terminal`, accepts omission (automatic), `--ambient`,
+  profile name or UUID, and `--json`, refuses `--profile` with `--ambient`, and maps
+  each to the right params; plain output reports the unchanged terminal ID and account
+  label.
+- An automatic request commits the global default with balancing off and the balanced
+  pick with it on; a bare request and an older client's params keep the ambient login;
+  an explicit profile wins over `automaticProfile`.
 - Menu policy tests cover visibility for tmux-backed Codex rows with non-empty rollout
   paths, transcript-derived idle/working state, missing presentation state, durable waiting
   and unknown states, and the busy caption. Readability remains a daemon check.
