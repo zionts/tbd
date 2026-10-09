@@ -140,12 +140,13 @@ struct ProfileBalancingFlagTests {
 
     // MARK: - The shipped default, and the wire
 
-    /// The shipped default today: OFF. Session spreading soaks behind its own switch.
-    /// Graduation edits this constant and nothing else.
-    @Test func shippedDefaultIsOff() async throws {
-        #expect(Config.profileBalancingEnabledDefault == false)
+    /// The shipped default: ON. An install that never touched the toggle
+    /// balances; `explicitFalseSurvivesADefaultFlipWhileNullFollowsIt` above is what keeps a
+    /// deliberate opt-out off.
+    @Test func shippedDefaultIsOn() async throws {
+        #expect(Config.profileBalancingEnabledDefault == true)
         let db = try TBDDatabase(inMemory: true)
-        #expect(try await db.config.get().profileBalancingEnabled == false)
+        #expect(try await db.config.get().profileBalancingEnabled == true)
     }
 
     @Test func setterRoundtrips() async throws {

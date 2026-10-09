@@ -12,7 +12,7 @@ session hits a hard limit, and a live-session count beside the usage bars so
 the person can see the load the policy is balancing. All three run entirely
 on machinery that exists today — the usage snapshots, the `terminal.profile_id`
 stamp, and the in-place profile swap. The launch policy, the only one that
-acts without a gesture, ships behind a default-off flag; the limit offer never
+acts without a gesture, sits behind a flag that is on by default; the limit offer never
 acts on its own.
 
 ## 1. What is wrong today
@@ -195,8 +195,8 @@ verdicts, so the resolver can log one line per decision and the app can show
 
 ## 6. The launch policy
 
-A new tri-state config flag, `profile_balancing_enabled` (shipped default
-`false`, constant `Config.profileBalancingEnabledDefault`, resolved in
+A tri-state config flag, `profile_balancing_enabled` (shipped default
+`true`, constant `Config.profileBalancingEnabledDefault`, resolved in
 `ConfigRecord.toModel()`), gates one change in
 `ModelProfileResolver.resolve(repoID:override:)`:
 
@@ -337,8 +337,7 @@ the `queuedPromptToggle` shape:
 - **Balance new Claude sessions across accounts** –
   `config.setProfileBalancingEnabled`. Help text: "When a new session would
   use the global default, pick the signed-in profile with the most room
-  instead. Repo overrides and explicit picks still win. Off by default
-  (soaking)."
+  instead. Repo overrides and explicit picks still win. On by default."
 
 The limit offer (§7) has no toggle: it acts only on a click, so there is
 nothing for a switch to make safer.
@@ -467,18 +466,24 @@ Both branches of every flag, per the repo rule.
 
 ## 11. Rollout
 
-The flag ships off. To soak:
+The flag is on by default, through `Config.profileBalancingEnabledDefault`.
+Because the column carries no SQL default, that constant reaches every
+install whose `profile_balancing_enabled` is NULL — new installs, and existing
+ones that never touched the toggle — while an explicit choice in either
+direction is kept. A person who wants the pre-balancing behavior opts out:
 
 ```text
-tbd profile balancing on
+tbd profile balancing off
 ```
 
-or the toggle in Settings → Model Profiles. Graduation is a one-line change
-to `Config.profileBalancingEnabledDefault`, which reaches everyone who never
-touched the toggle and preserves every explicit opt-out; the flag is deleted
-once the soak has shown the picker's choices match what the person would
-have chosen. The limit offer ships on, since it acts only on a click. The
-per-profile opt-out is not a flag and has no graduation.
+or the toggle in Settings → Model Profiles. The flag is deleted once field use
+shows nobody needs the opt-out. The limit offer ships on, since it acts only
+on a click. The per-profile opt-out is not a flag and has no graduation.
+
+Balancing on by default presumes readings fresh enough to route on: the
+setup-token poller's five-minute cadence and the picker's usage ceiling and
+fallback (§5.1, §6.3) are what make the default safe for a fleet that has
+never configured either.
 
 ## 12. Rejected alternatives
 

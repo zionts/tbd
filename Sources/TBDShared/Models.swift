@@ -1832,11 +1832,11 @@ public struct Config: Codable, Sendable, Equatable {
     /// `UPDATE` migration and every explicit opt-out left alone.
     public static let transcriptStreamingDefault = false
     /// The shipped default for `profileBalancingEnabled`, and the single place
-    /// it lives. Profile balancing ships off; graduation — after a soak in which
-    /// the picker's choices match what the person would have chosen — is a
-    /// change to this constant, with no forcing `UPDATE` migration and every
-    /// explicit opt-out left alone.
-    public static let profileBalancingEnabledDefault = false
+    /// it lives. Profile balancing is on by default: every install whose
+    /// `profile_balancing_enabled` is NULL — new installs, and existing ones
+    /// that never touched the toggle — balances, while an explicit choice in
+    /// either direction is honored. There is no forcing `UPDATE` migration.
+    public static let profileBalancingEnabledDefault = true
     /// The shipped default for `prPollScheduleEnabled`, and the single place it
     /// lives. Ships off; graduation is a change to this constant.
     public static let prPollScheduleDefault = false

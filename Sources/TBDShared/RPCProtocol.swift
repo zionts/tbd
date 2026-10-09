@@ -3996,7 +3996,7 @@ public struct DaemonCapabilitiesResult: Codable, Sendable {
     /// re-derive the pair.
     public var transcriptStreamingEnabled: Bool
     /// Whether the profile balancing gate is currently set (design 2026-09-05
-    /// §6). Default OFF while it soaks. Resolved through
+    /// §6). Default on. Resolved through
     /// `Config.profileBalancingEnabledDefault`, so an install that never touched
     /// the toggle reports whatever the shipped default currently is.
     ///

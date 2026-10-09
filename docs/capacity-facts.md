@@ -88,8 +88,9 @@ Top level of `tbd profile list --json`:
   running on, and it is never a substitute for a missing `profileID` (see
   "The terminal join").
 - **`balancing`** – object with one boolean field, `enabled`: whether new
-  sessions spread across the available pool (design 2026-09-05 §6). Defaults
-  to `false`.
+  sessions spread across the available pool (design 2026-09-05 §6). A daemon
+  resolves it to `true` unless someone turned it off; one that predates the
+  flag sends nothing, which reads as `false`.
 
 The envelope also carries app-oriented configuration mirrors —
 `primaryAgentPreference`, `globalEnvOverrides`, merge-automation defaults, and

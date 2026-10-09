@@ -840,7 +840,7 @@ public struct ConfigStore: Sendable {
         }
     }
 
-    /// Persist the profile balancing gate (default OFF, soaking) — the launch
+    /// Persist the profile balancing gate (default on) — the launch
     /// policy that spreads new sessions across the profiles with the most room
     /// (design 2026-09-05 §6). The column is written on every call, because
     /// writing either value is the explicit gesture that lifts it out of NULL

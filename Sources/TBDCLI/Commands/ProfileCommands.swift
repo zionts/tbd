@@ -530,7 +530,7 @@ struct ProfileLogin: AsyncParsableCommand {
 struct ProfileBalancing: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "balancing",
-        abstract: "Enable or disable spreading new sessions across profiles (default off)",
+        abstract: "Enable or disable spreading new sessions across profiles (default on)",
         discussion: """
             When on, new sessions land on the eligible profile with the most \
             room in its usage window, adjusted for how many sessions that \

@@ -59,10 +59,10 @@ struct ProfileBalancingRPCTests {
 
     // MARK: - Initial state
 
-    @Test("profile balancing is off before any call")
-    func profileBalancingOffBeforeAnyCall() async throws {
+    @Test("profile balancing is on before any call")
+    func profileBalancingOnBeforeAnyCall() async throws {
         let (_, db) = try makeRouterAndDB()
-        #expect(try await db.config.get().profileBalancingEnabled == false)
+        #expect(try await db.config.get().profileBalancingEnabled == true)
     }
 
     // MARK: - Round trip: flags

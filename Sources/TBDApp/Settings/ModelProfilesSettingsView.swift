@@ -72,7 +72,7 @@ struct ModelProfilesSettingsView: View {
                 set: { newValue in Task { await appState.setProfileBalancingEnabled(newValue) } }
             ))
             .font(.caption)
-            .help("When a new session would use the global default, pick the signed-in profile with the most room instead. Repo overrides and explicit picks still win. Off by default (soaking).")
+            .help("When a new session would use the global default, pick the signed-in profile with the most room instead. Repo overrides and explicit picks still win. On by default.")
         }
     }
 
