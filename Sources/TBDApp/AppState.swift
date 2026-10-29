@@ -3714,9 +3714,9 @@ final class AppState {
     ///
     /// When the gate is off this makes ZERO daemon calls. Otherwise it fires a
     /// fire-and-forget `worktreeSuspend` per worktree; the daemon filters to
-    /// `isClaudeResumable && suspendedAt == nil`, waits briefly per terminal
-    /// for idle, and skips busy ones — so firing for every worktree is safe and
-    /// no-ops worktrees with nothing to suspend.
+    /// `isClaudeResumable && suspendedAt == nil`, skips keep-warm tabs, waits
+    /// briefly per terminal for idle, and skips busy ones — so firing for
+    /// every worktree is safe and no-ops worktrees with nothing to suspend.
     func suspendIdleClaudeForSleep(defaults: UserDefaults = .standard) {
         let enabled = Self.autoSuspendClaudeEnabled(defaults: defaults)
         let ids = Self.worktreeIDsToSuspendForSleep(

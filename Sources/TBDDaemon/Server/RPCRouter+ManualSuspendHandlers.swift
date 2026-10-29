@@ -10,7 +10,9 @@ import TBDShared
 /// `HibernationCoordinator`:
 ///   - `terminal.suspend`  → `manualHibernate`
 ///   - `terminal.resume`   → `wake`
-///   - `worktree.suspend`  → hibernate every eligible Claude terminal
+///   - `worktree.suspend`  → hibernate every eligible Claude terminal, except
+///     keep-warm tabs: its only live caller is the app's automatic pre-sleep
+///     sweep, which must not override a pin the user set on purpose
 ///   - `worktree.resume`   → wake every parked Claude terminal
 extension RPCRouter {
 
@@ -102,7 +104,9 @@ extension RPCRouter {
         }
         await limitResumeScheduler?.wake()
 
-        let eligible = terminals.filter { $0.isManuallyHibernatable }
+        // Keep-warm tabs are skipped: this is an automatic sweep, not a user
+        // gesture. The act-time check below covers a pin set after this read.
+        let eligible = terminals.filter { $0.isAutoHibernationEligible }
 
         // Fire in background — RPC returns immediately so the app can show
         // the parking overlay while the daemon does its work.
@@ -119,7 +123,8 @@ extension RPCRouter {
                 row.method = ActuationSurface.worktreeSuspend.method
                 row.target = .local(worktree: worktreeID, terminal: terminal.id)
                 guard let actuationID = try? await actuationLog.appendRequest(row) else { continue }
-                let result = await hibernationCoordinator.manualHibernate(terminalID: terminal.id)
+                let result = await hibernationCoordinator.manualHibernate(
+                    terminalID: terminal.id, honorsKeepWarm: true)
                 await actuationLog.appendOutcome(
                     confirms: actuationID,
                     result: ActuationOutcome.classify(result),

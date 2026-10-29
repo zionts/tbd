@@ -727,6 +727,23 @@ struct HibernationCoordinatorTests {
         #expect(try await db.terminals.get(id: terminalID)?.isHibernated == true)
     }
 
+    @Test func manualHibernateHonoringKeepWarmRefusesPinnedTerminal() async throws {
+        // The automatic pre-sleep sweep opts in to the pin.
+        let (db, _, terminalID) = try await setup(activityState: .idle, keepWarm: true)
+        let result = await coordinator(db).manualHibernate(
+            terminalID: terminalID, honorsKeepWarm: true)
+        #expect(result == .notEligible(reason: "Terminal is pinned keep-warm"))
+        #expect(try await db.terminals.get(id: terminalID)?.isHibernated == false)
+    }
+
+    @Test func manualHibernateHonoringKeepWarmStillParksUnpinnedTerminal() async throws {
+        let (db, _, terminalID) = try await setup(activityState: .idle, keepWarm: false)
+        let result = await coordinator(db).manualHibernate(
+            terminalID: terminalID, honorsKeepWarm: true)
+        #expect(result == .ok)
+        #expect(try await db.terminals.get(id: terminalID)?.isHibernated == true)
+    }
+
     @Test func manualHibernateRejectsNonClaude() async throws {
         let (db, _, terminalID) = try await setup(sessionID: nil, kind: .shell)
         let result = await coordinator(db).manualHibernate(terminalID: terminalID)

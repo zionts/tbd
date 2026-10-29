@@ -12,7 +12,10 @@ public enum HibernateResult: Equatable, Sendable {
 }
 
 private enum HibernateEligibilityPolicy: Sendable {
-    case manual
+    /// `honorsKeepWarm` is false for an explicit user gesture (which bypasses
+    /// the keep-warm pin) and true for an automatic all-worktrees sweep that
+    /// reaches the manual path (the pre-sleep `worktree.suspend`).
+    case manual(honorsKeepWarm: Bool)
     case merge(inputVetoEnabled: Bool)
     case automatic(
         enabled: Bool,
@@ -257,8 +260,11 @@ public actor HibernationCoordinator {
     // MARK: - Hibernate
 
     /// Manual "Hibernate now". Honors the running / permission-prompt rails but
-    /// not keep-warm or idle-time (the user asked explicitly).
-    public func manualHibernate(terminalID: UUID) async -> HibernateResult {
+    /// not idle-time, and by default not keep-warm (the user asked explicitly).
+    /// A caller acting for the user automatically (the pre-sleep
+    /// `worktree.suspend` sweep) passes `honorsKeepWarm: true`, so a pinned tab
+    /// stays warm; the pin is re-checked under the tmux server lock at act time.
+    public func manualHibernate(terminalID: UUID, honorsKeepWarm: Bool = false) async -> HibernateResult {
         guard let terminal = try? await db.terminals.get(id: terminalID) else {
             return .notFound
         }
@@ -266,11 +272,17 @@ public actor HibernationCoordinator {
         guard terminal.isManuallyHibernatable else {
             return .notEligible(reason: manualBlockReason(terminal))
         }
+        if honorsKeepWarm && terminal.keepWarm {
+            return .notEligible(reason: Self.keepWarmRefusal)
+        }
         return await performHibernate(
             terminal: terminal,
             reason: .manual,
-            policy: .manual)
+            policy: .manual(honorsKeepWarm: honorsKeepWarm))
     }
+
+    /// Refusal text for a keep-warm pin; matches `mergeBlockReason(.keepWarm)`.
+    private static let keepWarmRefusal = "Terminal is pinned keep-warm"
 
     /// The reason a manual hibernate was refused, for the RPC error string.
     private func manualBlockReason(_ terminal: Terminal) -> String {
@@ -357,7 +369,7 @@ public actor HibernationCoordinator {
         case .notClaudeResumable: return "Not a resumable Claude session"
         case .alreadyHibernated: return "Terminal is already hibernated"
         case .suspended: return "Terminal is suspended"
-        case .keepWarm: return "Terminal is pinned keep-warm"
+        case .keepWarm: return keepWarmRefusal
         case .running: return "Session is actively running"
         case .waitingForUser: return "Session is waiting on a permission prompt"
         case .pendingTypedInput: return "Terminal has unsent typed input"
@@ -645,10 +657,13 @@ public actor HibernationCoordinator {
         policy: HibernateEligibilityPolicy
     ) -> HibernateResult? {
         switch policy {
-        case .manual:
+        case let .manual(honorsKeepWarm):
             guard terminal.hibernatedAt == nil else { return .alreadyHibernated }
             guard terminal.isManuallyHibernatable else {
                 return .notEligible(reason: manualBlockReason(terminal))
+            }
+            if honorsKeepWarm && terminal.keepWarm {
+                return .notEligible(reason: Self.keepWarmRefusal)
             }
             return nil
 

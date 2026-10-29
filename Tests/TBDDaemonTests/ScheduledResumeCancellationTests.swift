@@ -91,6 +91,37 @@ import TestSupport
         try await assertCancelled()
     }
 
+    @Test func worktreeSuspendSkipsKeepWarmTerminals() async throws {
+        // worktree.suspend is the automatic pre-sleep sweep: it parks idle
+        // Claude tabs but leaves a keep-warm pin alone.
+        let pinned = try await db.terminals.create(
+            worktreeID: worktreeID, tmuxWindowID: "@3", tmuxPaneID: "%3",
+            claudeSessionID: "sess-pinned", kind: .claude)
+        let unpinned = try await db.terminals.create(
+            worktreeID: worktreeID, tmuxWindowID: "@4", tmuxPaneID: "%4",
+            claudeSessionID: "sess-unpinned", kind: .claude)
+        for id in [pinned.id, unpinned.id] {
+            try await db.terminals.setActivityState(id: id, activityState: .idle, source: .derived)
+        }
+        try await db.terminals.setKeepWarm(id: pinned.id, keepWarm: true)
+
+        let request = try RPCRequest(
+            method: RPCMethod.worktreeSuspend,
+            params: WorktreeSuspendParams(worktreeID: worktreeID))
+        let response = await router.handle(request)
+        #expect(response.success)
+
+        // The handler parks in a background Task: poll (bounded) for the
+        // unpinned tab, then assert the pinned one was never touched.
+        let unpinnedID = unpinned.id
+        let pinnedID = pinned.id
+        let db = self.db
+        try #require(try await waitFor("unpinned tab parked") {
+            (try? await db.terminals.get(id: unpinnedID))?.isHibernated == true
+        })
+        #expect(try await db.terminals.get(id: pinnedID)?.isHibernated == false)
+    }
+
     @Test func terminalHibernateCancels() async throws {
         // Hibernation is a parking mechanism just like suspend: a parked pane
         // must not receive a scheduled auto-resume send (spec §Cancellation).
